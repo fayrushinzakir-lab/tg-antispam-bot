@@ -16,9 +16,12 @@ import sys
 import json
 import time
 import copy
+import html
+import asyncio
 import logging
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 from telegram import (
     Update,
@@ -84,6 +87,14 @@ DEFAULT_CONFIG = {
         "interval": 3600,
         "text": "Заходи к нам почаще и зови друзей! 🙌",
     },
+    # Текст «зазывалы» — сообщения с кнопкой «Пригласить друга»
+    "invite_text": "Нравится у нас? Зови друзей 👇",
+    # Кто отписался от призывов /all: {chat_id: [user_ids]}
+    "all_optout": {},
+    # Правила группы (общие для всех групп бота)
+    "rules": "Правила группы:\n1) Без спама и рекламы.\n2) Уважайте участников.\n3) Общайтесь по теме.",
+    # Защита от сноса (анти-нюк)
+    "antinuke": {"enabled": True, "ban_threshold": 5, "window": 30, "action": "stop"},
 }
 
 SHORTENERS = {
@@ -156,6 +167,8 @@ CONFIG = load_config()
 # ───────────────────────────────────────────────────────────────────────────
 
 flood_store: dict = defaultdict(deque)
+members_store: dict = defaultdict(dict)   # chat_id -> {user_id: имя} (в памяти, для /all)
+nuke_store: dict = defaultdict(deque)     # (chat_id, actor_id) -> метки банов (анти-снос)
 _admin_cache: dict = {}
 ADMIN_CACHE_TTL = 300
 _state = {"last_promo": 0.0}
@@ -370,6 +383,25 @@ def reset_warns(chat_id, uid):
     save_config()
 
 
+async def alert_owners(context, text):
+    """Личное оповещение всем главным владельцам (ADMIN_IDS)."""
+    for oid in ADMIN_IDS:
+        try:
+            await context.bot.send_message(oid, text)
+        except Exception as e:  # noqa: BLE001
+            log.debug("alert owner %s: %s", oid, e)
+
+
+def track_nuke(chat_id, actor_id):
+    a = CONFIG["antinuke"]
+    now = time.time()
+    dq = nuke_store[(chat_id, actor_id)]
+    dq.append(now)
+    while dq and now - dq[0] > a["window"]:
+        dq.popleft()
+    return len(dq)
+
+
 # ───────────────────────────────────────────────────────────────────────────
 #  СООБЩЕНИЯ В ГРУППАХ
 # ───────────────────────────────────────────────────────────────────────────
@@ -383,6 +415,8 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     remember_group(chat)
+    if user.id not in set(CONFIG["all_optout"].get(str(chat.id), [])):
+        members_store[chat.id][user.id] = user.first_name or user.username or str(user.id)
     text = msg.text or msg.caption or ""
 
     if await is_exempt(context, chat.id, user.id):
@@ -461,17 +495,83 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_my_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Бота добавили/удалили из группы — обновляем список известных групп."""
+    """Бота добавили/удалили/сняли — обновляем список групп и оповещаем владельца."""
     cm = update.my_chat_member
     if not cm:
         return
     status = cm.new_chat_member.status
+    old = cm.old_chat_member.status
+    actor = cm.from_user
     if status in ("member", "administrator"):
         remember_group(cm.chat)
-        log.info("Бот добавлен в группу %s", cm.chat.id)
+        log.info("Бот в группе %s, статус %s", cm.chat.id, status)
+        if old == "administrator" and status == "member" and CONFIG["antinuke"].get("enabled"):
+            await alert_owners(
+                context,
+                f"⚠️ В «{cm.chat.title}» меня сняли с админки (кто: {mention(actor)}). "
+                f"Пока не вернёшь права — защита и антиспам не работают.")
     elif status in ("left", "kicked"):
+        if CONFIG["antinuke"].get("enabled"):
+            await alert_owners(context, f"⚠️ Меня удалили из группы «{cm.chat.title}» (кто: {mention(actor)}).")
         forget_group(cm.chat.id)
         log.info("Бот удалён из группы %s", cm.chat.id)
+
+
+async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Анти-снос: следим за массовыми банами и назначением новых админов."""
+    cm = update.chat_member
+    if not cm:
+        return
+    a = CONFIG.get("antinuke", {})
+    if not a.get("enabled"):
+        return
+    chat = cm.chat
+    actor = cm.from_user
+    target = cm.new_chat_member.user
+    new = cm.new_chat_member.status
+    old = cm.old_chat_member.status
+    if not actor or actor.id == context.bot.id:
+        return
+
+    # Новый админ — оповестить владельца
+    if new == "administrator" and old not in ("administrator", "creator") and not is_manager(actor.id):
+        await alert_owners(context, f"⚠️ В «{chat.title}» новый админ: {mention(target)} (назначил {mention(actor)}).")
+        return
+
+    # Массовый бан — возможный снос
+    if new == "kicked" and actor.id != target.id and not is_manager(actor.id):
+        cnt = track_nuke(chat.id, actor.id)
+        if cnt >= a["ban_threshold"]:
+            nuke_store[(chat.id, actor.id)].clear()
+            await alert_owners(
+                context,
+                f"🚨 ВОЗМОЖНЫЙ СНОС в «{chat.title}»!\n"
+                f"{mention(actor)} забанил {cnt}+ участников за {a['window']} сек.")
+            if a["action"] == "stop":
+                try:
+                    await context.bot.ban_chat_member(chat.id, actor.id)
+                    await alert_owners(context, f"✅ {mention(actor)} забанен — снос остановлен.")
+                except Exception as e:  # noqa: BLE001
+                    await alert_owners(
+                        context,
+                        f"⚠️ Не смог сам забанить {mention(actor)}: {e}\nЗайди в группу и останови вручную.")
+
+
+async def on_chat_settings_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Оповещение при смене названия/фото группы."""
+    if not CONFIG["antinuke"].get("enabled"):
+        return
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg:
+        return
+    who = mention(update.effective_user) if update.effective_user else "кто-то"
+    if msg.new_chat_title:
+        await alert_owners(context, f"⚠️ В «{chat.title}» изменили название (кто: {who}).")
+    elif msg.new_chat_photo:
+        await alert_owners(context, f"⚠️ В «{chat.title}» сменили фото группы (кто: {who}).")
+    elif msg.delete_chat_photo:
+        await alert_owners(context, f"⚠️ В «{chat.title}» удалили фото группы (кто: {who}).")
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -661,25 +761,118 @@ async def cmd_warns(update, context):
 # ───────────────────────────────────────────────────────────────────────────
 
 
+async def ensure_invite_link(context, chat_id, force=False):
+    """Возвращает (создаёт при необходимости) ссылку-приглашение для чата."""
+    key = str(chat_id)
+    link = CONFIG["invite_links"].get(key)
+    if link and not force:
+        return link
+    try:
+        res = await context.bot.create_chat_invite_link(chat_id)
+        CONFIG["invite_links"][key] = res.invite_link
+        save_config()
+        return res.invite_link
+    except Exception as e:  # noqa: BLE001
+        log.debug("create invite link: %s", e)
+        return None
+
+
 async def cmd_invite(update, context):
-    """Выдать ссылку-приглашение в текущую группу."""
+    """Выдать ссылку-приглашение в текущую группу (для админов)."""
     chat = update.effective_chat
     if not await can_moderate(context, chat.id, update.effective_user.id):
         return
-    key = str(chat.id)
-    link = CONFIG["invite_links"].get(key)
     want_new = bool(context.args) and context.args[0].lower() in ("new", "новая")
-    if not link or want_new:
-        try:
-            res = await context.bot.create_chat_invite_link(chat.id)
-            link = res.invite_link
-            CONFIG["invite_links"][key] = link
-            save_config()
-        except Exception as e:  # noqa: BLE001
-            await update.effective_message.reply_text(
-                f"Не вышло создать ссылку: {e}\nМне нужно право «Приглашать пользователей».")
-            return
+    link = await ensure_invite_link(context, chat.id, force=want_new)
+    if not link:
+        await update.effective_message.reply_text(
+            "Не вышло создать ссылку. Дай боту право «Приглашать пользователей».")
+        return
     await update.effective_message.reply_text(f"🔗 Ссылка-приглашение:\n{link}\n\nДелись ей, чтобы звать народ.")
+
+
+async def cmd_zazyvala(update, context):
+    """Опубликовать в группе сообщение с кнопкой «Пригласить друга»."""
+    chat = update.effective_chat
+    if not await can_moderate(context, chat.id, update.effective_user.id):
+        return
+    link = await ensure_invite_link(context, chat.id)
+    if not link:
+        await update.effective_message.reply_text(
+            "Не вышло создать ссылку. Дай боту право «Приглашать пользователей».")
+        return
+    text = CONFIG.get("invite_text") or "Зови друзей 👇"
+    share = "https://t.me/share/url?url=" + quote(link, safe="") + "&text=" + quote(text, safe="")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("👥 Пригласить друга", url=share)]])
+    try:
+        sent = await context.bot.send_message(chat.id, text, reply_markup=kb)
+    except Exception as e:  # noqa: BLE001
+        await update.effective_message.reply_text(f"Не вышло опубликовать: {e}")
+        return
+    try:
+        await context.bot.pin_chat_message(chat.id, sent.message_id, disable_notification=True)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await update.effective_message.delete()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _optout_list(chat_id):
+    return CONFIG["all_optout"].setdefault(str(chat_id), [])
+
+
+async def cmd_all(update, context):
+    """Призыв: отметить (тегнуть) всех активных участников группы."""
+    chat = update.effective_chat
+    if not await can_moderate(context, chat.id, update.effective_user.id):
+        return
+    text = _args_text(update) or "Все сюда! 👀"
+    optout = set(_optout_list(chat.id))
+    members = members_store.get(chat.id, {})
+    targets = [(uid, name) for uid, name in members.items() if uid not in optout]
+    if not targets:
+        await update.effective_message.reply_text(
+            "Пока некого звать — я отмечаю только тех, кто писал в чате после моего запуска. "
+            "Подожди, пока люди начнут писать, и зови снова.")
+        return
+    targets = targets[:100]  # предохранитель от мегафлуда
+    batch, first = [], True
+    for i, (uid, name) in enumerate(targets, 1):
+        batch.append(f'<a href="tg://user?id={uid}">{html.escape(name or "друг")}</a>')
+        if len(batch) >= 5 or i == len(targets):
+            body = (f"📣 {html.escape(text)}\n" if first else "") + " ".join(batch)
+            try:
+                await context.bot.send_message(chat.id, body, parse_mode="HTML")
+            except Exception as e:  # noqa: BLE001
+                log.debug("all batch: %s", e)
+            batch, first = [], False
+            await asyncio.sleep(1)  # пауза между пачками, чтобы не словить лимиты
+
+
+async def cmd_anreg(update, context):
+    """Пользователь выходит из призывов /all."""
+    chat = update.effective_chat
+    uid = update.effective_user.id
+    lst = _optout_list(chat.id)
+    if uid not in lst:
+        lst.append(uid)
+        save_config()
+    members_store.get(chat.id, {}).pop(uid, None)
+    await update.effective_message.reply_text("✅ Ты больше не будешь получать призывы (/all). Вернуться: /reg")
+
+
+async def cmd_reg(update, context):
+    """Пользователь возвращается в призывы /all."""
+    chat = update.effective_chat
+    uid = update.effective_user.id
+    lst = _optout_list(chat.id)
+    if uid in lst:
+        lst.remove(uid)
+        save_config()
+    members_store[chat.id][uid] = update.effective_user.first_name or str(uid)
+    await update.effective_message.reply_text("✅ Снова участвуешь в призывах (/all).")
 
 
 async def cmd_say(update, context):
@@ -696,6 +889,34 @@ async def cmd_say(update, context):
     except Exception:  # noqa: BLE001
         pass
     await context.bot.send_message(chat.id, text)
+
+
+async def cmd_rules(update, context):
+    """Показать правила группы (для всех участников)."""
+    await update.effective_message.reply_text(CONFIG.get("rules") or "Правила пока не заданы.")
+
+
+async def cmd_link(update, context):
+    """Ссылка на группу (для всех участников)."""
+    chat = update.effective_chat
+    link = await ensure_invite_link(context, chat.id)
+    if not link:
+        await update.effective_message.reply_text(
+            "Ссылка пока недоступна — обратись к админу (боту нужно право «Приглашать пользователей»).")
+        return
+    await update.effective_message.reply_text(f"🔗 Ссылка на группу:\n{link}")
+
+
+async def cmd_setrules(update, context):
+    if not is_manager(update.effective_user.id):
+        return
+    text = _args_text(update)
+    if not text:
+        await update.effective_message.reply_text("Формат: /setrules текст правил")
+        return
+    CONFIG["rules"] = text
+    save_config()
+    await update.effective_message.reply_text("✅ Правила сохранены.", reply_markup=rules_kb())
 
 
 async def _broadcast(context, text: str):
@@ -748,13 +969,35 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔘 Функции", callback_data="m:toggles"),
          InlineKeyboardButton("⚙️ Антифлуд", callback_data="m:flood")],
         [InlineKeyboardButton("🛡 Модерация", callback_data="m:mod"),
-         InlineKeyboardButton("👋 Приветствие", callback_data="m:welcome")],
-        [InlineKeyboardButton("📣 Промо/Рассылка", callback_data="m:promo"),
+         InlineKeyboardButton("🛡 Анти-снос", callback_data="m:antinuke")],
+        [InlineKeyboardButton("👋 Приветствие", callback_data="m:welcome"),
+         InlineKeyboardButton("📣 Промо/Рассылка", callback_data="m:promo")],
+        [InlineKeyboardButton("💬 Ключевые слова", callback_data="m:triggers"),
          InlineKeyboardButton("👥 Доступ", callback_data="m:access")],
-        [InlineKeyboardButton("💬 Ключевые слова", callback_data="m:triggers")],
         [InlineKeyboardButton("🚫 Стоп-слова", callback_data="m:words"),
          InlineKeyboardButton("🔗 Спам-ссылки", callback_data="m:links")],
-        [InlineKeyboardButton("ℹ️ Помощь", callback_data="m:help")],
+        [InlineKeyboardButton("📜 Правила", callback_data="m:rules"),
+         InlineKeyboardButton("ℹ️ Помощь", callback_data="m:help")],
+    ])
+
+
+def antinuke_kb() -> InlineKeyboardMarkup:
+    a = CONFIG["antinuke"]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Защита включена" if a["enabled"] else "🔴 Защита выключена", callback_data="an:toggle")],
+        [InlineKeyboardButton(f"Порог: {a['ban_threshold']} банов за {a['window']} сек", callback_data="noop")],
+        [InlineKeyboardButton("➖ порог", callback_data="an:thr:-"), InlineKeyboardButton("➕ порог", callback_data="an:thr:+")],
+        [InlineKeyboardButton("➖ окно", callback_data="an:win:-"), InlineKeyboardButton("➕ окно", callback_data="an:win:+")],
+        [InlineKeyboardButton(
+            f"Действие: {'банить нарушителя' if a['action'] == 'stop' else 'только оповещать'}", callback_data="an:action")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
+    ])
+
+
+def rules_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Изменить правила", callback_data="ru:edit")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
     ])
 
 
@@ -844,9 +1087,20 @@ def promo_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"Интервал: {human_duration(p['interval'])}", callback_data="noop")],
         [InlineKeyboardButton("➖", callback_data="pr:int:-"), InlineKeyboardButton("➕", callback_data="pr:int:+")],
         [InlineKeyboardButton("✏️ Изменить текст промо", callback_data="pr:edit")],
+        [InlineKeyboardButton("✏️ Текст кнопки-зазывалы", callback_data="pr:invtext")],
         [InlineKeyboardButton("📨 Разослать сообщение сейчас", callback_data="pr:cast")],
+        [InlineKeyboardButton("📝 Запостить в группу", callback_data="post:list")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
     ])
+
+
+def post_groups_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for i, (cid, title) in enumerate(sorted(CONFIG["groups"].items())):
+        label = title if len(title) <= 30 else title[:29] + "…"
+        rows.append([InlineKeyboardButton(f"📝 {label}", callback_data=f"pto:{i}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:promo")])
+    return InlineKeyboardMarkup(rows)
 
 
 def access_kb() -> InlineKeyboardMarkup:
@@ -887,6 +1141,8 @@ def promo_menu_text() -> str:
         f"Групп на учёте: {len(CONFIG['groups'])}\n\n"
         "Текст промо:\n" + (p["text"] or "—") + "\n\n"
         "«Разослать сейчас» — отправит одно сообщение во все группы.\n"
+        "Кнопка-зазывала «Пригласить друга»: команда /zazyvala в группе.\n"
+        "Текст зазывалы: " + (CONFIG.get("invite_text") or "—") + "\n"
         "В группе доступна команда /invite — ссылка-приглашение."
     )
 
@@ -903,20 +1159,50 @@ def access_menu_text() -> str:
     )
 
 
+def antinuke_menu_text() -> str:
+    a = CONFIG["antinuke"]
+    act = "забанить нарушителя и оповестить тебя" if a["action"] == "stop" else "только оповестить тебя"
+    return (
+        "🛡 Защита от сноса (анти-снос).\n\n"
+        f"Статус: {'включена' if a['enabled'] else 'выключена'}\n"
+        f"Триггер: {a['ban_threshold']}+ банов за {a['window']} сек от одного человека\n"
+        f"Действие: {act}\n\n"
+        "Что делает: ловит массовые баны, пишет тебе в ЛС и (если включено) банит нарушителя. "
+        "Также сразу сообщает, если меня сняли с админки/удалили, назначили нового админа "
+        "или сменили название/фото группы.\n\n"
+        "⚠️ Создателя группы Telegram не даёт тронуть никому, даже боту — поэтому полностью "
+        "запретить снос со стороны владельца нельзя, но ты узнаешь моментально."
+    )
+
+
+def rules_menu_text() -> str:
+    return (
+        "📜 Правила группы (одни для всех твоих групп).\n\n"
+        "Участники смотрят их командой /group в чате.\n\n"
+        "Сейчас:\n" + (CONFIG.get("rules") or "—")
+    )
+
+
 HELP_TEXT = (
     "ℹ️ Управление (в ЛС): /panel /status /id\n\n"
     "Автоответы: /add слово = ответ · /del · /list\n"
     "Стоп-слова (чёрный список, удаляются): /addword · /delword · /words\n"
     "Спам-домены: /addlink · /dellink · /links\n"
-    "Приветствие: /setwelcome текст ({name}, {chat})\n\n"
+    "Приветствие: /setwelcome текст ({name}, {chat})\n"
+    "Правила: /setrules текст\n\n"
     "🛡 Модерация (в группе, для админов чата):\n"
     "/ban /unban /kick · /mute [время] /unmute · /warn /unwarn /warns\n"
     "Цель: ответом на сообщение, либо @user или id. Время: 30m, 2h, 1d.\n\n"
-    "📣 Привлечение и постинг:\n"
+    "📣 Привлечение, призыв, постинг:\n"
     "/invite — ссылка-приглашение (в группе)\n"
+    "/zazyvala — кнопка «Пригласить друга» (в группе)\n"
+    "/all [текст] — призыв: отметить всех активных (в группе)\n"
+    "/anreg — выйти из призывов · /reg — вернуться\n"
     "/say текст — опубликовать в группе\n"
     "/broadcast текст — разослать во все группы (в ЛС)\n"
-    "Авто-промо по таймеру — в панели «Промо/Рассылка».\n\n"
+    "Постинг в выбранную группу и авто-промо — в панели «Промо/Рассылка».\n\n"
+    "📜 Для участников (в группе): /group — правила · /link — ссылка на группу\n"
+    "🛡 Защита от сноса — в панели «Анти-снос».\n\n"
     "👥 Доступ (только главный владелец):\n"
     "/grant — выдать права · /revoke — забрать · /managers — список\n\n"
     "Боту в группе нужны права: удалять сообщения, блокировать, "
@@ -975,6 +1261,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "m:mod": ("🛡 Модерация. Команды — в группе (/ban, /mute, /warn...).\nЗдесь — настройки предупреждений:", mod_kb()),
         "m:welcome": (welcome_menu_text(), welcome_kb()),
         "m:promo": (promo_menu_text(), promo_kb()),
+        "m:antinuke": (antinuke_menu_text(), antinuke_kb()),
+        "m:rules": (rules_menu_text(), rules_kb()),
         "m:help": (HELP_TEXT, main_menu_kb()),
     }
     if data in nav:
@@ -1001,6 +1289,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         CONFIG["flood"][field] = max(floor, CONFIG["flood"][field] + (step if sign == "+" else -step))
         save_config()
         return await safe_edit(query, "⚙️ Настройки антифлуда:", flood_kb())
+
+    if data.startswith("an:"):
+        what = data.split(":")[1]
+        a = CONFIG["antinuke"]
+        if what == "toggle":
+            a["enabled"] = not a["enabled"]
+        elif what == "action":
+            a["action"] = "alert" if a["action"] == "stop" else "stop"
+        elif what == "thr":
+            a["ban_threshold"] = max(2, a["ban_threshold"] + (1 if data.split(":")[2] == "+" else -1))
+        elif what == "win":
+            a["window"] = max(10, a["window"] + (10 if data.split(":")[2] == "+" else -10))
+        save_config()
+        return await safe_edit(query, antinuke_menu_text(), antinuke_kb())
+
+    if data == "ru:edit":
+        context.user_data["await"] = "rules"
+        return await safe_edit(query, "Пришли новый текст правил одним сообщением.\n(или /cancel)", None)
 
     if data.startswith("md:"):
         parts = data.split(":")
@@ -1038,9 +1344,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if what == "edit":
             context.user_data["await"] = "promo"
             return await safe_edit(query, "Пришли текст авто-промо одним сообщением.\n(или /cancel)", None)
+        if what == "invtext":
+            context.user_data["await"] = "invite_text"
+            return await safe_edit(
+                query, "Пришли текст для кнопки-зазывалы (его увидят участники и друзья при приглашении).\n(или /cancel)", None)
         if what == "cast":
             context.user_data["await"] = "broadcast"
             return await safe_edit(query, "Пришли сообщение — разошлю его во все группы бота.\n(или /cancel)", None)
+
+    if data == "post:list":
+        if not CONFIG["groups"]:
+            return await safe_edit(query, "Пока нет известных групп. Добавь бота в группу и напиши там что-нибудь.", promo_kb())
+        return await safe_edit(query, "Выбери группу, куда опубликовать:", post_groups_kb())
+    if data.startswith("pto:"):
+        items = sorted(CONFIG["groups"].items())
+        i = int(data[4:])
+        if 0 <= i < len(items):
+            cid, title = items[i]
+            context.user_data["await"] = "post"
+            context.user_data["post_chat"] = int(cid)
+            return await safe_edit(query, f"Пришли текст — опубликую его в «{title}».\n(или /cancel)", None)
+        return await safe_edit(query, "Группа не найдена.", post_groups_kb())
 
     if data.startswith("dt:"):
         keys = sorted(CONFIG["triggers"].keys())
@@ -1320,6 +1644,22 @@ async def on_private_text(update, context):
             await update.message.reply_text("✅ Текст промо сохранён.", reply_markup=promo_kb())
         else:
             await update.message.reply_text("Пусто. Попробуй снова через /panel.")
+    elif awaiting == "invite_text":
+        if text:
+            CONFIG["invite_text"] = text
+            save_config()
+            await update.message.reply_text(
+                "✅ Текст зазывалы сохранён. Опубликуй кнопку командой /zazyvala в группе.",
+                reply_markup=promo_kb())
+        else:
+            await update.message.reply_text("Пусто. Попробуй снова через /panel.")
+    elif awaiting == "rules":
+        if text:
+            CONFIG["rules"] = text
+            save_config()
+            await update.message.reply_text("✅ Правила сохранены.", reply_markup=rules_kb())
+        else:
+            await update.message.reply_text("Пусто. Попробуй снова через /panel.")
     elif awaiting == "broadcast":
         if not text:
             await update.message.reply_text("Пусто, ничего не разослал.")
@@ -1329,6 +1669,16 @@ async def on_private_text(update, context):
             return
         ok, fail = await _broadcast(context, text)
         await update.message.reply_text(f"📣 Разослано в {ok} групп(ы), не доставлено: {fail}.", reply_markup=promo_kb())
+    elif awaiting == "post":
+        cid = context.user_data.pop("post_chat", None)
+        if not text or not cid:
+            await update.message.reply_text("Пусто или группа не выбрана. Попробуй снова через /panel.")
+            return
+        try:
+            await context.bot.send_message(cid, text)
+            await update.message.reply_text("✅ Опубликовано.", reply_markup=promo_kb())
+        except Exception as e:  # noqa: BLE001
+            await update.message.reply_text(f"Не вышло опубликовать: {e}", reply_markup=promo_kb())
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1367,6 +1717,7 @@ def build_app() -> Application:
     # Где угодно (внутренняя проверка)
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("setwelcome", cmd_setwelcome))
+    app.add_handler(CommandHandler("setrules", cmd_setrules))
     app.add_handler(CommandHandler("grant", cmd_grant))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
 
@@ -1380,16 +1731,29 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("unwarn", cmd_unwarn, filters=groups))
     app.add_handler(CommandHandler(["warns", "warnings"], cmd_warns, filters=groups))
     app.add_handler(CommandHandler("say", cmd_say, filters=groups))
-    app.add_handler(CommandHandler(["invite", "link"], cmd_invite, filters=groups))
+    app.add_handler(CommandHandler("invite", cmd_invite, filters=groups))
+    app.add_handler(CommandHandler("link", cmd_link, filters=groups))
+    app.add_handler(CommandHandler(["group", "rules"], cmd_rules, filters=groups))
+    app.add_handler(CommandHandler(["zazyvala", "invitebtn"], cmd_zazyvala, filters=groups))
+    app.add_handler(CommandHandler("all", cmd_all, filters=groups))
+    app.add_handler(CommandHandler("anreg", cmd_anreg, filters=groups))
+    app.add_handler(CommandHandler("reg", cmd_reg, filters=groups))
 
     # Кнопки
     app.add_handler(CallbackQueryHandler(on_callback))
 
     # Членство бота в группах
     app.add_handler(ChatMemberHandler(on_my_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    # Изменения участников (анти-снос)
+    app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
 
     # Новые участники
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
+
+    # Смена названия/фото группы (анти-снос)
+    app.add_handler(MessageHandler(
+        filters.StatusUpdate.NEW_CHAT_TITLE | filters.StatusUpdate.NEW_CHAT_PHOTO | filters.StatusUpdate.DELETE_CHAT_PHOTO,
+        on_chat_settings_change))
 
     # Сообщения в группах
     app.add_handler(MessageHandler(
