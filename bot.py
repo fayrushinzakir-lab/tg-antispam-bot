@@ -116,7 +116,7 @@ DEFAULT_CONFIG = {
     # Показывать ID новичка при входе: "off" | "all" | "admins"
     "show_join_id": "off",
     # Глобальный допуск: бот работает в группе только после одобрения владельцем
-    "require_approval": True,
+    "require_approval": False,
     "approved_chats": [],
     # Индивидуальные настройки по чатам: {chat_id: {...только per-chat ключи...}}
     # Если для чата записи нет — используются глобальные настройки выше (как шаблон).
@@ -409,7 +409,7 @@ async def can_edit_target(context, user_id: int, target) -> bool:
 
 def chat_allowed(chat_id: int) -> bool:
     """True, если бот допущен работать в этом чате (или допуск выключен)."""
-    if not CONFIG.get("require_approval", True):
+    if not CONFIG.get("require_approval", False):
         return True
     return chat_id in CONFIG.get("approved_chats", [])
 
@@ -1040,7 +1040,7 @@ async def on_my_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         remember_group(cm.chat)
         log.info("Бот в группе %s, статус %s", cm.chat.id, status)
         # Свежо добавили и чат ещё не одобрен — спрашиваем разрешение у владельца
-        if old in ("left", "kicked") and CONFIG.get("require_approval", True) \
+        if old in ("left", "kicked") and CONFIG.get("require_approval", False) \
                 and cm.chat.id not in CONFIG.get("approved_chats", []):
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Разрешить", callback_data=f"appr:ok:{cm.chat.id}"),
@@ -2221,7 +2221,7 @@ def access_kb() -> InlineKeyboardMarkup:
 
 
 def approve_kb() -> InlineKeyboardMarkup:
-    req = CONFIG.get("require_approval", True)
+    req = CONFIG.get("require_approval", False)
     rows = [[InlineKeyboardButton(
         "🔒 Требовать одобрение: ВКЛ" if req else "🔓 Требовать одобрение: ВЫКЛ",
         callback_data="apt:toggle")]]
@@ -2238,7 +2238,7 @@ def approve_kb() -> InlineKeyboardMarkup:
 
 
 def approve_menu_text() -> str:
-    req = CONFIG.get("require_approval", True)
+    req = CONFIG.get("require_approval", False)
     n = len(CONFIG.get("approved_chats", []))
     return (
         "🔐 Допуск чатов.\n\n"
@@ -2262,7 +2262,7 @@ def status_text(cfg, target_label: str = "— группа —", show_global: bo
     pun = "бан" if m["warn_action"] == "ban" else f"мут {human_duration(m['warn_mute'])}"
     jid_label = {"off": "не показывать", "all": "видно всем", "admins": "только админам"}.get(
         cfg.get("show_join_id", "off"), "не показывать")
-    appr_label = "требуется одобрение" if CONFIG.get("require_approval", True) else "свободный"
+    appr_label = "требуется одобрение" if CONFIG.get("require_approval", False) else "свободный"
     lines += [
         "",
         f"Антифлуд: {f['limit']}/{f['period']}с → мут {f['mute']}с",
@@ -2547,7 +2547,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_owner(user.id):
             return await query.answer("Только для главного владельца", show_alert=True)
         if data == "apt:toggle":
-            CONFIG["require_approval"] = not CONFIG.get("require_approval", True)
+            CONFIG["require_approval"] = not CONFIG.get("require_approval", False)
             save_config()
         elif data.startswith("appr:"):
             _, act, cid = data.split(":", 2)
@@ -3490,13 +3490,14 @@ def build_app() -> Application:
         filters.StatusUpdate.NEW_CHAT_TITLE | filters.StatusUpdate.NEW_CHAT_PHOTO | filters.StatusUpdate.DELETE_CHAT_PHOTO,
         on_chat_settings_change))
 
-    # Ночной режим и медиа-фильтр — раньше антиспама (может удалить и остановить обработку)
+    # Ночной режим и медиа-фильтр — отдельная группа 0 (может удалить и остановить обработку)
     app.add_handler(MessageHandler(
-        groups & ~filters.StatusUpdate.ALL & ~filters.COMMAND, on_group_guard))
+        groups & ~filters.StatusUpdate.ALL & ~filters.COMMAND, on_group_guard), group=0)
 
-    # Сообщения в группах
+    # Антиспам / стоп-слова / автоответы / антифлуд — ГРУППА 1 (своя, иначе сторож выше
+    # перехватил бы апдейт первым и этот хендлер не запустился бы)
     app.add_handler(MessageHandler(
-        groups & (filters.TEXT | filters.CAPTION) & ~filters.StatusUpdate.ALL, on_group_message))
+        groups & (filters.TEXT | filters.CAPTION) & ~filters.StatusUpdate.ALL, on_group_message), group=1)
 
     # Текст в ЛС
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, on_private_text))
