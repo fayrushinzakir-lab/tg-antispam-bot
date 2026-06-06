@@ -29,6 +29,10 @@ from telegram import (
     ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeAllPrivateChats,
 )
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
@@ -238,7 +242,28 @@ captcha_pending: dict = {}                # (chat_id, user_id) -> message_id к�
 _admin_cache: dict = {}
 _creator_cache: dict = {}                 # chat_id -> id создателя группы (или None)
 _recurring_last: dict = {}               # (chat_id, idx) -> метка последней отправки авто-сообщения
+soft_mutes: dict = {}                    # (chat_id, user_id) -> до какого времени удалять сообщения (0 = до снятия)
+join_dates: dict = {}                    # (chat_id, user_id) -> метка времени входа (для /info)
 ADMIN_CACHE_TTL = 300
+
+
+def soft_mute_add(chat_id: int, user_id: int, seconds: int = 0):
+    """Мягкий мут: помечаем, что сообщения этого пользователя надо удалять (для обычных групп)."""
+    soft_mutes[(chat_id, user_id)] = (time.time() + seconds) if seconds else 0.0
+
+
+def soft_mute_remove(chat_id: int, user_id: int):
+    soft_mutes.pop((chat_id, user_id), None)
+
+
+def is_soft_muted(chat_id: int, user_id: int) -> bool:
+    until = soft_mutes.get((chat_id, user_id))
+    if until is None:
+        return False
+    if until and until <= time.time():
+        soft_mutes.pop((chat_id, user_id), None)
+        return False
+    return True
 _state = {"last_promo": 0.0}
 
 
@@ -574,8 +599,15 @@ def check_flood(chat_id: int, user_id: int, cfg: dict) -> bool:
 
 
 async def mute_user(context, chat_id: int, user_id: int, seconds):
+    """Мут участника. В супергруппе — настоящий мут. В обычной группе мут одного нельзя,
+    поэтому включаем «мягкий мут»: сообщения этого пользователя будут удаляться."""
     until = None if not seconds else datetime.now(timezone.utc) + timedelta(seconds=seconds)
-    await context.bot.restrict_chat_member(chat_id, user_id, permissions=MUTE_PERMS, until_date=until)
+    try:
+        await context.bot.restrict_chat_member(chat_id, user_id, permissions=MUTE_PERMS, until_date=until)
+        soft_mute_remove(chat_id, user_id)  # настоящий мут — мягкий не нужен
+    except Exception as e:  # noqa: BLE001
+        log.debug("mute %s: %s → мягкий мут (обычная группа)", user_id, e)
+        soft_mute_add(chat_id, user_id, int(seconds) if seconds else 0)
 
 
 # ── предупреждения ──────────────────────────────────────────────────────────
@@ -757,6 +789,14 @@ async def on_group_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if await is_exempt(context, chat.id, user.id):
         return
+    # Мягкий мут (обычная группа): удаляем сообщения замученного, пока мут не снят
+    if is_soft_muted(chat.id, user.id):
+        try:
+            await msg.delete()
+            bump(chat.id, "deleted")
+        except Exception as e:  # noqa: BLE001
+            log.debug("soft-mute delete: %s", e)
+        raise ApplicationHandlerStop
     cfg = chat_cfg(chat.id)
     # Ночной режим
     if is_night_now(cfg.get("night", {})):
@@ -894,13 +934,16 @@ async def start_captcha(context, chat, user) -> bool:
         text = (f"👋 {html.escape(name)}, чтобы писать в этом чате, нажми кнопку ниже "
                 f"за {human_duration(c['timeout'])}.")
     else:
-        text = (f"👋 {html.escape(name)}, нажми кнопку ниже за {human_duration(c['timeout'])}, "
-                "иначе тебя удалят из чата.")
+        # обычная группа: мут одного нельзя — «мягкий мут» (удаляем сообщения) до нажатия/таймаута
+        soft_mute_add(chat.id, user.id, c["timeout"] + 30)
+        text = (f"👋 {html.escape(name)}, нажми кнопку ниже за {human_duration(c['timeout'])}. "
+                "До этого твои сообщения будут удаляться, а если не нажмёшь — удалю из чата.")
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Я не бот", callback_data=f"cap:{user.id}")]])
     try:
         sent = await context.bot.send_message(chat.id, text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:  # noqa: BLE001
         log.debug("captcha msg %s: %s", user.id, e)
+        soft_mute_remove(chat.id, user.id)
         if muted:
             try:
                 await context.bot.restrict_chat_member(chat.id, user.id, permissions=FULL_PERMS)
@@ -923,6 +966,7 @@ async def captcha_timeout(context: ContextTypes.DEFAULT_TYPE):
     mid = captcha_pending.pop((chat_id, uid), None)
     if mid is None:
         return  # уже подтвердил
+    soft_mute_remove(chat_id, uid)
     try:
         await context.bot.delete_message(chat_id, mid)
     except Exception:  # noqa: BLE001
@@ -937,6 +981,123 @@ async def captcha_timeout(context: ContextTypes.DEFAULT_TYPE):
         log.info("Капча не пройдена (%s): %s", action, uid)
     except Exception as e:  # noqa: BLE001
         log.debug("captcha fail action %s: %s", uid, e)
+
+
+def info_action_kb(tid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❗ Предупредить", callback_data=f"act:warn:{tid}"),
+         InlineKeyboardButton("🔇 Мут 1ч", callback_data=f"act:mute:{tid}")],
+        [InlineKeyboardButton("🔊 Размут", callback_data=f"act:unmute:{tid}"),
+         InlineKeyboardButton("🚫 Бан", callback_data=f"act:ban:{tid}")],
+        [InlineKeyboardButton("👥 Роли", callback_data=f"act:roles:{tid}")],
+    ])
+
+
+def info_roles_kb(chat_id: int, tid: int) -> InlineKeyboardMarkup:
+    roles = chat_roles(chat_id)
+    rows = []
+    for i, name in enumerate(sorted(roles.keys())):
+        inrole = tid in (roles[name] or {}).get("members", [])
+        rows.append([InlineKeyboardButton(f"{'✅' if inrole else '➕'} {name}",
+                                          callback_data=f"arole:{tid}:{i}")])
+    if not rows:
+        rows.append([InlineKeyboardButton("Ролей нет — создай в /panel → ▶️ Ещё → Роли", callback_data="noop")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"act:back:{tid}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def handle_action_press(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки действий под карточкой /info: предупредить / мут / размут / бан."""
+    query = update.callback_query
+    chat = update.effective_chat
+    presser = update.effective_user
+    data = query.data or ""
+
+    # Роли с карточки: показать список, переключать членство (право — как на настройки)
+    if data.startswith("arole:") or data.startswith("act:roles:") or data.startswith("act:back:"):
+        try:
+            tid = int(data.split(":")[-2]) if data.startswith("arole:") else int(data.split(":")[2])
+        except Exception:  # noqa: BLE001
+            return await query.answer()
+        if not await can_open_settings(context, chat.id, presser.id):
+            return await query.answer("Роли может назначать тот, кто настраивает группу", show_alert=True)
+        if data.startswith("act:back:"):
+            try:
+                await query.edit_message_reply_markup(reply_markup=info_action_kb(tid))
+            except Exception:  # noqa: BLE001
+                pass
+            return await query.answer()
+        if data.startswith("arole:"):
+            idx = int(data.split(":")[2])
+            wcfg = chat_cfg_writable(chat.id)
+            names = sorted((wcfg.get("roles", {}) or {}).keys())
+            if idx < len(names):
+                mem = wcfg["roles"][names[idx]].setdefault("members", [])
+                if tid in mem:
+                    mem.remove(tid)
+                else:
+                    if not is_manager(tid):
+                        mem.append(tid)
+                save_config()
+        try:
+            await query.edit_message_reply_markup(reply_markup=info_roles_kb(chat.id, tid))
+        except Exception:  # noqa: BLE001
+            pass
+        return await query.answer()
+
+    try:
+        _, action, tid_s = data.split(":")
+        tid = int(tid_s)
+    except Exception:  # noqa: BLE001
+        return await query.answer()
+    key = {"warn": "warn", "mute": "mute", "unmute": "mute", "ban": "ban"}.get(action, "ban")
+    if not await can_moderate(context, chat.id, presser.id, key):
+        return await query.answer("Нет прав", show_alert=True)
+    if action in ("ban", "mute") and (is_manager(tid) or tid in await group_admin_ids(context, chat.id)):
+        return await query.answer("Это администратор/доверенный — не трогаю", show_alert=True)
+    try:
+        if action == "warn":
+            n = inc_warn(chat.id, tid)
+            bump(chat.id, "warns")
+            m = chat_cfg(chat.id)["moderation"]
+            if n >= m["warn_limit"]:
+                reset_warns(chat.id, tid)
+                if m["warn_action"] == "ban":
+                    await context.bot.ban_chat_member(chat.id, tid)
+                    bump(chat.id, "banned")
+                    msg = f"{n}/{m['warn_limit']} — бан"
+                else:
+                    await mute_user(context, chat.id, tid, m["warn_mute"])
+                    bump(chat.id, "muted")
+                    msg = f"{n}/{m['warn_limit']} — мут"
+            else:
+                msg = f"предупреждение {n}/{m['warn_limit']}"
+        elif action == "mute":
+            await mute_user(context, chat.id, tid, 3600)
+            bump(chat.id, "muted")
+            msg = "мут на 1 час"
+        elif action == "unmute":
+            soft_mute_remove(chat.id, tid)
+            try:
+                await context.bot.restrict_chat_member(chat.id, tid, permissions=FULL_PERMS)
+            except Exception:  # noqa: BLE001
+                pass
+            msg = "размучен"
+        elif action == "ban":
+            await context.bot.ban_chat_member(chat.id, tid)
+            bump(chat.id, "banned")
+            msg = "забанен"
+        else:
+            return await query.answer()
+        await query.answer("✅ " + msg)
+        try:
+            base = query.message.text or "👤 Инфо"
+            await query.edit_message_text(
+                base + f"\n\n✅ {presser.first_name}: {msg}")
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as e:  # noqa: BLE001
+        await query.answer(f"Не вышло: {e}", show_alert=True)
 
 
 async def handle_setstaff_press(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -979,6 +1140,7 @@ async def handle_captcha_press(update: Update, context: ContextTypes.DEFAULT_TYP
     if context.job_queue:
         for job in context.job_queue.get_jobs_by_name(f"cap:{chat.id}:{user.id}"):
             job.schedule_removal()
+    soft_mute_remove(chat.id, user.id)
     try:
         await context.bot.restrict_chat_member(chat.id, user.id, permissions=FULL_PERMS)
     except Exception as e:  # noqa: BLE001
@@ -1015,6 +1177,7 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     log.debug("ban new member: %s", e)
                 continue
         bump(chat.id, "joined")
+        join_dates[(chat.id, u.id)] = time.time()
         await announce_join_id(context, chat, u)
         if captcha_on and await start_captcha(context, chat, u):
             continue  # приветствие отправим после прохождения капчи
@@ -1249,11 +1412,11 @@ async def cmd_diag(update, context):
         lines.append("\nℹ️ Ты админ/доверенный — на ТВОИ сообщения фильтры НЕ действуют. "
                      "Проверяй стоп-слова с обычного аккаунта (не админа).")
     if chat.type == "group":
-        lines.append("\n⚠️ Это ОБЫЧНАЯ группа. Мут недоступен (Telegram разрешает мутить только в супергруппах): "
-                     "не работают /mute, мут за флуд и наказание «мут» за предупреждения. "
-                     "Капча работает в режиме «кик»: не нажал кнопку вовремя — удаляю из чата (но до нажатия может писать). "
-                     "Бан/кик, стоп-слова, автоответы — работают. "
-                     "Для полноценного мута сделай группу супергруппой (она может остаться приватной).")
+        lines.append("\nℹ️ Это ОБЫЧНАЯ группа. Настоящий мут Telegram тут недоступен, поэтому мут работает "
+                     "как «мягкий»: бот удаляет сообщения заглушённого (для /mute, мута за флуд/предупреждения и капчи). "
+                     "Снаружи это как мут. Бан/кик/стоп-слова/автоответы работают как обычно. "
+                     "Хочешь честный мут (человек вообще не сможет отправить сообщение) — сделай группу супергруппой "
+                     "(можно приватной).")
     try:
         await msg.reply_text("\n".join(lines), parse_mode="HTML")
     except Exception:  # noqa: BLE001
@@ -1340,11 +1503,12 @@ async def cmd_unmute(update, context):
     if not tid:
         await update.effective_message.reply_text("Кого размутить? Ответь на сообщение или /unmute @user")
         return
+    soft_mute_remove(chat.id, tid)
     try:
         await context.bot.restrict_chat_member(chat.id, tid, permissions=FULL_PERMS)
-        await update.effective_message.reply_text(f"🔊 {tname} размучен.")
     except Exception as e:  # noqa: BLE001
-        await update.effective_message.reply_text(f"Не вышло: {e}")
+        log.debug("unmute restrict %s: %s", tid, e)  # обычная группа — хватило снятия мягкого мута
+    await update.effective_message.reply_text(f"🔊 {tname} размучен.")
 
 
 async def cmd_warn(update, context):
@@ -2358,9 +2522,9 @@ def captcha_menu_text(cfg) -> str:
         "Не успел за отведённое время — применяю действие выше.\n\n"
         "Боту нужно право «Ограничивать участников». Создателя группы Telegram "
         "ограничить нельзя, поэтому к нему капча не применяется.\n\n"
-        "ℹ️ В супергруппе новичок не может писать до нажатия кнопки. В обычной группе мут "
-        "недоступен, поэтому работает режим «кик»: не нажал вовремя — удаляю из чата "
-        "(до нажатия писать может). Тип группы покажет /diag."
+        "ℹ️ В супергруппе новичок реально не может писать до нажатия. В обычной группе настоящий "
+        "мут недоступен, поэтому до нажатия его сообщения удаляются (мягкий мут), а если не нажал "
+        "вовремя — удаляю из чата. Тип группы покажет /diag."
     )
 
 
@@ -2393,6 +2557,7 @@ HELP_TEXT = (
     "🛡 Модерация (в группе, для админов чата):\n"
     "/ban /unban /kick · /mute [время] /unmute · /warn /unwarn /warns · /stats\n"
     "/userid — узнать ID (ответом на сообщение — ID автора)\n"
+    "/info — карточка пользователя + кнопки (предупредить/мут/бан) (ответом)\n"
     "/reload — перечитать админов/права прямо сейчас (в группе)\n"
     "/diag — диагностика в группе: почему бот не реагирует (одобрена ли, админ ли бот, права)\n"
     "Цель: ответом на сообщение, либо @user или id. Время: 30m, 2h, 1d.\n\n"
@@ -2478,6 +2643,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Привязка staff-группы — кнопка в служебном чате
     if data.startswith("ss:"):
         return await handle_setstaff_press(update, context)
+
+    # Кнопки действий под карточкой /info (модераторские) — проверка прав внутри
+    if data.startswith("act:") or data.startswith("arole:"):
+        return await handle_action_press(update, context)
 
     # Доступ к панели: владелец/менеджер — полный; админ группы — только свои группы
     manager = is_manager(user.id)
@@ -3002,6 +3171,56 @@ async def cmd_id(update, context):
     await update.message.reply_text(f"Твой ID: {u.id}\nID этого чата: {c.id}")
 
 
+STATUS_RU = {"creator": "Владелец", "administrator": "Администратор", "member": "Участник",
+             "restricted": "Ограничен", "left": "Не в группе", "kicked": "Забанен"}
+
+
+async def cmd_info(update, context):
+    """Карточка пользователя + кнопки модерации (как у GroupHelp). Для админов/модераторов."""
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not chat or chat.type == "private":
+        return
+    actor = update.effective_user
+    if not await can_moderate(context, chat.id, actor.id, "warn"):
+        return
+    tid, tname = await resolve_target(update, context)
+    if not tid:
+        tid, tname = actor.id, (actor.first_name or str(actor.id))
+    fname, uname, status = tname, "—", "—"
+    try:
+        cm = await context.bot.get_chat_member(chat.id, tid)
+        status = STATUS_RU.get(cm.status, cm.status)
+        u = cm.user
+        fname = " ".join(filter(None, [u.first_name, u.last_name])) or fname
+        uname = f"@{u.username}" if u.username else "—"
+    except Exception as e:  # noqa: BLE001
+        log.debug("info getmember %s: %s", tid, e)
+    warns = get_warn(chat.id, tid)
+    limit = chat_cfg(chat.id)["moderation"]["warn_limit"]
+    roles = user_roles(chat.id, tid)
+    src = msg.reply_to_message.from_user if (msg.reply_to_message and msg.reply_to_message.from_user) else actor
+    lang = getattr(src, "language_code", None) if src and src.id == tid else None
+    lines = [
+        "👤 Инфо",
+        f"🆔 ID: <code>{tid}</code>",
+        f"Имя: {html.escape(fname)}",
+        f"Юзернейм: {html.escape(uname)}",
+        f"Состояние: {status}",
+        f"Предупреждения: {warns}/{limit}",
+    ]
+    jt = join_dates.get((chat.id, tid))
+    if jt:
+        lines.append("Вступил(а): " + datetime.fromtimestamp(jt).strftime("%d.%m.%y в %H:%M"))
+    if lang:
+        lines.append(f"Язык: {html.escape(lang)}")
+    if roles:
+        lines.append("Роли: " + html.escape(", ".join(roles)))
+    if is_soft_muted(chat.id, tid):
+        lines.append("🔇 Сейчас в муте")
+    await msg.reply_text("\n".join(lines), reply_markup=info_action_kb(tid), parse_mode="HTML")
+
+
 async def cmd_userid(update, context):
     """Узнать Telegram ID. Ответом на сообщение — ID его автора (для админов)."""
     msg = update.effective_message
@@ -3083,6 +3302,27 @@ async def cmd_managers(update, context):
     if not is_owner(update.effective_user.id):
         return
     await update.message.reply_text(access_menu_text(), reply_markup=access_kb())
+
+
+async def cmd_settings_hint(update, context):
+    """/config (или /settings) в группе — кнопка, открывающая настройки в личке."""
+    chat = update.effective_chat
+    if not chat or chat.type == "private":
+        return
+    user = update.effective_user
+    if not await can_open_settings(context, chat.id, user.id):
+        return
+    try:
+        uname = context.bot.username or (await context.bot.get_me()).username
+    except Exception:  # noqa: BLE001
+        uname = None
+    if uname:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "⚙️ Открыть настройки", url=f"https://t.me/{uname}?start=panel")]])
+        await update.effective_message.reply_text(
+            "Настройки группы открываются в личке со мной 👇", reply_markup=kb)
+    else:
+        await update.effective_message.reply_text("Открой меня в личке и напиши /panel.")
 
 
 # ── контент-команды ─────────────────────────────────────────────────────────
@@ -3431,8 +3671,51 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Ошибка при обработке апдейта: %s", context.error)
 
 
+async def _post_init(app: Application):
+    """Меню команд (список при вводе «/») — отдельно для групп и для лички."""
+    try:
+        group_cmds = [
+            BotCommand("info", "👤 Инфо о пользователе + кнопки"),
+            BotCommand("warn", "⚠️ Предупредить (ответом)"),
+            BotCommand("unwarn", "Снять предупреждение (ответом)"),
+            BotCommand("warns", "Сколько предупреждений (ответом)"),
+            BotCommand("mute", "🔇 Заглушить (ответом)"),
+            BotCommand("unmute", "🔊 Снять заглушение (ответом)"),
+            BotCommand("ban", "🚫 Забанить (ответом)"),
+            BotCommand("kick", "👢 Выгнать (ответом)"),
+            BotCommand("unban", "Разбанить (ответом или @user)"),
+            BotCommand("role", "👥 Выдать роль (ответом): /role Имя"),
+            BotCommand("unrole", "Снять роли (ответом)"),
+            BotCommand("all", "📣 Позвать всех"),
+            BotCommand("say", "🗣 Сказать от имени бота"),
+            BotCommand("group", "📜 Показать правила"),
+            BotCommand("link", "🔗 Ссылка-приглашение"),
+            BotCommand("stats", "📊 Статистика чата"),
+            BotCommand("config", "⚙️ Настройки (откроются в личке)"),
+            BotCommand("reload", "🔄 Обновить список админов/права"),
+            BotCommand("diag", "🔧 Диагностика: почему бот молчит"),
+            BotCommand("setstaff", "🛡 Сделать этот чат служебным"),
+        ]
+        # Команды модерации показываем ТОЛЬКО админам группы (обычные участники их не видят)
+        await app.bot.set_my_commands(group_cmds, scope=BotCommandScopeAllChatAdministrators())
+        # Обычным участникам в группах — пустой список (как у GroupHelp: команд не видно)
+        try:
+            await app.bot.set_my_commands([], scope=BotCommandScopeAllGroupChats())
+        except Exception:  # noqa: BLE001
+            pass
+        priv_cmds = [
+            BotCommand("panel", "⚙️ Панель настроек"),
+            BotCommand("status", "📊 Статус и настройки"),
+            BotCommand("start", "Старт"),
+            BotCommand("help", "Что я умею"),
+        ]
+        await app.bot.set_my_commands(priv_cmds, scope=BotCommandScopeAllPrivateChats())
+    except Exception as e:  # noqa: BLE001
+        log.debug("set_my_commands: %s", e)
+
+
 def build_app() -> Application:
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
     private = filters.ChatType.PRIVATE
     groups = filters.ChatType.GROUPS
@@ -3443,6 +3726,7 @@ def build_app() -> Application:
     # ЛС (управление)
     app.add_handler(CommandHandler("start", cmd_start, filters=private))
     app.add_handler(CommandHandler(["panel", "settings", "menu"], cmd_panel, filters=private))
+    app.add_handler(CommandHandler(["config", "settings"], cmd_settings_hint, filters=groups))
     app.add_handler(CommandHandler("status", cmd_status, filters=private))
     app.add_handler(CommandHandler("help", cmd_help, filters=private))
     app.add_handler(CommandHandler("cancel", cmd_cancel, filters=private))
@@ -3469,6 +3753,7 @@ def build_app() -> Application:
     # Модерация / привлечение (в группах)
     app.add_handler(CommandHandler("reload", cmd_reload, filters=groups))
     app.add_handler(CommandHandler("diag", cmd_diag, filters=groups))
+    app.add_handler(CommandHandler("info", cmd_info, filters=groups))
     app.add_handler(CommandHandler(["role", "setrole"], cmd_role, filters=groups))
     app.add_handler(CommandHandler("unrole", cmd_unrole, filters=groups))
     app.add_handler(CommandHandler("setstaff", cmd_setstaff, filters=groups))
