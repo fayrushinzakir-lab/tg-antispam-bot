@@ -880,25 +880,32 @@ async def announce_join_id(context, chat, user):
 
 
 async def start_captcha(context, chat, user) -> bool:
-    """Мутит новичка и просит нажать «я не бот». True — если капча запущена."""
+    """Просит новичка нажать «я не бот». В супергруппе — с мутом до нажатия,
+    в обычной группе (где мут недоступен) — режим «кик, если не нажал». True — капча запущена."""
     c = chat_cfg(chat.id)["captcha"]
+    muted = False
     try:
         await context.bot.restrict_chat_member(chat.id, user.id, permissions=MUTE_PERMS)
+        muted = True
     except Exception as e:  # noqa: BLE001
-        log.debug("captcha mute %s: %s", user.id, e)
-        return False  # не можем замутить — пропускаем капчу, чтобы не ломать вход
+        log.debug("captcha mute %s: %s (обычная группа — режим кика)", user.id, e)
     name = user.first_name or "друг"
-    text = (f"👋 {html.escape(name)}, чтобы писать в этом чате, нажми кнопку ниже "
-            f"за {human_duration(c['timeout'])}.")
+    if muted:
+        text = (f"👋 {html.escape(name)}, чтобы писать в этом чате, нажми кнопку ниже "
+                f"за {human_duration(c['timeout'])}.")
+    else:
+        text = (f"👋 {html.escape(name)}, нажми кнопку ниже за {human_duration(c['timeout'])}, "
+                "иначе тебя удалят из чата.")
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Я не бот", callback_data=f"cap:{user.id}")]])
     try:
         sent = await context.bot.send_message(chat.id, text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:  # noqa: BLE001
         log.debug("captcha msg %s: %s", user.id, e)
-        try:
-            await context.bot.restrict_chat_member(chat.id, user.id, permissions=FULL_PERMS)
-        except Exception:  # noqa: BLE001
-            pass
+        if muted:
+            try:
+                await context.bot.restrict_chat_member(chat.id, user.id, permissions=FULL_PERMS)
+            except Exception:  # noqa: BLE001
+                pass
         return False
     captcha_pending[(chat.id, user.id)] = sent.message_id
     if context.job_queue:
@@ -1242,10 +1249,11 @@ async def cmd_diag(update, context):
         lines.append("\nℹ️ Ты админ/доверенный — на ТВОИ сообщения фильтры НЕ действуют. "
                      "Проверяй стоп-слова с обычного аккаунта (не админа).")
     if chat.type == "group":
-        lines.append("\n⚠️ Это ОБЫЧНАЯ группа. Капча, мут и «предупреждение→мут» не работают: "
-                     "Telegram разрешает мутить только в супергруппах. Бан/кик, стоп-слова и автоответы — работают. "
-                     "Сделай группу супергруппой (Настройки группы → Тип группы → сделать публичной, сохранить, "
-                     "потом можно вернуть приватной). Настройки перенесутся автоматически.")
+        lines.append("\n⚠️ Это ОБЫЧНАЯ группа. Мут недоступен (Telegram разрешает мутить только в супергруппах): "
+                     "не работают /mute, мут за флуд и наказание «мут» за предупреждения. "
+                     "Капча работает в режиме «кик»: не нажал кнопку вовремя — удаляю из чата (но до нажатия может писать). "
+                     "Бан/кик, стоп-слова, автоответы — работают. "
+                     "Для полноценного мута сделай группу супергруппой (она может остаться приватной).")
     try:
         await msg.reply_text("\n".join(lines), parse_mode="HTML")
     except Exception:  # noqa: BLE001
@@ -2350,8 +2358,9 @@ def captcha_menu_text(cfg) -> str:
         "Не успел за отведённое время — применяю действие выше.\n\n"
         "Боту нужно право «Ограничивать участников». Создателя группы Telegram "
         "ограничить нельзя, поэтому к нему капча не применяется.\n\n"
-        "⚠️ Важно: капча работает только в СУПЕРГРУППЕ. В обычной группе Telegram "
-        "не даёт мутить участников. Проверить тип — командой /diag в группе."
+        "ℹ️ В супергруппе новичок не может писать до нажатия кнопки. В обычной группе мут "
+        "недоступен, поэтому работает режим «кик»: не нажал вовремя — удаляю из чата "
+        "(до нажатия писать может). Тип группы покажет /diag."
     )
 
 
