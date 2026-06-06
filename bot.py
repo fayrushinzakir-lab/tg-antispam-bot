@@ -433,25 +433,25 @@ def chat_cfg_writable(chat_id) -> dict:
 
 
 def panel_cfg(context) -> dict:
-    """Какой конфиг сейчас правит человек в панели: шаблон или конкретный чат."""
-    tgt = context.user_data.get("cfg_target", "defaults")
-    if tgt == "defaults":
-        return CONFIG  # правим глобальный шаблон (верхний уровень)
-    return chat_cfg_writable(int(tgt))
+    """Редактируемый конфиг выбранной группы."""
+    tgt = context.user_data.get("cfg_target")
+    if tgt and tgt != "defaults":
+        return chat_cfg_writable(int(tgt))
+    return CONFIG  # запасной вариант, если группа не выбрана (UI этого не допускает)
 
 
 def panel_cfg_view(context) -> dict:
-    """Конфиг выбранной цели ТОЛЬКО для показа — без создания персональной копии."""
-    tgt = context.user_data.get("cfg_target", "defaults")
-    if tgt == "defaults":
-        return CONFIG
-    return chat_cfg(int(tgt))  # вернёт свои настройки чата или общий шаблон
+    """Конфиг выбранной группы ТОЛЬКО для показа — без создания персональной копии."""
+    tgt = context.user_data.get("cfg_target")
+    if tgt and tgt != "defaults":
+        return chat_cfg(int(tgt))
+    return CONFIG
 
 
 def panel_target_label(context) -> str:
-    tgt = context.user_data.get("cfg_target", "defaults")
-    if tgt == "defaults":
-        return "🌐 шаблон (новые группы)"
+    tgt = context.user_data.get("cfg_target")
+    if not tgt or tgt == "defaults":
+        return "— группа не выбрана —"
     title = CONFIG.get("groups", {}).get(str(tgt), str(tgt))
     return f"📂 {title}"
 
@@ -1755,7 +1755,7 @@ async def recurring_job(context: ContextTypes.DEFAULT_TYPE):
 # ───────────────────────────────────────────────────────────────────────────
 
 
-def main_menu_kb(target_label: str = "🌐 шаблон (новые группы)", full: bool = True) -> InlineKeyboardMarkup:
+def main_menu_kb(target_label: str = "— группа —", full: bool = True) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(f"⚙️ Настраиваю: {target_label}", callback_data="pick:list")],
         [InlineKeyboardButton("📊 Статус", callback_data="m:status"),
@@ -1780,17 +1780,19 @@ def main_menu_kb(target_label: str = "🌐 шаблон (новые группы
 
 
 def pick_kb(manager: bool = True, allowed=None) -> InlineKeyboardMarkup:
-    """Выбор цели. Менеджеру — шаблон + все группы. Админу группы — только его группы."""
+    """Выбор группы для настройки (📂 — уже настроена, ▫️ — по умолчанию)."""
     rows = []
-    if manager:
-        rows.append([InlineKeyboardButton("🌐 Шаблон (для новых групп)", callback_data="pick:defaults")])
     custom = set(CONFIG.get("chats", {}).keys())
+    shown = 0
     for cid, title in sorted(CONFIG.get("groups", {}).items()):
         if allowed is not None and cid not in allowed:
             continue
-        label = title if len(title) <= 24 else title[:23] + "…"
-        mark = "📂" if cid in custom else "▫️"  # 📂 — свои настройки, ▫️ — по шаблону
+        label = title if len(title) <= 26 else title[:25] + "…"
+        mark = "📂" if cid in custom else "▫️"
         rows.append([InlineKeyboardButton(f"{mark} {label}", callback_data=f"pick:{cid}")])
+        shown += 1
+    if shown == 0:
+        rows.append([InlineKeyboardButton("➕ Сначала добавь меня в группу", callback_data="noop")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -2166,7 +2168,7 @@ def approve_menu_text() -> str:
     )
 
 
-def status_text(cfg, target_label: str = "🌐 шаблон (новые группы)", show_global: bool = True) -> str:
+def status_text(cfg, target_label: str = "— группа —", show_global: bool = True) -> str:
     en = cfg["enabled"]
     f = cfg["flood"]
     m = cfg["moderation"]
@@ -2264,7 +2266,7 @@ def captcha_menu_text(cfg) -> str:
     )
 
 
-def backup_menu_text(label: str = "🌐 шаблон", owner: bool = False) -> str:
+def backup_menu_text(label: str = "— группа —", owner: bool = False) -> str:
     t = (
         f"💾 Бэкап настроек · сейчас: {label}\n\n"
         "«Скачать настройки этой группы» — пришлю файл с настройками выбранной цели "
@@ -2282,8 +2284,8 @@ def backup_menu_text(label: str = "🌐 шаблон", owner: bool = False) -> s
 HELP_TEXT = (
     "ℹ️ Управление (в ЛС): /panel /status /id\n\n"
     "⚙️ У каждой группы могут быть СВОИ настройки. В панели сверху кнопка "
-    "«Настраиваю: …» — выбери шаблон (для новых групп) или конкретную группу, "
-    "и дальше всё (стоп-слова, приветствие, капча, правила и т.д.) применяется к ней.\n\n"
+    "«Настраиваю: …» — выбери конкретную группу, и дальше всё "
+    "(стоп-слова, приветствие, капча, правила и т.д.) применяется именно к ней.\n\n"
     "Автоответы: /add слово = ответ · /del · /list\n"
     "Стоп-слова (чёрный список, удаляются): /addword · /delword · /words\n"
     "Спам-домены: /addlink · /dellink · /links\n"
@@ -2379,44 +2381,40 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Доступ к панели: владелец/менеджер — полный; админ группы — только свои группы
     manager = is_manager(user.id)
-    allowed = None  # None => все цели (менеджер)
-    if not manager:
+    if manager:
+        allowed = set(CONFIG.get("groups", {}).keys())  # менеджер настраивает любую группу
+    else:
         my = await user_admin_groups(context, user.id)
         if not my:
             await query.answer("Недоступно", show_alert=True)
             return
         allowed = {cid for cid, _ in my}
-        # групп-админ не может стоять на шаблоне или чужой группе — нормализуем
-        if context.user_data.get("cfg_target") not in allowed:
-            context.user_data["cfg_target"] = sorted(allowed)[0]
-        # глобальные разделы — недоступны
+        # глобальные разделы — недоступны не-менеджерам
         if (data in ("m:promo", "m:access", "m:approve", "bk:export", "bk:import")
                 or data.startswith(("pr:", "post:", "pto:", "dm:", "appr:", "apt:"))):
             await query.answer("Это только для владельца/менеджеров бота", show_alert=True)
             return
+    # Цель панели — всегда реальная группа из доступных
+    if allowed and context.user_data.get("cfg_target") not in allowed:
+        context.user_data["cfg_target"] = sorted(allowed)[0]
 
     await query.answer()
 
-    # Конфиг выбранной цели — для ПОКАЗА (read-only). Копия для правки берётся при изменении.
+    # Конфиг выбранной группы — для ПОКАЗА (read-only). Копия для правки берётся при изменении.
     cfg = panel_cfg_view(context)
     label = panel_target_label(context)
 
-    # Выбор цели настройки
+    # Выбор группы
     if data.startswith("pick:"):
         val = data[5:]
         if val == "list":
-            intro = ("Что настраиваем?\n\n«Шаблон» — настройки по умолчанию для новых групп.\n"
-                     "Или выбери конкретную группу (📂 — свои настройки, ▫️ — по шаблону):") if manager else \
-                    ("Выбери свою группу (📂 — свои настройки, ▫️ — по шаблону):")
-            return await safe_edit(query, intro, pick_kb(manager, allowed))
-        if val == "defaults":
-            if not manager:
-                return await query.answer("Шаблон настраивает только владелец/менеджер", show_alert=True)
-            context.user_data["cfg_target"] = "defaults"
-        else:
-            if not manager and (allowed is None or val not in allowed):
-                return await query.answer("Это не твоя группа", show_alert=True)
-            context.user_data["cfg_target"] = val
+            return await safe_edit(
+                query, "Выбери группу для настройки (📂 — уже настроена, ▫️ — по умолчанию):",
+                pick_kb(manager, allowed))
+        if val not in allowed:
+            return await query.answer(
+                "Группа недоступна" if manager else "Это не твоя группа", show_alert=True)
+        context.user_data["cfg_target"] = val
         return await safe_edit(
             query, "🛠 Панель управления AntiSpam",
             main_menu_kb(panel_target_label(context), full=manager))
@@ -2796,17 +2794,21 @@ async def add_group_button(context):
 
 
 async def _ensure_panel_target(update, context):
-    """Готовит цель панели под права. Возвращает ('manager'|'groupadmin'|'none', label, full)."""
+    """Готовит цель панели (всегда реальная группа). Возвращает (level, label, full).
+    level: manager | groupadmin | nogroups | none."""
     uid = update.effective_user.id
-    if is_manager(uid):
-        return "manager", panel_target_label(context), True
-    my = await user_admin_groups(context, uid)
-    if not my:
-        return "none", "", False
-    allowed = {cid for cid, _ in my}
+    manager = is_manager(uid)
+    if manager:
+        allowed = list(CONFIG.get("groups", {}).keys())
+        if not allowed:
+            return "nogroups", "", True
+    else:
+        allowed = [cid for cid, _ in await user_admin_groups(context, uid)]
+        if not allowed:
+            return "none", "", False
     if context.user_data.get("cfg_target") not in allowed:
         context.user_data["cfg_target"] = sorted(allowed)[0]
-    return "groupadmin", panel_target_label(context), False
+    return ("manager" if manager else "groupadmin"), panel_target_label(context), manager
 
 
 async def cmd_start(update, context):
@@ -2835,6 +2837,12 @@ async def cmd_start(update, context):
             "Можешь настроить свои группы (где ты админ): антиспам, приветствие, "
             "капчу, правила и т.д. Нажми «Настроить мои группы».",
             reply_markup=kb)
+    elif level == "nogroups":
+        await update.message.reply_text(
+            "👋 Привет! Я AntiSpam Moriarty.\n\n"
+            "Я ещё не добавлен ни в одну группу. Нажми кнопку ниже, добавь меня "
+            "администратором — и тогда в /panel появятся настройки этой группы.",
+            reply_markup=InlineKeyboardMarkup([[add_btn]]))
     else:
         await update.message.reply_text(
             "👋 Я антиспам-бот. Добавь меня в группу администратором — и я буду следить за порядком.\n\n"
@@ -2846,13 +2854,19 @@ async def cmd_panel(update, context):
     level, label, full = await _ensure_panel_target(update, context)
     if level == "none":
         return
+    if level == "nogroups":
+        add_btn = await add_group_button(context)
+        await update.message.reply_text(
+            "Я пока не добавлен ни в одну группу. Добавь меня — и появятся настройки.",
+            reply_markup=InlineKeyboardMarkup([[add_btn]]))
+        return
     await update.message.reply_text(
         "🛠 Панель управления AntiSpam", reply_markup=main_menu_kb(label, full=full))
 
 
 async def cmd_status(update, context):
     level, label, full = await _ensure_panel_target(update, context)
-    if level == "none":
+    if level in ("none", "nogroups"):
         return
     await update.message.reply_text(
         status_text(panel_cfg_view(context), label, show_global=(level == "manager")),
