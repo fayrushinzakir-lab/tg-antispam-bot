@@ -665,12 +665,46 @@ async def _gate_unapproved(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Замок: в неодобренных группах бот молчит (блокируем все прочие хендлеры).
 
     Группу всё равно запоминаем, чтобы владелец мог одобрить её из панели.
+    Пропускаем диагностику (/diag) и служебные сообщения о миграции группы.
     """
     chat = update.effective_chat
     if chat is not None and getattr(chat, "type", None) in ("group", "supergroup"):
         remember_group(chat)
         if not chat_allowed(chat.id):
+            msg = update.effective_message
+            txt = (msg.text or "") if msg else ""
+            if txt.startswith("/diag"):
+                return  # диагностику пропускаем даже без одобрения
+            if msg and (msg.migrate_to_chat_id or msg.migrate_from_chat_id):
+                return  # миграцию группы пропускаем
             raise ApplicationHandlerStop
+
+
+def _migrate_chat(old_id: int, new_id: int):
+    """Перенести одобрение и настройки при апгрейде группы в супергруппу (id меняется)."""
+    if old_id == new_id:
+        return
+    appr = CONFIG.setdefault("approved_chats", [])
+    if old_id in appr and new_id not in appr:
+        appr.append(new_id)
+    o, n = str(old_id), str(new_id)
+    for store in ("groups", "chats", "invite_links", "all_optout", "warns"):
+        d = CONFIG.get(store)
+        if isinstance(d, dict) and o in d and n not in d:
+            d[n] = d.pop(o)
+    save_config()
+    log.info("Группа мигрировала: %s → %s", old_id, new_id)
+
+
+async def on_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Апгрейд группы → супергруппа: переносим одобрение/настройки на новый chat_id."""
+    msg = update.effective_message
+    if not msg:
+        return
+    if msg.migrate_to_chat_id:
+        _migrate_chat(update.effective_chat.id, msg.migrate_to_chat_id)
+    elif msg.migrate_from_chat_id:
+        _migrate_chat(msg.migrate_from_chat_id, update.effective_chat.id)
 
 
 def message_media_type(msg) -> str:
@@ -1163,6 +1197,54 @@ async def cmd_reload(update, context):
     if not await can_moderate(context, chat.id, update.effective_user.id):
         return
     await update.effective_message.reply_text("✅ Готово — список админов и права перечитаны.")
+
+
+async def cmd_diag(update, context):
+    """Диагностика в группе: почему бот не реагирует. Доступна админам/владельцу."""
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not chat or chat.type == "private":
+        if msg:
+            await msg.reply_text("Команду /diag нужно вызвать в группе.")
+        return
+    user = update.effective_user
+    if not (is_manager(user.id) or user.id in await group_admin_ids(context, chat.id)):
+        return
+    lines = [f"🔧 Диагностика · {chat.title}", f"chat_id: <code>{chat.id}</code> · тип: {chat.type}", ""]
+    appr = chat_allowed(chat.id)
+    lines.append(("✅" if appr else "🔴") +
+                 (" Группа одобрена" if appr else " Группа НЕ одобрена → бот молчит. Реши в ЛС: /panel → 👥 Доступ → 🔐 Допуск чатов"))
+    try:
+        me = await context.bot.get_chat_member(chat.id, context.bot.id)
+        isadm = me.status in ("administrator", "creator")
+        if isadm:
+            lines.append("✅ Бот — администратор")
+            cd = bool(getattr(me, "can_delete_messages", False))
+            cr = bool(getattr(me, "can_restrict_members", False))
+            lines.append(("✅" if cd else "🔴") + f" Право удалять сообщения: {'да' if cd else 'НЕТ'}")
+            lines.append(("✅" if cr else "🔴") + f" Право банить/мутить: {'да' if cr else 'НЕТ'}")
+        else:
+            lines.append("🔴 Бот НЕ администратор → Telegram не отдаёт ему обычные сообщения "
+                         "(privacy-mode), и он не может удалять/банить. Сделай бота админом с правами "
+                         "удалять сообщения и банить.")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"⚠️ Не смог проверить статус бота: {e}")
+    cfg = chat_cfg(chat.id)
+    en = cfg["enabled"]
+    lines += [
+        "",
+        f"Стоп-слова: {'вкл' if en.get('words') else 'выкл'} ({len(cfg['stop_words'])} шт)",
+        f"Автоответы: {'вкл' if en.get('triggers') else 'выкл'} ({len(cfg['triggers'])} шт)",
+        f"Антифлуд: {'вкл' if en.get('flood') else 'выкл'} · Капча: {'вкл' if cfg['captcha']['enabled'] else 'выкл'}",
+        f"Настройки группы: {'свои' if str(chat.id) in CONFIG.get('chats', {}) else 'по умолчанию'}",
+    ]
+    if await is_exempt(context, chat.id, user.id):
+        lines.append("\nℹ️ Ты админ/доверенный — на ТВОИ сообщения фильтры НЕ действуют. "
+                     "Проверяй стоп-слова с обычного аккаунта (не админа).")
+    try:
+        await msg.reply_text("\n".join(lines), parse_mode="HTML")
+    except Exception:  # noqa: BLE001
+        await msg.reply_text("\n".join(lines).replace("<code>", "").replace("</code>", ""))
 
 
 async def cmd_ban(update, context):
@@ -2296,6 +2378,7 @@ HELP_TEXT = (
     "/ban /unban /kick · /mute [время] /unmute · /warn /unwarn /warns · /stats\n"
     "/userid — узнать ID (ответом на сообщение — ID автора)\n"
     "/reload — перечитать админов/права прямо сейчас (в группе)\n"
+    "/diag — диагностика в группе: почему бот не реагирует (одобрена ли, админ ли бот, права)\n"
     "Цель: ответом на сообщение, либо @user или id. Время: 30m, 2h, 1d.\n\n"
     "📣 Привлечение, призыв, постинг:\n"
     "/invite — ссылка-приглашение (в группе)\n"
@@ -2331,7 +2414,8 @@ GROUPADMIN_HELP = (
     "капчу, ключевые слова (автоответы), стоп-слова, спам-домены, правила.\n\n"
     "💾 Бэкап → «Скачать/Загрузить настройки этой группы» — сохранить или перенести настройки группы.\n\n"
     "В группе работают команды модерации: /ban /kick /mute /warn /warns /stats, "
-    "а также /group (правила), /link (ссылка) и /reload (перечитать права сейчас).\n\n"
+    "а также /group (правила), /link (ссылка), /reload (перечитать права) и "
+    "/diag (диагностика — почему бот молчит).\n\n"
     "🕹 Кто какие команды может — панель → ▶️ Ещё → «Права на команды» "
     "(а кто открывает настройки группы — меняет только создатель группы).\n"
     "🧹 Медиа-фильтр, 🌙 ночной режим и 🔁 авто-сообщения — тоже в ▶️ Ещё.\n"
@@ -3368,6 +3452,7 @@ def build_app() -> Application:
 
     # Модерация / привлечение (в группах)
     app.add_handler(CommandHandler("reload", cmd_reload, filters=groups))
+    app.add_handler(CommandHandler("diag", cmd_diag, filters=groups))
     app.add_handler(CommandHandler(["role", "setrole"], cmd_role, filters=groups))
     app.add_handler(CommandHandler("unrole", cmd_unrole, filters=groups))
     app.add_handler(CommandHandler("setstaff", cmd_setstaff, filters=groups))
@@ -3417,6 +3502,9 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, on_private_text))
     # Файл в ЛС (импорт настроек)
     app.add_handler(MessageHandler(private & filters.Document.ALL, on_private_document))
+
+    # Апгрейд группы в супергруппу — перенести одобрение/настройки на новый chat_id
+    app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, on_migrate), group=1)
 
     # Чистка сервис-сообщений (вход/выход/закреп/смена фото) — отдельная группа,
     # чтобы работать вместе с приветствием/капчей/анти-сносом, а не вместо них
