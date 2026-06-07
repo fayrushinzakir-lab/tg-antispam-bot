@@ -42,6 +42,7 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ChatMemberHandler,
+    ChatJoinRequestHandler,
     ContextTypes,
     filters,
 )
@@ -68,6 +69,7 @@ DEFAULT_CONFIG = {
     "enabled": {
         "invites": True, "shorteners": True, "all_links": False, "spam_domains": True,
         "words": True, "flood": True, "name_check": True, "triggers": True,
+        "words2": False,
         "clean_service": False,
     },
     "flood": {"limit": 5, "period": 10, "mute": 300},
@@ -76,6 +78,11 @@ DEFAULT_CONFIG = {
         "заработок", "заработай", "инвестиц", "1xbet", "1win", "mostbet",
         "порно", "porn", "интим",
     ],
+    # Второй список слов — свой набор и СВОЁ наказание (мягче/строже первого).
+    # action: delete|mute|ban. profile: искать слова ещё и в имени/юзернейме участника.
+    "stop_words2": [],
+    "stop_words2_action": "ban",
+    "stop_words2_profile": True,
     "spam_links": [],
     "triggers": {"банан": "300 руб"},
     "trigger_match": "word",
@@ -85,6 +92,8 @@ DEFAULT_CONFIG = {
     # Медиа-фильтр: какие типы сообщений удалять у обычных участников
     "media_block": {"photo": False, "video": False, "animation": False, "sticker": False,
                     "voice": False, "video_note": False, "audio": False, "document": False, "forward": False},
+    # Наказание медиа-фильтра: delete|mute|ban (что делать с отправителем заблокированного медиа)
+    "media_action": "delete",
     # Ночной режим: в заданные часы сообщения обычных участников удаляются
     "night": {"enabled": False, "start": 23, "end": 7, "tz": 0},
     # Повторяющиеся авто-сообщения: [{"text": ..., "interval": минуты}]
@@ -93,7 +102,11 @@ DEFAULT_CONFIG = {
     "roles": {},
     # Staff-группа (служебный чат для уведомлений по этой группе); 0 — не задана
     "staff_group": 0,
+    # Чёрный список пользователей этой группы: по ID и по подстрокам имени/юзернейма
+    "blacklist": {"ids": [], "names": []},
     "welcome": {"enabled": False, "text": "Добро пожаловать, {name}! Рады видеть тебя в «{chat}»."},
+    # Язык сообщений для новичков (капча и т.п.): ru | uz | en
+    "lang": "ru",
     "warns": {},
     # Кому выдан доступ к управлению (помимо ADMIN_IDS)
     "managers": [],
@@ -106,6 +119,7 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "interval": 3600,
         "text": "Заходи к нам почаще и зови друзей! 🙌",
+        "pin": False,
     },
     # Текст «зазывалы» — сообщения с кнопкой «Пригласить друга»
     "invite_text": "Нравится у нас? Зови друзей 👇",
@@ -116,12 +130,14 @@ DEFAULT_CONFIG = {
     # Защита от сноса (анти-нюк)
     "antinuke": {"enabled": True, "ban_threshold": 5, "window": 30, "action": "stop"},
     # Капча для новичков: проверка «я не бот» на входе
-    "captcha": {"enabled": False, "timeout": 120, "action": "kick"},
+    "captcha": {"enabled": False, "timeout": 120, "action": "kick", "via_request": True},
     # Показывать ID новичка при входе: "off" | "all" | "admins"
     "show_join_id": "off",
     # Глобальный допуск: бот работает в группе только после одобрения владельцем
-    "require_approval": False,
+    "require_approval": True,
     "approved_chats": [],
+    # Подписчики ЛС по группам (кто прошёл капчу-заявку или запускал бота): {chat_id: [user_ids]}
+    "dm_subscribers": {},
     # Индивидуальные настройки по чатам: {chat_id: {...только per-chat ключи...}}
     # Если для чата записи нет — используются глобальные настройки выше (как шаблон).
     "chats": {},
@@ -138,11 +154,63 @@ FEATURES = [
     ("all_links", "Блокировать ВСЕ ссылки"),
     ("spam_domains", "Спам-домены из списка"),
     ("words", "Фильтр стоп-слов (чёрный список)"),
+    ("words2", "Второй список слов (своё наказание)"),
     ("flood", "Антифлуд"),
     ("name_check", "Проверка имён при входе"),
     ("triggers", "Автоответы (ключевые слова)"),
     ("clean_service", "Чистить сервис-сообщения (вход/выход)"),
 ]
+
+# ── Языки сообщений для новичков (капча и т.п.) ──────────────────────────────
+LANGS = {"ru": "Русский 🇷🇺", "uz": "Oʻzbekcha 🇺🇿", "en": "English 🇺🇸"}
+TR = {
+    "cap_btn": {
+        "ru": "✅ Я не бот",
+        "uz": "✅ Men bot emasman",
+        "en": "✅ I'm not a bot",
+    },
+    "cap_muted": {
+        "ru": "👋 {name}, чтобы писать в этом чате, нажми кнопку ниже за {time}.",
+        "uz": "👋 {name}, ushbu chatda yozish uchun {time} ichida quyidagi tugmani bosing.",
+        "en": "👋 {name}, to write in this chat, press the button below within {time}.",
+    },
+    "cap_kick": {
+        "ru": "👋 {name}, нажми кнопку ниже за {time}. До этого твои сообщения будут удаляться, "
+              "а если не нажмёшь — удалю из чата.",
+        "uz": "👋 {name}, {time} ichida quyidagi tugmani bosing. Shu vaqtgacha xabarlaringiz "
+              "oʻchiriladi, bosmasangiz — chatdan chiqarib yuboraman.",
+        "en": "👋 {name}, press the button below within {time}. Until then your messages will be "
+              "deleted, and if you don't press it I'll remove you from the chat.",
+    },
+    "cap_ok": {
+        "ru": "✅ Спасибо! Теперь можешь писать.",
+        "uz": "✅ Rahmat! Endi yozishingiz mumkin.",
+        "en": "✅ Thanks! You can write now.",
+    },
+    "cap_dm": {
+        "ru": "👋 Привет! Ты хочешь вступить в «{chat}».\nНажми кнопку ниже, чтобы подтвердить, "
+              "что ты не бот — и я впущу тебя.",
+        "uz": "👋 Salom! Siz «{chat}» guruhiga qoʻshilmoqchisiz.\nBot emasligingizni tasdiqlash uchun "
+              "quyidagi tugmani bosing — va men sizni qabul qilaman.",
+        "en": "👋 Hi! You're requesting to join «{chat}».\nPress the button below to confirm you're "
+              "not a bot, and I'll let you in.",
+    },
+    "cap_ok_dm": {
+        "ru": "✅ Готово! Я впустил тебя в «{chat}». Добро пожаловать!",
+        "uz": "✅ Tayyor! Sizni «{chat}» guruhiga qabul qildim. Xush kelibsiz!",
+        "en": "✅ Done! I've let you into «{chat}». Welcome!",
+    },
+}
+
+
+def tr(chat_id: int, key: str, **kw) -> str:
+    """Перевод сообщения для новичков по языку группы (по умолчанию ru)."""
+    lang = chat_cfg(chat_id).get("lang", "ru")
+    s = TR.get(key, {}).get(lang) or TR.get(key, {}).get("ru", key)
+    try:
+        return s.format(**kw) if kw else s
+    except Exception:  # noqa: BLE001
+        return s
 
 # ───────────────────────────────────────────────────────────────────────────
 #  ЛОГИ
@@ -160,12 +228,13 @@ log = logging.getLogger("antispam")
 
 # Настройки, которые могут быть индивидуальными для каждой группы.
 # Всё остальное (managers, groups, promo, approved_chats, invite_text, …) — глобальное.
-PER_CHAT_KEYS = ("enabled", "flood", "stop_words", "spam_links", "triggers",
+PER_CHAT_KEYS = ("enabled", "flood", "stop_words", "stop_words2", "stop_words2_action",
+                 "stop_words2_profile", "spam_links", "triggers",
                  "trigger_match", "moderation", "welcome", "captcha", "show_join_id",
-                 "rules", "antinuke", "cmd_perms", "media_block", "night", "recurring",
-                 "roles", "staff_group")
+                 "rules", "antinuke", "cmd_perms", "media_block", "media_action", "night", "recurring",
+                 "roles", "staff_group", "lang", "blacklist")
 PER_CHAT_DICTS = ("enabled", "flood", "moderation", "welcome", "captcha", "antinuke",
-                  "cmd_perms", "media_block", "night", "roles")
+                  "cmd_perms", "media_block", "night", "roles", "blacklist")
 
 
 def _fill_chat(chat: dict, base: dict) -> dict:
@@ -188,7 +257,7 @@ def _merge_defaults(data: dict) -> dict:
     if not isinstance(data, dict):
         return cfg
     for k, v in data.items():
-        if k in ("enabled", "flood", "moderation", "welcome", "promo", "antinuke", "captcha", "cmd_perms", "media_block", "night", "roles") and isinstance(v, dict):
+        if k in ("enabled", "flood", "moderation", "welcome", "promo", "antinuke", "captcha", "cmd_perms", "media_block", "night", "roles", "blacklist") and isinstance(v, dict):
             cfg[k].update(v)
         else:
             cfg[k] = v
@@ -209,7 +278,7 @@ def load_config() -> dict:
             # Миграция при обновлении со старой версии: уже известные группы
             # автоматически считаем разрешёнными, чтобы бот в них не замолчал.
             # Новые чаты по-прежнему требуют одобрения владельца.
-            if isinstance(raw, dict) and "approved_chats" not in raw and raw.get("groups"):
+            if isinstance(raw, dict) and raw.get("groups") and not cfg.get("approved_chats"):
                 cfg["approved_chats"] = [int(c) for c in raw["groups"].keys()]
             return cfg
         except Exception as e:  # noqa: BLE001
@@ -434,7 +503,7 @@ async def can_edit_target(context, user_id: int, target) -> bool:
 
 def chat_allowed(chat_id: int) -> bool:
     """True, если бот допущен работать в этом чате (или допуск выключен)."""
-    if not CONFIG.get("require_approval", False):
+    if not CONFIG.get("require_approval", True):
         return True
     return chat_id in CONFIG.get("approved_chats", [])
 
@@ -561,6 +630,44 @@ def find_word_violation(text: str, cfg: dict):
     for w in cfg.get("stop_words", []):
         if w and w.lower() in t:
             return w
+    return None
+
+
+def is_blacklisted(chat_id: int, user) -> bool:
+    """Пользователь в чёрном списке группы — по ID или по подстроке имени/фамилии/юзернейма."""
+    if user is None:
+        return False
+    bl = chat_cfg(chat_id).get("blacklist", {}) or {}
+    if getattr(user, "id", None) in bl.get("ids", []):
+        return True
+    names = bl.get("names", [])
+    if names:
+        prof = " ".join(filter(None, [getattr(user, "first_name", None),
+                                       getattr(user, "last_name", None),
+                                       getattr(user, "username", None)])).lower()
+        for n in names:
+            if n and n.lower() in prof:
+                return True
+    return False
+
+
+def find_word2_violation(text: str, cfg: dict, user=None):
+    """Второй список: ищем слово в тексте, а при включённой проверке профиля —
+    ещё и в имени/фамилии/юзернейме отправителя."""
+    words = cfg.get("stop_words2", [])
+    if not words:
+        return None
+    t = (text or "").lower()
+    for w in words:
+        if w and w.lower() in t:
+            return w
+    if user is not None and cfg.get("stop_words2_profile", True):
+        prof = " ".join(filter(None, [getattr(user, "first_name", None),
+                                       getattr(user, "last_name", None),
+                                       getattr(user, "username", None)])).lower()
+        for w in words:
+            if w and w.lower() in prof:
+                return w
     return None
 
 
@@ -789,6 +896,19 @@ async def on_group_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if await is_exempt(context, chat.id, user.id):
         return
+    # Чёрный список: баним и удаляем сообщение (по ID или имени)
+    if is_blacklisted(chat.id, user):
+        try:
+            await msg.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await context.bot.ban_chat_member(chat.id, user.id)
+            bump(chat.id, "banned")
+            log.info("Бан (чёрный список) от %s", user.id)
+        except Exception as e:  # noqa: BLE001
+            log.debug("blacklist ban msg: %s", e)
+        raise ApplicationHandlerStop
     # Мягкий мут (обычная группа): удаляем сообщения замученного, пока мут не снят
     if is_soft_muted(chat.id, user.id):
         try:
@@ -817,6 +937,17 @@ async def on_group_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 bump(chat.id, "deleted")
             except Exception as e:  # noqa: BLE001
                 log.debug("media block: %s", e)
+            action = cfg.get("media_action", "delete")
+            if action in ("mute", "ban"):
+                try:
+                    if action == "ban":
+                        await context.bot.ban_chat_member(chat.id, user.id)
+                        bump(chat.id, "banned")
+                    else:
+                        await mute_user(context, chat.id, user.id, cfg["flood"]["mute"])
+                        bump(chat.id, "muted")
+                except Exception as e:  # noqa: BLE001
+                    log.debug("media punish: %s", e)
             raise ApplicationHandlerStop
 
 
@@ -847,6 +978,27 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:  # noqa: BLE001
             log.debug("delete link: %s", e)
         return
+
+    if cfg["enabled"].get("words2"):
+        bad2 = find_word2_violation(text, cfg, user)
+        if bad2:
+            action = cfg.get("stop_words2_action", "ban")
+            try:
+                await msg.delete()
+                bump(chat.id, "deleted")
+            except Exception as e:  # noqa: BLE001
+                log.debug("delete word2: %s", e)
+            try:
+                if action == "ban":
+                    await context.bot.ban_chat_member(chat.id, user.id)
+                    bump(chat.id, "banned")
+                elif action == "mute":
+                    await mute_user(context, chat.id, user.id, cfg["flood"]["mute"])
+                    bump(chat.id, "muted")
+            except Exception as e:  # noqa: BLE001
+                log.debug("word2 punish: %s", e)
+            log.info("Второй список ('%s', %s) от %s", bad2, action, user.id)
+            return
 
     if cfg["enabled"].get("words"):
         bad = find_word_violation(text, cfg)
@@ -931,14 +1083,12 @@ async def start_captcha(context, chat, user) -> bool:
         log.debug("captcha mute %s: %s (обычная группа — режим кика)", user.id, e)
     name = user.first_name or "друг"
     if muted:
-        text = (f"👋 {html.escape(name)}, чтобы писать в этом чате, нажми кнопку ниже "
-                f"за {human_duration(c['timeout'])}.")
+        text = tr(chat.id, "cap_muted", name=html.escape(name), time=human_duration(c['timeout']))
     else:
         # обычная группа: мут одного нельзя — «мягкий мут» (удаляем сообщения) до нажатия/таймаута
         soft_mute_add(chat.id, user.id, c["timeout"] + 30)
-        text = (f"👋 {html.escape(name)}, нажми кнопку ниже за {human_duration(c['timeout'])}. "
-                "До этого твои сообщения будут удаляться, а если не нажмёшь — удалю из чата.")
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Я не бот", callback_data=f"cap:{user.id}")]])
+        text = tr(chat.id, "cap_kick", name=html.escape(name), time=human_duration(c['timeout']))
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(tr(chat.id, "cap_btn"), callback_data=f"cap:{user.id}")]])
     try:
         sent = await context.bot.send_message(chat.id, text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:  # noqa: BLE001
@@ -1150,8 +1300,157 @@ async def handle_captcha_press(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:  # noqa: BLE001
         pass
     bump(chat.id, "captcha_pass")
-    await query.answer("Готово! Можешь писать 🎉")
+    await query.answer(tr(chat.id, "cap_ok"))
     await send_welcome(context, chat, user)
+
+
+_join_handled: dict = {}  # (chat_id, user_id) -> ts последней обработки входа (антидубль)
+
+
+def _join_seen(chat_id: int, user_id: int, window: int = 20) -> bool:
+    """True, если этот вход уже обрабатывали недавно — чтобы капча не сработала дважды
+    (и на сервис-сообщение «вошёл», и на событие chat_member)."""
+    key = (chat_id, user_id)
+    now = time.time()
+    last = _join_handled.get(key)
+    _join_handled[key] = now
+    return last is not None and (now - last) < window
+
+
+join_requests: dict = {}  # (chat_id, user_id) -> True, пока ждём прохождения капчи-заявки
+
+
+def add_dm_subscriber(chat_id: int, user_id: int):
+    """Запомнить, что у бота есть личка с этим человеком (для будущих рассылок от группы)."""
+    subs = CONFIG.setdefault("dm_subscribers", {}).setdefault(str(chat_id), [])
+    if user_id not in subs:
+        subs.append(user_id)
+        save_config()
+
+
+async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Заявка на вступление: пишем новичку капчу в ЛИЧКУ. Так капча работает в любой
+    группе (мут не нужен), и человек оказывается в личке у бота."""
+    jr = update.chat_join_request
+    if not jr:
+        return
+    chat = jr.chat
+    user = jr.from_user
+    if not chat_allowed(chat.id):
+        return
+    cfg = chat_cfg(chat.id)
+    cap = cfg["captcha"]
+    if not (cap.get("enabled") and cap.get("via_request", True)):
+        return  # капча-в-личке выключена — заявку обработает админ вручную
+    if is_blacklisted(chat.id, user):
+        try:
+            await context.bot.decline_chat_join_request(chat.id, user.id)
+            log.info("Заявка отклонена (чёрный список): %s", user.id)
+        except Exception as e:  # noqa: BLE001
+            log.debug("blacklist decline: %s", e)
+        return
+    if cfg["enabled"].get("name_check"):
+        name = " ".join(filter(None, [user.first_name, user.last_name, user.username])).lower()
+        if find_word_violation(name, cfg) or find_link_violation(name, cfg):
+            try:
+                await context.bot.decline_chat_join_request(chat.id, user.id)
+            except Exception as e:  # noqa: BLE001
+                log.debug("decline spam name: %s", e)
+            return
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(tr(chat.id, "cap_btn"), callback_data=f"jrok:{chat.id}")]])
+    try:
+        await context.bot.send_message(jr.user_chat_id, tr(chat.id, "cap_dm", chat=chat.title or "группа"),
+                                       reply_markup=kb)
+    except Exception as e:  # noqa: BLE001
+        log.debug("join-request dm %s: %s", user.id, e)
+        return  # не смогли написать в личку — оставляем заявку админам
+    join_requests[(chat.id, user.id)] = True
+    if context.job_queue:
+        context.job_queue.run_once(
+            join_request_timeout, cap["timeout"],
+            data={"chat_id": chat.id, "user_id": user.id}, name=f"jr:{chat.id}:{user.id}")
+
+
+async def join_request_timeout(context: ContextTypes.DEFAULT_TYPE):
+    d = context.job.data
+    cid, uid = d["chat_id"], d["user_id"]
+    if join_requests.pop((cid, uid), None) is None:
+        return  # уже подтвердил
+    try:
+        await context.bot.decline_chat_join_request(cid, uid)
+        log.info("Заявка отклонена (капча не пройдена): %s", uid)
+    except Exception as e:  # noqa: BLE001
+        log.debug("join-request timeout decline: %s", e)
+
+
+async def handle_join_request_press(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Новичок нажал «я не бот» в личке — одобряем заявку и запоминаем его как подписчика."""
+    query = update.callback_query
+    user = update.effective_user
+    try:
+        cid = int((query.data or "").split(":")[1])
+    except Exception:  # noqa: BLE001
+        return await query.answer()
+    try:
+        await context.bot.approve_chat_join_request(cid, user.id)
+    except Exception as e:  # noqa: BLE001
+        log.debug("approve join-request %s: %s", user.id, e)
+        return await query.answer("Не получилось, попробуй ещё раз позже", show_alert=True)
+    join_requests.pop((cid, user.id), None)
+    if context.job_queue:
+        for job in context.job_queue.get_jobs_by_name(f"jr:{cid}:{user.id}"):
+            job.schedule_removal()
+    _join_seen(cid, user.id)            # чтобы в группе капча повторно не сработала
+    add_dm_subscriber(cid, user.id)     # теперь ему можно слать рассылку от группы
+    bump(cid, "captcha_pass")
+    title = CONFIG.get("groups", {}).get(str(cid), "группу")
+    await query.answer(tr(cid, "cap_ok"))
+    try:
+        await query.edit_message_text(tr(cid, "cap_ok_dm", chat=title))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        class _C:
+            id = cid
+            title = CONFIG.get("groups", {}).get(str(cid), "")
+        await send_welcome(context, _C(), user)
+    except Exception as e:  # noqa: BLE001
+        log.debug("welcome after approve: %s", e)
+
+
+async def handle_join(context, chat, u):
+    """Единая обработка входа новичка: проверка имени → капча или приветствие.
+    Вызывается из сервис-сообщения (on_new_members) и из события chat_member
+    (в супергруппе вход по ссылке приходит именно как chat_member, без сервис-сообщения)."""
+    if u is None or getattr(u, "is_bot", False):
+        return
+    if _join_seen(chat.id, u.id):
+        return
+    if is_blacklisted(chat.id, u):
+        try:
+            await context.bot.ban_chat_member(chat.id, u.id)
+            bump(chat.id, "name_bans")
+            log.info("Бан при входе (чёрный список): %s", u.id)
+        except Exception as e:  # noqa: BLE001
+            log.debug("blacklist ban join: %s", e)
+        return
+    cfg = chat_cfg(chat.id)
+    if cfg["enabled"].get("name_check"):
+        name = " ".join(filter(None, [u.first_name, u.last_name, u.username])).lower()
+        if find_word_violation(name, cfg) or find_link_violation(name, cfg):
+            try:
+                await context.bot.ban_chat_member(chat.id, u.id)
+                bump(chat.id, "name_bans")
+                log.info("Бан при входе (спам в имени): %s", u.id)
+            except Exception as e:  # noqa: BLE001
+                log.debug("ban new member: %s", e)
+            return
+    bump(chat.id, "joined")
+    join_dates[(chat.id, u.id)] = time.time()
+    await announce_join_id(context, chat, u)
+    if cfg["captcha"].get("enabled") and await start_captcha(context, chat, u):
+        return  # приветствие — после прохождения капчи
+    await send_welcome(context, chat, u)
 
 
 async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1160,28 +1459,8 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.new_chat_members:
         return
     remember_group(chat)
-    cfg = chat_cfg(chat.id)
-    name_check = cfg["enabled"].get("name_check")
-    captcha_on = cfg["captcha"].get("enabled")
     for u in msg.new_chat_members:
-        if u.is_bot:
-            continue
-        if name_check:
-            name = " ".join(filter(None, [u.first_name, u.last_name, u.username])).lower()
-            if find_word_violation(name, cfg) or find_link_violation(name, cfg):
-                try:
-                    await context.bot.ban_chat_member(chat.id, u.id)
-                    bump(chat.id, "name_bans")
-                    log.info("Бан при входе (спам в имени): %s", u.id)
-                except Exception as e:  # noqa: BLE001
-                    log.debug("ban new member: %s", e)
-                continue
-        bump(chat.id, "joined")
-        join_dates[(chat.id, u.id)] = time.time()
-        await announce_join_id(context, chat, u)
-        if captcha_on and await start_captcha(context, chat, u):
-            continue  # приветствие отправим после прохождения капчи
-        await send_welcome(context, chat, u)
+        await handle_join(context, chat, u)
 
 
 async def on_service_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1210,7 +1489,7 @@ async def on_my_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         remember_group(cm.chat)
         log.info("Бот в группе %s, статус %s", cm.chat.id, status)
         # Свежо добавили и чат ещё не одобрен — спрашиваем разрешение у владельца
-        if old in ("left", "kicked") and CONFIG.get("require_approval", False) \
+        if old in ("left", "kicked") and CONFIG.get("require_approval", True) \
                 and cm.chat.id not in CONFIG.get("approved_chats", []):
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Разрешить", callback_data=f"appr:ok:{cm.chat.id}"),
@@ -1257,6 +1536,14 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     if not chat_allowed(chat.id):
         return
+    # Вход нового участника. В супергруппе вход по ссылке приходит сюда (chat_member),
+    # а не сервис-сообщением — поэтому капчу/приветствие запускаем и отсюда.
+    try:
+        if (cm.new_chat_member.status == "member"
+                and cm.old_chat_member.status in ("left", "kicked")):
+            await handle_join(context, chat, cm.new_chat_member.user)
+    except Exception as e:  # noqa: BLE001
+        log.debug("chat_member join: %s", e)
     a = chat_cfg(chat.id)["antinuke"]
     if not a.get("enabled"):
         return
@@ -1339,11 +1626,20 @@ def extract_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
     return " ".join(args).strip()
 
 
+async def _deny(update):
+    """Ответить, что у пользователя недостаточно прав на команду (вместо молчания)."""
+    try:
+        await update.effective_message.reply_text("⛔ Недостаточно прав для этой команды.")
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 async def _guard(update, context, key: str = "ban"):
     chat = update.effective_chat
     actor = update.effective_user
     if not await can_moderate(context, chat.id, actor.id, key):
-        return None
+        return await _deny(update)
     tid, tname = await resolve_target(update, context)
     if not tid:
         await update.effective_message.reply_text(
@@ -1365,7 +1661,7 @@ async def cmd_reload(update, context):
     _admin_cache.pop(chat.id, None)
     _creator_cache.pop(chat.id, None)
     if not await can_moderate(context, chat.id, update.effective_user.id):
-        return
+        return await _deny(update)
     await update.effective_message.reply_text("✅ Готово — список админов и права перечитаны.")
 
 
@@ -1437,10 +1733,59 @@ async def cmd_ban(update, context):
         await update.effective_message.reply_text(f"Не вышло: {e}\nПроверь, что я админ с правом банить.")
 
 
+async def cmd_block(update, context):
+    """В чёрный список по ID (ответом на сообщение или /block @user|id) + бан сразу."""
+    chat = update.effective_chat
+    if not await can_moderate(context, chat.id, update.effective_user.id, "ban"):
+        return await _deny(update)
+    tid, tname = await resolve_target(update, context)
+    if not tid:
+        await update.effective_message.reply_text(
+            "Кого в чёрный список? Ответь на его сообщение или /block @user (либо id). "
+            "Имена добавляются в панели: ▶️ Ещё → 🚷 Чёрный список.")
+        return
+    if is_manager(tid) or tid in await group_admin_ids(context, chat.id):
+        await update.effective_message.reply_text("Это администратор/доверенный — не добавляю.")
+        return
+    wcfg = chat_cfg_writable(chat.id)
+    ids = wcfg.setdefault("blacklist", {"ids": [], "names": []}).setdefault("ids", [])
+    if tid not in ids:
+        ids.append(tid)
+        save_config()
+    try:
+        await context.bot.ban_chat_member(chat.id, tid)
+        bump(chat.id, "banned")
+    except Exception as e:  # noqa: BLE001
+        log.debug("block ban: %s", e)
+    await update.effective_message.reply_text(
+        f"🚷 {tname} в чёрном списке (ID {tid}). Если вернётся — забаню снова.")
+
+
+async def cmd_unblock(update, context):
+    """Убрать из чёрного списка по ID (ответом или /unblock id) + разбан."""
+    chat = update.effective_chat
+    if not await can_moderate(context, chat.id, update.effective_user.id, "ban"):
+        return await _deny(update)
+    tid, tname = await resolve_target(update, context)
+    if not tid:
+        await update.effective_message.reply_text("Кого убрать? Ответь на сообщение или /unblock id.")
+        return
+    wcfg = chat_cfg_writable(chat.id)
+    ids = wcfg.setdefault("blacklist", {"ids": [], "names": []}).setdefault("ids", [])
+    if tid in ids:
+        ids.remove(tid)
+        save_config()
+    try:
+        await context.bot.unban_chat_member(chat.id, tid, only_if_banned=True)
+    except Exception as e:  # noqa: BLE001
+        log.debug("unblock unban: %s", e)
+    await update.effective_message.reply_text(f"✅ {tname} убран из чёрного списка.")
+
+
 async def cmd_unban(update, context):
     chat = update.effective_chat
     if not await can_moderate(context, chat.id, update.effective_user.id, "ban"):
-        return
+        return await _deny(update)
     tid, tname = await resolve_target(update, context)
     if not tid:
         await update.effective_message.reply_text("Кого разбанить? /unban @user или id")
@@ -1498,7 +1843,7 @@ async def cmd_mute(update, context):
 async def cmd_unmute(update, context):
     chat = update.effective_chat
     if not await can_moderate(context, chat.id, update.effective_user.id, "mute"):
-        return
+        return await _deny(update)
     tid, tname = await resolve_target(update, context)
     if not tid:
         await update.effective_message.reply_text("Кого размутить? Ответь на сообщение или /unmute @user")
@@ -1544,7 +1889,7 @@ async def cmd_warn(update, context):
 async def cmd_unwarn(update, context):
     chat = update.effective_chat
     if not await can_moderate(context, chat.id, update.effective_user.id, "warn"):
-        return
+        return await _deny(update)
     tid, tname = await resolve_target(update, context)
     if not tid:
         await update.effective_message.reply_text("С кого снять предупреждение? /unwarn @user")
@@ -1560,7 +1905,7 @@ async def cmd_role(update, context):
         return
     user = update.effective_user
     if not await can_open_settings(context, chat.id, user.id):
-        return
+        return await _deny(update)
     name = _args_text(update).strip()
     roles = chat_roles(chat.id)
     if not name:
@@ -1599,7 +1944,7 @@ async def cmd_unrole(update, context):
         return
     user = update.effective_user
     if not await can_open_settings(context, chat.id, user.id):
-        return
+        return await _deny(update)
     tid, tname = await resolve_target(update, context)
     if not tid:
         await update.effective_message.reply_text("Ответь на сообщение человека, с которого снять роль.")
@@ -1644,7 +1989,7 @@ async def cmd_setstaff(update, context):
 async def cmd_warns(update, context):
     chat = update.effective_chat
     if not await can_moderate(context, chat.id, update.effective_user.id, "warn"):
-        return
+        return await _deny(update)
     tid, tname = await resolve_target(update, context)
     if not tid:
         await update.effective_message.reply_text("Чьи предупреждения? /warns @user")
@@ -1657,7 +2002,7 @@ async def cmd_stats(update, context):
     """Статистика по текущей группе (с последнего перезапуска бота)."""
     chat = update.effective_chat
     if not await can_moderate(context, chat.id, update.effective_user.id):
-        return
+        return await _deny(update)
     s = stats_store.get(chat.id, {})
     active = len(members_store.get(chat.id, {}))
     warned_now = len(CONFIG["warns"].get(str(chat.id), {}))
@@ -1703,7 +2048,7 @@ async def cmd_invite(update, context):
     """Выдать ссылку-приглашение в текущую группу (для админов)."""
     chat = update.effective_chat
     if not await can_moderate(context, chat.id, update.effective_user.id):
-        return
+        return await _deny(update)
     want_new = bool(context.args) and context.args[0].lower() in ("new", "новая")
     link = await ensure_invite_link(context, chat.id, force=want_new)
     if not link:
@@ -1717,7 +2062,7 @@ async def cmd_zazyvala(update, context):
     """Опубликовать в группе сообщение с кнопкой «Пригласить друга»."""
     chat = update.effective_chat
     if not await can_moderate(context, chat.id, update.effective_user.id):
-        return
+        return await _deny(update)
     link = await ensure_invite_link(context, chat.id)
     if not link:
         await update.effective_message.reply_text(
@@ -1754,7 +2099,7 @@ async def cmd_all(update, context):
     """
     chat = update.effective_chat
     if not await can_moderate(context, chat.id, update.effective_user.id, "all"):
-        return
+        return await _deny(update)
     text = _args_text(update) or "Все сюда! 👀"
     optout = set(_optout_list(chat.id))
     members = members_store.get(chat.id, {})
@@ -1834,7 +2179,7 @@ async def cmd_reg(update, context):
 async def cmd_say(update, context):
     """Бот публикует объявление в текущей группе."""
     if not is_manager(update.effective_user.id):
-        return
+        return await _deny(update)
     text = _args_text(update)
     if not text:
         await update.effective_message.reply_text("Что написать? /say текст объявления")
@@ -1878,11 +2223,53 @@ async def cmd_setrules(update, context):
         f"✅ Правила сохранены ({panel_target_label(context)}).", reply_markup=rules_kb())
 
 
-async def _broadcast(context, text: str):
+async def _post_to_chat(context, cid, text=None, photo_id=None, pin=False):
+    """Опубликовать в группе текст или фото (с подписью), при желании — закрепить."""
+    if photo_id:
+        m = await context.bot.send_photo(int(cid), photo_id, caption=(text or None))
+    else:
+        m = await context.bot.send_message(int(cid), text)
+    if pin:
+        try:
+            await context.bot.pin_chat_message(int(cid), m.message_id, disable_notification=True)
+        except Exception as e:  # noqa: BLE001
+            log.debug("pin %s: %s", cid, e)
+    return m
+
+
+async def _dm_broadcast(context, cid, text=None, photo_id=None):
+    """Рассылка в ЛС подписчикам группы (кто прошёл капчу-заявку), от имени группы."""
+    subs = list(CONFIG.get("dm_subscribers", {}).get(str(cid), []))
+    title = CONFIG.get("groups", {}).get(str(cid), "группа")
+    header = f"📢 От «{title}»:\n"
+    body = header + (text or "")
+    ok = fail = 0
+    blocked = []
+    for uid in subs:
+        try:
+            if photo_id:
+                await context.bot.send_photo(uid, photo_id, caption=body)
+            else:
+                await context.bot.send_message(uid, body)
+            ok += 1
+        except Forbidden:
+            fail += 1
+            blocked.append(uid)  # человек заблокировал бота — уберём из подписчиков
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            log.debug("dm-broadcast %s: %s", uid, e)
+    if blocked:
+        lst = CONFIG.setdefault("dm_subscribers", {}).get(str(cid), [])
+        CONFIG["dm_subscribers"][str(cid)] = [u for u in lst if u not in blocked]
+        save_config()
+    return ok, fail
+
+
+async def _broadcast(context, text=None, photo_id=None, pin=False):
     ok = fail = 0
     for cid in list(CONFIG["groups"].keys()):
         try:
-            await context.bot.send_message(int(cid), text)
+            await _post_to_chat(context, cid, text, photo_id, pin)
             ok += 1
         except Forbidden:
             # Бота кикнули/заблокировали в этом чате — это навсегда, забываем группу
@@ -2024,7 +2411,7 @@ def main_menu_kb(target_label: str = "— группа —", full: bool = True) 
         [InlineKeyboardButton("🛡 Анти-снос", callback_data="m:antinuke"),
          InlineKeyboardButton("👋 Приветствие", callback_data="m:welcome")],
         [InlineKeyboardButton("🤖 Капча", callback_data="m:captcha"),
-         InlineKeyboardButton("💬 Ключевые слова", callback_data="m:triggers")],
+         InlineKeyboardButton("💬 Автоответы", callback_data="m:triggers")],
         [InlineKeyboardButton("🚫 Стоп-слова", callback_data="m:words"),
          InlineKeyboardButton("🔗 Спам-ссылки", callback_data="m:links")],
         [InlineKeyboardButton("📜 Правила", callback_data="m:rules"),
@@ -2063,6 +2450,8 @@ def captcha_kb(cfg) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"Время на проверку: {human_duration(c['timeout'])}", callback_data="noop")],
         [InlineKeyboardButton("➖", callback_data="cap_set:to:-"), InlineKeyboardButton("➕", callback_data="cap_set:to:+")],
         [InlineKeyboardButton(f"Если не прошёл: {'бан' if c['action'] == 'ban' else 'кик'}", callback_data="cap_set:action")],
+        [InlineKeyboardButton(f"{'✅' if c.get('via_request', True) else '⬜'} Капча в личке (по заявке)",
+                              callback_data="cap_set:viareq")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
     ])
 
@@ -2103,12 +2492,58 @@ def other_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧹 Медиа-фильтр", callback_data="m:media"),
          InlineKeyboardButton("🌙 Ночной режим", callback_data="m:night")],
+        [InlineKeyboardButton("🛑 Второй список слов", callback_data="m:words2"),
+         InlineKeyboardButton("🚷 Чёрный список", callback_data="m:blacklist")],
         [InlineKeyboardButton("🔁 Авто-сообщения", callback_data="m:recurring"),
          InlineKeyboardButton("👥 Роли", callback_data="m:roles")],
         [InlineKeyboardButton("🛡 Staff-группа", callback_data="m:staff"),
-         InlineKeyboardButton("🕹 Права на команды", callback_data="m:cmdperms")],
+         InlineKeyboardButton("🌐 Язык новичков", callback_data="m:lang")],
+        [InlineKeyboardButton("🕹 Права на команды", callback_data="m:cmdperms")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
     ])
+
+
+def blacklist_kb(cfg) -> InlineKeyboardMarkup:
+    bl = cfg.get("blacklist", {}) or {}
+    rows = [
+        [InlineKeyboardButton("➕ Добавить ID", callback_data="add:blid"),
+         InlineKeyboardButton("➕ Добавить имя", callback_data="add:blname")],
+    ]
+    for i, uid in enumerate(bl.get("ids", [])):
+        rows.append([InlineKeyboardButton(f"❌ ID {uid}", callback_data=f"dblid:{i}")])
+    for i, nm in enumerate(bl.get("names", [])):
+        rows.append([InlineKeyboardButton(f"❌ имя: {nm}", callback_data=f"dblname:{i}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:other")])
+    return InlineKeyboardMarkup(rows)
+
+
+def blacklist_menu_text(cfg, target_label: str) -> str:
+    bl = cfg.get("blacklist", {}) or {}
+    return (
+        f"🚷 Чёрный список · {target_label}\n\n"
+        f"По ID: {len(bl.get('ids', []))} · по именам: {len(bl.get('names', []))}\n\n"
+        "Кто попал в список — баню при входе (и при заявке отклоняю), а если он уже в группе и "
+        "что-то пишет — баню и удаляю. «Имя» — это подстрока: ищется в имени, фамилии и юзернейме.\n\n"
+        "Быстро добавить из чата: ответь на сообщение командой /block (по ID), /unblock — убрать."
+    )
+
+
+def lang_kb(cfg) -> InlineKeyboardMarkup:
+    cur = cfg.get("lang", "ru")
+    rows = [[InlineKeyboardButton(("✅ " if code == cur else "") + name, callback_data=f"lang:{code}")]
+            for code, name in LANGS.items()]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:other")])
+    return InlineKeyboardMarkup(rows)
+
+
+def lang_menu_text(cfg, target_label: str) -> str:
+    cur = LANGS.get(cfg.get("lang", "ru"), "Русский")
+    return (
+        f"🌐 Язык для новичков · {target_label}\n\n"
+        f"Сейчас: {cur}\n\n"
+        "На этом языке бот пишет сообщения, которые видят новички (капча). "
+        "Панель настроек остаётся на русском."
+    )
 
 
 def roles_kb(cfg) -> InlineKeyboardMarkup:
@@ -2192,15 +2627,22 @@ def media_kb(cfg) -> InlineKeyboardMarkup:
     for key, label in MEDIA_TYPES:
         on = mb.get(key, False)
         rows.append([InlineKeyboardButton(f"{'🚫 удаляю' if on else '✅ можно'} · {label}", callback_data=f"mb:{key}")])
+    act = cfg.get("media_action", "delete")
+    act_ru = {"delete": "только удалить", "mute": "удалить + мут", "ban": "удалить + бан"}.get(act, act)
+    rows.append([InlineKeyboardButton(f"⚙️ Наказание: {act_ru}", callback_data="mact")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:other")])
     return InlineKeyboardMarkup(rows)
 
 
 def media_menu_text(cfg, target_label: str) -> str:
+    act = cfg.get("media_action", "delete")
+    act_ru = {"delete": "только удаляю сообщение", "mute": "удаляю и мучу отправителя",
+              "ban": "удаляю и баню отправителя"}.get(act, act)
     return (
         f"🧹 Медиа-фильтр · {target_label}\n\n"
         "🚫 — этот тип удаляется у обычных участников, ✅ — разрешён. "
         "Админы и доверенные не затрагиваются.\n\n"
+        f"⚙️ Наказание за заблокированное медиа: {act_ru}. Меняется кнопкой ниже.\n\n"
         "ℹ️ Это грубый фильтр по типу вложения. Распознавания «18+» по содержимому "
         "картинки здесь нет — для этого нужен внешний ИИ-классификатор."
     )
@@ -2311,6 +2753,38 @@ def words_kb(cfg) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def words2_kb(cfg) -> InlineKeyboardMarkup:
+    act = cfg.get("stop_words2_action", "ban")
+    act_ru = {"delete": "удалить", "mute": "мут", "ban": "бан"}.get(act, act)
+    prof = cfg.get("stop_words2_profile", True)
+    rows = [
+        [InlineKeyboardButton("➕ Добавить слово", callback_data="add:word2")],
+        [InlineKeyboardButton(f"⚙️ Наказание: {act_ru}", callback_data="w2act")],
+        [InlineKeyboardButton(f"{'✅' if prof else '⬜'} Искать в профиле/имени: {'да' if prof else 'нет'}",
+                              callback_data="w2prof")],
+    ]
+    for i, w in enumerate(sorted(cfg.get("stop_words2", []))):
+        rows.append([InlineKeyboardButton(f"❌ {w}", callback_data=f"dw2:{i}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:other")])
+    return InlineKeyboardMarkup(rows)
+
+
+def words2_menu_text(cfg, target_label: str) -> str:
+    en = cfg["enabled"].get("words2")
+    act = cfg.get("stop_words2_action", "ban")
+    act_ru = {"delete": "удаляю сообщение", "mute": "удаляю и мучу", "ban": "удаляю и баню"}.get(act, act)
+    prof = cfg.get("stop_words2_profile", True)
+    return (
+        f"🛑 Второй список слов · {target_label}\n\n"
+        f"Статус: {'включён' if en else 'выключен'} (вкл/выкл — в разделе «Функции»).\n"
+        f"Наказание: {act_ru}.\n"
+        f"Поиск в профиле/имени: {'да' if prof else 'нет'}.\n\n"
+        "Это отдельный список со своим, более строгим наказанием (в отличие от обычных "
+        "стоп-слов, которые просто удаляются). Если включён поиск в профиле — слова "
+        "ищутся ещё и в имени/юзернейме отправителя (ловит спам-профили)."
+    )
+
+
 def links_kb(cfg) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("➕ Добавить домен", callback_data="add:link")]]
     for i, d in enumerate(sorted(cfg["spam_links"])):
@@ -2375,6 +2849,8 @@ def promo_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✏️ Текст кнопки-зазывалы", callback_data="pr:invtext")],
         [InlineKeyboardButton("📨 Разослать сообщение сейчас", callback_data="pr:cast")],
         [InlineKeyboardButton("📝 Запостить в группу", callback_data="post:list")],
+        [InlineKeyboardButton(f"📌 Закреплять посты: {'да' if p.get('pin') else 'нет'}", callback_data="pr:pin")],
+        [InlineKeyboardButton("💬 Рассылка подписчикам в ЛС", callback_data="dmcast:list")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
     ])
 
@@ -2384,6 +2860,16 @@ def post_groups_kb() -> InlineKeyboardMarkup:
     for i, (cid, title) in enumerate(sorted(CONFIG["groups"].items())):
         label = title if len(title) <= 30 else title[:29] + "…"
         rows.append([InlineKeyboardButton(f"📝 {label}", callback_data=f"pto:{i}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:promo")])
+    return InlineKeyboardMarkup(rows)
+
+
+def dmcast_groups_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for i, (cid, title) in enumerate(sorted(CONFIG["groups"].items())):
+        n = len(CONFIG.get("dm_subscribers", {}).get(str(cid), []))
+        label = title if len(title) <= 24 else title[:23] + "…"
+        rows.append([InlineKeyboardButton(f"💬 {label} ({n} подп.)", callback_data=f"dmto:{i}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:promo")])
     return InlineKeyboardMarkup(rows)
 
@@ -2398,7 +2884,7 @@ def access_kb() -> InlineKeyboardMarkup:
 
 
 def approve_kb() -> InlineKeyboardMarkup:
-    req = CONFIG.get("require_approval", False)
+    req = CONFIG.get("require_approval", True)
     rows = [[InlineKeyboardButton(
         "🔒 Требовать одобрение: ВКЛ" if req else "🔓 Требовать одобрение: ВЫКЛ",
         callback_data="apt:toggle")]]
@@ -2415,7 +2901,7 @@ def approve_kb() -> InlineKeyboardMarkup:
 
 
 def approve_menu_text() -> str:
-    req = CONFIG.get("require_approval", False)
+    req = CONFIG.get("require_approval", True)
     n = len(CONFIG.get("approved_chats", []))
     return (
         "🔐 Допуск чатов.\n\n"
@@ -2439,7 +2925,7 @@ def status_text(cfg, target_label: str = "— группа —", show_global: bo
     pun = "бан" if m["warn_action"] == "ban" else f"мут {human_duration(m['warn_mute'])}"
     jid_label = {"off": "не показывать", "all": "видно всем", "admins": "только админам"}.get(
         cfg.get("show_join_id", "off"), "не показывать")
-    appr_label = "требуется одобрение" if CONFIG.get("require_approval", False) else "свободный"
+    appr_label = "требуется одобрение" if CONFIG.get("require_approval", True) else "свободный"
     lines += [
         "",
         f"Антифлуд: {f['limit']}/{f['period']}с → мут {f['mute']}с",
@@ -2524,7 +3010,11 @@ def captcha_menu_text(cfg) -> str:
         "ограничить нельзя, поэтому к нему капча не применяется.\n\n"
         "ℹ️ В супергруппе новичок реально не может писать до нажатия. В обычной группе настоящий "
         "мут недоступен, поэтому до нажатия его сообщения удаляются (мягкий мут), а если не нажал "
-        "вовремя — удаляю из чата. Тип группы покажет /diag."
+        "вовремя — удаляю из чата. Тип группы покажет /diag.\n\n"
+        "🔗 «Капча в личке (по заявке)»: если в настройках группы включить ссылку «с заявкой на "
+        "вступление» (Request Admin Approval), бот будет писать новичку капчу В ЛИЧКУ и впускать "
+        "после нажатия. Работает в любой группе, и человек попадает в личку бота (можно потом "
+        "слать рассылку от группы). Бот должен быть админом с правом добавлять/одобрять участников."
     )
 
 
@@ -2640,6 +3130,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("cap:"):
         return await handle_captcha_press(update, context)
 
+    # Капча по заявке на вступление — кнопку жмёт новичок в ЛИЧКЕ
+    if data.startswith("jrok:"):
+        return await handle_join_request_press(update, context)
+
     # Привязка staff-группы — кнопка в служебном чате
     if data.startswith("ss:"):
         return await handle_setstaff_press(update, context)
@@ -2660,7 +3154,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         allowed = {cid for cid, _ in my}
         # глобальные разделы — недоступны не-менеджерам
         if (data in ("m:promo", "m:access", "m:approve", "bk:export", "bk:import")
-                or data.startswith(("pr:", "post:", "pto:", "dm:", "appr:", "apt:"))):
+                or data.startswith(("pr:", "post:", "pto:", "dm:", "dmcast:", "dmto:", "appr:", "apt:"))):
             await query.answer("Это только для владельца/менеджеров бота", show_alert=True)
             return
     # Цель панели — всегда реальная группа из доступных
@@ -2732,7 +3226,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_owner(user.id):
             return await query.answer("Только для главного владельца", show_alert=True)
         if data == "apt:toggle":
-            CONFIG["require_approval"] = not CONFIG.get("require_approval", False)
+            CONFIG["require_approval"] = not CONFIG.get("require_approval", True)
             save_config()
         elif data.startswith("appr:"):
             _, act, cid = data.split(":", 2)
@@ -2779,6 +3273,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "m:toggles": (f"🔘 Функции · {label}\nВключение/выключение:", toggles_kb(cfg)),
         "m:triggers": (f"💬 Автоответы (слово → ответ) · {label}:", triggers_kb(cfg)),
         "m:words": (f"🚫 Стоп-слова · {label}\nСообщения с этими словами удаляются:", words_kb(cfg)),
+        "m:words2": (words2_menu_text(cfg, label), words2_kb(cfg)),
+        "m:lang": (lang_menu_text(cfg, label), lang_kb(cfg)),
+        "m:blacklist": (blacklist_menu_text(cfg, label), blacklist_kb(cfg)),
         "m:links": (f"🔗 Спам-домены · {label}:", links_kb(cfg)),
         "m:flood": (f"⚙️ Антифлуд · {label}:", flood_kb(cfg)),
         "m:mod": (f"🛡 Модерация · {label}\nКоманды — в группе (/ban, /mute…). Здесь — предупреждения:", mod_kb(cfg)),
@@ -2847,6 +3344,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c["action"] = "ban" if c["action"] == "kick" else "kick"
         elif parts[1] == "to":
             c["timeout"] = max(30, min(600, c["timeout"] + (30 if parts[2] == "+" else -30)))
+        elif parts[1] == "viareq":
+            c["via_request"] = not c.get("via_request", True)
         save_config()
         return await safe_edit(query, captcha_menu_text(cfg), captcha_kb(cfg))
 
@@ -2906,7 +3405,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 query, "Пришли текст для кнопки-зазывалы (его увидят участники и друзья при приглашении).\n(или /cancel)", None)
         if what == "cast":
             context.user_data["await"] = "broadcast"
-            return await safe_edit(query, "Пришли сообщение — разошлю его во все группы бота.\n(или /cancel)", None)
+            return await safe_edit(query, "Пришли сообщение (текст или фото с подписью) — разошлю во все группы бота.\n(или /cancel)", None)
+        if what == "pin":
+            CONFIG["promo"]["pin"] = not CONFIG["promo"].get("pin", False)
+            save_config()
+            return await safe_edit(query, promo_menu_text(), promo_kb())
 
     if data == "post:list":
         if not CONFIG["groups"]:
@@ -2919,8 +3422,34 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cid, title = items[i]
             context.user_data["await"] = "post"
             context.user_data["post_chat"] = int(cid)
-            return await safe_edit(query, f"Пришли текст — опубликую его в «{title}».\n(или /cancel)", None)
+            return await safe_edit(query, f"Пришли текст или фото с подписью — опубликую в «{title}».\n(или /cancel)", None)
         return await safe_edit(query, "Группа не найдена.", post_groups_kb())
+
+    if data == "dmcast:list":
+        if not CONFIG["groups"]:
+            return await safe_edit(query, "Пока нет известных групп.", promo_kb())
+        return await safe_edit(
+            query,
+            "Кому рассылать в личку: выбери группу. Подписчики — те, кто прошёл капчу-заявку "
+            "(вступал через ссылку с одобрением). Сообщение придёт им в ЛС с шапкой от имени группы.",
+            dmcast_groups_kb())
+    if data.startswith("dmto:"):
+        items = sorted(CONFIG["groups"].items())
+        i = int(data[5:])
+        if 0 <= i < len(items):
+            cid, title = items[i]
+            n = len(CONFIG.get("dm_subscribers", {}).get(str(cid), []))
+            if n == 0:
+                return await safe_edit(
+                    query,
+                    f"У «{title}» пока нет подписчиков в ЛС. Они появляются, когда люди вступают "
+                    "через ссылку-заявку и проходят капчу в личке (включи это в разделе Капча).",
+                    dmcast_groups_kb())
+            context.user_data["await"] = "dmcast"
+            context.user_data["dmcast_chat"] = int(cid)
+            return await safe_edit(
+                query, f"Пришли текст или фото с подписью — разошлю {n} подписчикам «{title}» в ЛС.\n(или /cancel)", None)
+        return await safe_edit(query, "Группа не найдена.", dmcast_groups_kb())
 
     if data.startswith("dt:"):
         cfg = panel_cfg(context)
@@ -2954,6 +3483,58 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mbd[key] = not mbd.get(key, False)
         save_config()
         return await safe_edit(query, media_menu_text(wcfg, label), media_kb(wcfg))
+
+    if data == "mact":
+        wcfg = panel_cfg(context)
+        cyc = ["delete", "mute", "ban"]
+        cur = wcfg.get("media_action", "delete")
+        wcfg["media_action"] = cyc[(cyc.index(cur) + 1) % len(cyc)] if cur in cyc else "delete"
+        save_config()
+        return await safe_edit(query, media_menu_text(wcfg, label), media_kb(wcfg))
+
+    if data.startswith("dw2:"):
+        wcfg = panel_cfg(context)
+        words = sorted(wcfg.get("stop_words2", []))
+        i = int(data[4:])
+        if 0 <= i < len(words):
+            wcfg["stop_words2"].remove(words[i])
+            save_config()
+        return await safe_edit(query, words2_menu_text(wcfg, label), words2_kb(wcfg))
+    if data == "w2act":
+        wcfg = panel_cfg(context)
+        cyc = ["delete", "mute", "ban"]
+        cur = wcfg.get("stop_words2_action", "ban")
+        wcfg["stop_words2_action"] = cyc[(cyc.index(cur) + 1) % len(cyc)] if cur in cyc else "ban"
+        save_config()
+        return await safe_edit(query, words2_menu_text(wcfg, label), words2_kb(wcfg))
+    if data == "w2prof":
+        wcfg = panel_cfg(context)
+        wcfg["stop_words2_profile"] = not wcfg.get("stop_words2_profile", True)
+        save_config()
+        return await safe_edit(query, words2_menu_text(wcfg, label), words2_kb(wcfg))
+    if data.startswith("dblid:"):
+        wcfg = panel_cfg(context)
+        ids = wcfg.setdefault("blacklist", {"ids": [], "names": []}).setdefault("ids", [])
+        i = int(data.split(":")[1])
+        if 0 <= i < len(ids):
+            ids.pop(i)
+            save_config()
+        return await safe_edit(query, blacklist_menu_text(wcfg, label), blacklist_kb(wcfg))
+    if data.startswith("dblname:"):
+        wcfg = panel_cfg(context)
+        names = wcfg.setdefault("blacklist", {"ids": [], "names": []}).setdefault("names", [])
+        i = int(data.split(":")[1])
+        if 0 <= i < len(names):
+            names.pop(i)
+            save_config()
+        return await safe_edit(query, blacklist_menu_text(wcfg, label), blacklist_kb(wcfg))
+    if data.startswith("lang:"):
+        wcfg = panel_cfg(context)
+        code = data.split(":")[1]
+        if code in LANGS:
+            wcfg["lang"] = code
+            save_config()
+        return await safe_edit(query, lang_menu_text(wcfg, label), lang_kb(wcfg))
 
     if data.startswith("nm:"):
         wcfg = panel_cfg(context)
@@ -3042,6 +3623,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "add:word":
         context.user_data["await"] = "word"
         return await safe_edit(query, f"Пришли стоп-слово для «{label}» одним сообщением.\n(или /cancel)", None)
+    if data == "add:word2":
+        context.user_data["await"] = "word2"
+        return await safe_edit(query, f"Пришли слово для ВТОРОГО списка «{label}» одним сообщением.\n(или /cancel)", None)
+    if data == "add:blid":
+        context.user_data["await"] = "blid"
+        return await safe_edit(query, f"Пришли числовой ID пользователя для чёрного списка «{label}».\n(или /cancel)", None)
+    if data == "add:blname":
+        context.user_data["await"] = "blname"
+        return await safe_edit(query, f"Пришли имя/часть имени или @юзернейм для чёрного списка «{label}».\n(или /cancel)", None)
     if data == "add:link":
         context.user_data["await"] = "link"
         return await safe_edit(query, f"Пришли домен для «{label}», напр. example.com\n(или /cancel)", None)
@@ -3183,7 +3773,7 @@ async def cmd_info(update, context):
         return
     actor = update.effective_user
     if not await can_moderate(context, chat.id, actor.id, "warn"):
-        return
+        return await _deny(update)
     tid, tname = await resolve_target(update, context)
     if not tid:
         tid, tname = actor.id, (actor.first_name or str(actor.id))
@@ -3277,12 +3867,31 @@ async def cmd_grant(update, context):
         return
     tid, tname = await resolve_target(update, context)
     if not tid:
-        await update.effective_message.reply_text("Кому выдать права? Ответь на сообщение человека или /grant @user (id).")
+        passed = context.args[0] if context.args else None
+        if passed and passed.startswith("@"):
+            await update.effective_message.reply_text(
+                f"❗ Не смог определить ID для {passed}.\n"
+                "Telegram не даёт ботам узнавать ID по @имени, если человек ещё ни разу не писал боту.\n\n"
+                "Сделай любым способом:\n"
+                f"1) Пусть человек напишет мне /start в личке — потом снова /grant {passed}\n"
+                "2) Или выдай по числовому ID: /grant 123456789\n"
+                "   (узнать ID: ответь на его сообщение в группе командой /userid, "
+                "или пусть откроет @userinfobot)\n"
+                "3) Или просто ответь на его сообщение командой /grant")
+        else:
+            await update.effective_message.reply_text(
+                "Кому выдать права? Способы:\n"
+                "• ответь на сообщение человека командой /grant\n"
+                "• /grant <числовой_id>  (узнать ID: /userid ответом на его сообщение)\n"
+                "• /grant @username — сработает, только если человек уже писал боту")
         return
     if tid not in CONFIG["managers"]:
         CONFIG["managers"].append(tid)
         save_config()
-    await update.effective_message.reply_text(f"✅ {tname} теперь может управлять ботом (панель + модерация).")
+        await update.effective_message.reply_text(
+            f"✅ {tname} теперь может управлять ботом (панель + модерация во всех группах).\nID: {tid}")
+    else:
+        await update.effective_message.reply_text(f"{tname} уже в списке управляющих (ID {tid}).")
 
 
 async def cmd_revoke(update, context):
@@ -3311,7 +3920,7 @@ async def cmd_settings_hint(update, context):
         return
     user = update.effective_user
     if not await can_open_settings(context, chat.id, user.id):
-        return
+        return await _deny(update)
     try:
         uname = context.bot.username or (await context.bot.get_me()).username
     except Exception:  # noqa: BLE001
@@ -3514,6 +4123,48 @@ async def on_private_document(update, context):
         reply_markup=backup_kb(owner))
 
 
+async def on_private_photo(update, context):
+    """Фото в личке во время рассылки/поста: публикуем фото с подписью."""
+    user = update.effective_user
+    awaiting = context.user_data.get("await")
+    if awaiting not in ("broadcast", "post", "dmcast"):
+        return
+    if not is_manager(user.id):
+        context.user_data.pop("await", None)
+        return
+    try:
+        photo_id = update.message.photo[-1].file_id
+    except Exception:  # noqa: BLE001
+        return
+    caption = (update.message.caption or "").strip()
+    context.user_data.pop("await", None)
+    pin = CONFIG["promo"].get("pin", False)
+    if awaiting == "broadcast":
+        if not CONFIG["groups"]:
+            await update.message.reply_text("Пока нет известных групп.")
+            return
+        ok, fail = await _broadcast(context, caption, photo_id, pin)
+        await update.message.reply_text(f"📣 Разослано в {ok} групп(ы), не доставлено: {fail}.", reply_markup=promo_kb())
+    elif awaiting == "post":
+        cid = context.user_data.pop("post_chat", None)
+        if not cid:
+            await update.message.reply_text("Группа не выбрана. Попробуй снова через /panel.")
+            return
+        try:
+            await _post_to_chat(context, cid, caption, photo_id, pin)
+            await update.message.reply_text("✅ Опубликовано (фото).", reply_markup=promo_kb())
+        except Exception as e:  # noqa: BLE001
+            await update.message.reply_text(f"Не вышло опубликовать: {e}", reply_markup=promo_kb())
+    elif awaiting == "dmcast":
+        cid = context.user_data.pop("dmcast_chat", None)
+        if not cid:
+            await update.message.reply_text("Группа не выбрана. Попробуй снова через /panel.")
+            return
+        ok, fail = await _dm_broadcast(context, cid, caption, photo_id)
+        await update.message.reply_text(
+            f"📨 Отправлено {ok} подписчикам, не доставлено: {fail}.", reply_markup=promo_kb())
+
+
 async def on_private_text(update, context):
     user = update.effective_user
     manager = is_manager(user.id)
@@ -3529,7 +4180,7 @@ async def on_private_text(update, context):
         await update.message.reply_text("Это только для владельца/менеджеров бота.")
         return
     # Настройки конкретной цели — проверяем право на неё
-    if awaiting in ("trigger", "word", "link", "welcome", "rules", "recurring", "role_new"):
+    if awaiting in ("trigger", "word", "word2", "blid", "blname", "link", "welcome", "rules", "recurring", "role_new"):
         tgt = context.user_data.get("cfg_target", "defaults")
         if not await can_edit_target(context, user.id, tgt):
             context.user_data.pop("await", None)
@@ -3560,6 +4211,37 @@ async def on_private_text(update, context):
             save_config()
         await update.message.reply_text(
             f"✅ Стоп-слово: {w} ({panel_target_label(context)})", reply_markup=words_kb(cfg))
+    elif awaiting == "word2":
+        w = text.lower()
+        cfg = panel_cfg(context)
+        lst = cfg.setdefault("stop_words2", [])
+        if w and w not in lst:
+            lst.append(w)
+            save_config()
+        await update.message.reply_text(
+            f"✅ Во второй список добавлено: {w} ({panel_target_label(context)})", reply_markup=words2_kb(cfg))
+    elif awaiting == "blid":
+        cfg = panel_cfg(context)
+        digits = "".join(ch for ch in text if ch.isdigit() or ch == "-")
+        if not digits.lstrip("-").isdigit():
+            await update.message.reply_text("Это не похоже на числовой ID. Попробуй снова через /panel.")
+            return
+        uid = int(digits)
+        ids = cfg.setdefault("blacklist", {"ids": [], "names": []}).setdefault("ids", [])
+        if uid not in ids:
+            ids.append(uid)
+            save_config()
+        await update.message.reply_text(
+            f"🚷 ID {uid} в чёрном списке ({panel_target_label(context)}).", reply_markup=blacklist_kb(cfg))
+    elif awaiting == "blname":
+        cfg = panel_cfg(context)
+        nm = text.lstrip("@").lower().strip()
+        names = cfg.setdefault("blacklist", {"ids": [], "names": []}).setdefault("names", [])
+        if nm and nm not in names:
+            names.append(nm)
+            save_config()
+        await update.message.reply_text(
+            f"🚷 Имя «{nm}» в чёрном списке ({panel_target_label(context)}).", reply_markup=blacklist_kb(cfg))
     elif awaiting == "link":
         d = text.lower()
         cfg = panel_cfg(context)
@@ -3645,7 +4327,7 @@ async def on_private_text(update, context):
         if not CONFIG["groups"]:
             await update.message.reply_text("Пока нет известных групп. Добавь бота в группу и напиши там что-нибудь.")
             return
-        ok, fail = await _broadcast(context, text)
+        ok, fail = await _broadcast(context, text, pin=CONFIG["promo"].get("pin", False))
         await update.message.reply_text(f"📣 Разослано в {ok} групп(ы), не доставлено: {fail}.", reply_markup=promo_kb())
     elif awaiting == "post":
         cid = context.user_data.pop("post_chat", None)
@@ -3653,10 +4335,18 @@ async def on_private_text(update, context):
             await update.message.reply_text("Пусто или группа не выбрана. Попробуй снова через /panel.")
             return
         try:
-            await context.bot.send_message(cid, text)
+            await _post_to_chat(context, cid, text, pin=CONFIG["promo"].get("pin", False))
             await update.message.reply_text("✅ Опубликовано.", reply_markup=promo_kb())
         except Exception as e:  # noqa: BLE001
             await update.message.reply_text(f"Не вышло опубликовать: {e}", reply_markup=promo_kb())
+    elif awaiting == "dmcast":
+        cid = context.user_data.pop("dmcast_chat", None)
+        if not text or not cid:
+            await update.message.reply_text("Пусто или группа не выбрана. Попробуй снова через /panel.")
+            return
+        ok, fail = await _dm_broadcast(context, cid, text)
+        await update.message.reply_text(
+            f"📨 Отправлено {ok} подписчикам, не доставлено: {fail}.", reply_markup=promo_kb())
     elif awaiting == "import_config":
         await update.message.reply_text(
             "Жду файл config.json (документом), а не текст. /panel → 💾 Бэкап → «Загрузить».")
@@ -3684,6 +4374,8 @@ async def _post_init(app: Application):
             BotCommand("ban", "🚫 Забанить (ответом)"),
             BotCommand("kick", "👢 Выгнать (ответом)"),
             BotCommand("unban", "Разбанить (ответом или @user)"),
+            BotCommand("block", "🚷 В чёрный список + бан (ответом)"),
+            BotCommand("unblock", "Убрать из чёрного списка (ответом)"),
             BotCommand("role", "👥 Выдать роль (ответом): /role Имя"),
             BotCommand("unrole", "Снять роли (ответом)"),
             BotCommand("all", "📣 Позвать всех"),
@@ -3759,6 +4451,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("setstaff", cmd_setstaff, filters=groups))
     app.add_handler(CommandHandler("ban", cmd_ban, filters=groups))
     app.add_handler(CommandHandler("unban", cmd_unban, filters=groups))
+    app.add_handler(CommandHandler("block", cmd_block, filters=groups))
+    app.add_handler(CommandHandler("unblock", cmd_unblock, filters=groups))
     app.add_handler(CommandHandler("kick", cmd_kick, filters=groups))
     app.add_handler(CommandHandler("mute", cmd_mute, filters=groups))
     app.add_handler(CommandHandler("unmute", cmd_unmute, filters=groups))
@@ -3782,6 +4476,7 @@ def build_app() -> Application:
     app.add_handler(ChatMemberHandler(on_my_member, ChatMemberHandler.MY_CHAT_MEMBER))
     # Изменения участников (анти-снос)
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(ChatJoinRequestHandler(on_join_request))
 
     # Новые участники
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
@@ -3803,6 +4498,7 @@ def build_app() -> Application:
     # Текст в ЛС
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, on_private_text))
     # Файл в ЛС (импорт настроек)
+    app.add_handler(MessageHandler(private & filters.PHOTO, on_private_photo))
     app.add_handler(MessageHandler(private & filters.Document.ALL, on_private_document))
 
     # Апгрейд группы в супергруппу — перенести одобрение/настройки на новый chat_id
