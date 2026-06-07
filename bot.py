@@ -138,6 +138,10 @@ DEFAULT_CONFIG = {
     "approved_chats": [],
     # Подписчики ЛС по группам (кто прошёл капчу-заявку или запускал бота): {chat_id: [user_ids]}
     "dm_subscribers": {},
+    # Запланированные посты (ежедневно в заданное время): список объектов
+    "scheduled_posts": [],
+    # Часовой пояс для расписания постов (смещение от UTC в часах)
+    "post_tz": 5,
     # Индивидуальные настройки по чатам: {chat_id: {...только per-chat ключи...}}
     # Если для чата записи нет — используются глобальные настройки выше (как шаблон).
     "chats": {},
@@ -2289,6 +2293,168 @@ async def _broadcast(context, text=None, photo_id=None, pin=False):
     return ok, fail
 
 
+def _post_tz():
+    return timezone(timedelta(hours=int(CONFIG.get("post_tz", 5))))
+
+
+def _post_buttons_markup(buttons):
+    """buttons: список [текст, url] → инлайн-клавиатура (по кнопке на строку)."""
+    if not buttons:
+        return None
+    rows = []
+    for b in buttons:
+        try:
+            txt, url = b[0], b[1]
+            if txt and url:
+                rows.append([InlineKeyboardButton(txt, url=url)])
+        except Exception:  # noqa: BLE001
+            continue
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def _parse_buttons(text):
+    """Текст «Название - https://ссылка» по строкам → список [текст, url]."""
+    out = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if " - " in line:
+            txt, url = line.split(" - ", 1)
+        elif "|" in line:
+            txt, url = line.split("|", 1)
+        else:
+            continue
+        txt, url = txt.strip(), url.strip()
+        if txt and url.startswith(("http://", "https://", "tg://")):
+            out.append([txt, url])
+    return out
+
+
+def _capture_post_content(message):
+    """Извлечь из сообщения тип/файл/текст для будущей публикации."""
+    cap = (message.caption or "").strip()
+    if message.photo:
+        return {"type": "photo", "file_id": message.photo[-1].file_id, "text": cap}
+    if getattr(message, "video", None):
+        return {"type": "video", "file_id": message.video.file_id, "text": cap}
+    if getattr(message, "animation", None):
+        return {"type": "animation", "file_id": message.animation.file_id, "text": cap}
+    if getattr(message, "sticker", None):
+        return {"type": "sticker", "file_id": message.sticker.file_id, "text": ""}
+    if getattr(message, "document", None):
+        return {"type": "document", "file_id": message.document.file_id, "text": cap}
+    if getattr(message, "audio", None):
+        return {"type": "audio", "file_id": message.audio.file_id, "text": cap}
+    if getattr(message, "voice", None):
+        return {"type": "voice", "file_id": message.voice.file_id, "text": cap}
+    if getattr(message, "video_note", None):
+        return {"type": "video_note", "file_id": message.video_note.file_id, "text": ""}
+    if message.text:
+        return {"type": "text", "file_id": None, "text": message.text}
+    return None
+
+
+# типы контента, которые НЕ поддерживают подпись/кнопки
+_NO_CAPTION_TYPES = {"sticker", "video_note"}
+
+
+async def _send_scheduled_post(context, post):
+    """Опубликовать запланированный пост в его группу."""
+    cid = int(post["chat_id"])
+    t = post.get("type", "text")
+    text = post.get("text") or ""
+    fid = post.get("file_id")
+    markup = None if t in _NO_CAPTION_TYPES else _post_buttons_markup(post.get("buttons"))
+    cap = None if t in _NO_CAPTION_TYPES else (text or None)
+    b = context.bot
+    if t == "text":
+        m = await b.send_message(cid, text or "‎", reply_markup=markup)
+    elif t == "photo":
+        m = await b.send_photo(cid, fid, caption=cap, reply_markup=markup)
+    elif t == "video":
+        m = await b.send_video(cid, fid, caption=cap, reply_markup=markup)
+    elif t == "animation":
+        m = await b.send_animation(cid, fid, caption=cap, reply_markup=markup)
+    elif t == "document":
+        m = await b.send_document(cid, fid, caption=cap, reply_markup=markup)
+    elif t == "audio":
+        m = await b.send_audio(cid, fid, caption=cap, reply_markup=markup)
+    elif t == "voice":
+        m = await b.send_voice(cid, fid, caption=cap, reply_markup=markup)
+    elif t == "video_note":
+        m = await b.send_video_note(cid, fid)
+    elif t == "sticker":
+        m = await b.send_sticker(cid, fid)
+    else:
+        m = await b.send_message(cid, text or "‎")
+    if post.get("pin"):
+        try:
+            await b.pin_chat_message(cid, m.message_id, disable_notification=True)
+        except Exception as e:  # noqa: BLE001
+            log.debug("sched pin: %s", e)
+    return m
+
+
+async def _fire_scheduled_post(context):
+    pid = context.job.data.get("id")
+    post = _find_post(pid)
+    if not post or not post.get("enabled", True):
+        return
+    try:
+        await _send_scheduled_post(context, post)
+        log.info("Запланированный пост «%s» опубликован", post.get("name"))
+    except Forbidden:
+        log.info("Пост «%s»: нет доступа в группу", post.get("name"))
+    except Exception as e:  # noqa: BLE001
+        log.warning("Пост «%s»: ошибка публикации: %s", post.get("name"), e)
+
+
+def _find_post(pid):
+    for p in CONFIG.get("scheduled_posts", []):
+        if p.get("id") == pid:
+            return p
+    return None
+
+
+def _new_post_id():
+    n = 1
+    existing = {p.get("id") for p in CONFIG.get("scheduled_posts", [])}
+    while f"p{n}" in existing:
+        n += 1
+    return f"p{n}"
+
+
+def _schedule_post(jq, post):
+    if jq is None or not post.get("enabled", True):
+        return
+    try:
+        h, m = map(int, str(post["time"]).split(":"))
+    except Exception:  # noqa: BLE001
+        return
+    from datetime import time as _dtime
+    jq.run_daily(_fire_scheduled_post, time=_dtime(h, m, tzinfo=_post_tz()),
+                 data={"id": post["id"]}, name=f"sched:{post['id']}")
+
+
+def _unschedule_post(jq, pid):
+    if jq is None:
+        return
+    for job in jq.get_jobs_by_name(f"sched:{pid}"):
+        job.schedule_removal()
+
+
+def _reschedule_all_posts(jq):
+    """Снять все задания постов и создать заново из конфига (после старта/смены пояса)."""
+    if jq is None:
+        return
+    for job in list(jq.jobs()):
+        if job.name and job.name.startswith("sched:"):
+            job.schedule_removal()
+    for p in CONFIG.get("scheduled_posts", []):
+        _schedule_post(jq, p)
+
+
 async def cmd_broadcast(update, context):
     """Разослать сообщение во все группы бота (в ЛС)."""
     if not is_manager(update.effective_user.id):
@@ -2851,6 +3017,7 @@ def promo_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📝 Запостить в группу", callback_data="post:list")],
         [InlineKeyboardButton(f"📌 Закреплять посты: {'да' if p.get('pin') else 'нет'}", callback_data="pr:pin")],
         [InlineKeyboardButton("💬 Рассылка подписчикам в ЛС", callback_data="dmcast:list")],
+        [InlineKeyboardButton("🗓 Запланированные посты", callback_data="m:sched")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
     ])
 
@@ -2871,6 +3038,75 @@ def dmcast_groups_kb() -> InlineKeyboardMarkup:
         label = title if len(title) <= 24 else title[:23] + "…"
         rows.append([InlineKeyboardButton(f"💬 {label} ({n} подп.)", callback_data=f"dmto:{i}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:promo")])
+    return InlineKeyboardMarkup(rows)
+
+
+_POST_TYPE_RU = {"text": "текст", "photo": "фото", "video": "видео", "animation": "гиф",
+                 "sticker": "стикер", "document": "документ", "audio": "аудио",
+                 "voice": "голосовое", "video_note": "кружок"}
+
+
+def sched_kb() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("➕ Новый пост", callback_data="sp:new")]]
+    for p in CONFIG.get("scheduled_posts", []):
+        title = CONFIG.get("groups", {}).get(str(p["chat_id"]), str(p["chat_id"]))
+        title = title if len(title) <= 12 else title[:11] + "…"
+        flag = "🟢" if p.get("enabled", True) else "⚪"
+        rows.append([InlineKeyboardButton(f"{flag} {p['name']} · {p['time']} → {title}",
+                                          callback_data=f"spo:{p['id']}")])
+    tz = CONFIG.get("post_tz", 5)
+    rows.append([InlineKeyboardButton("🕐 −", callback_data="sptz:-"),
+                 InlineKeyboardButton(f"пояс UTC+{tz}", callback_data="noop"),
+                 InlineKeyboardButton("🕐 +", callback_data="sptz:+")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:promo")])
+    return InlineKeyboardMarkup(rows)
+
+
+def sched_menu_text() -> str:
+    posts = CONFIG.get("scheduled_posts", [])
+    tz = CONFIG.get("post_tz", 5)
+    return (
+        f"🗓 Запланированные посты · часовой пояс UTC+{tz}\n\n"
+        f"Постов: {len(posts)}. Каждый выходит каждый день в своё время.\n\n"
+        "Контент любой: текст, фото, видео, гиф, стикер, документ — плюс кнопки-ссылки и эмодзи. "
+        "Нажми на пост, чтобы включить/выключить, закрепление или удалить.\n\n"
+        "⚠️ Расписание переживает перезапуск только при подключённом Volume."
+    )
+
+
+def sched_post_kb(p) -> InlineKeyboardMarkup:
+    pid = p["id"]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Включён" if p.get("enabled", True) else "⚪ Выключен",
+                              callback_data=f"spt:{pid}")],
+        [InlineKeyboardButton(f"📌 Закреплять: {'да' if p.get('pin') else 'нет'}", callback_data=f"spp:{pid}")],
+        [InlineKeyboardButton("🗑 Удалить пост", callback_data=f"spd:{pid}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="m:sched")],
+    ])
+
+
+def sched_post_text(p) -> str:
+    title = CONFIG.get("groups", {}).get(str(p["chat_id"]), str(p["chat_id"]))
+    btns = p.get("buttons") or []
+    preview = (p.get("text") or "").strip().replace("\n", " ")
+    preview = preview[:60] + "…" if len(preview) > 60 else preview
+    txt = (
+        f"📨 Пост «{p['name']}»\n"
+        f"Группа: {title}\n"
+        f"Время: каждый день в {p['time']} (UTC+{CONFIG.get('post_tz', 5)})\n"
+        f"Тип: {_POST_TYPE_RU.get(p.get('type'), 'пост')} · кнопок: {len(btns)}\n"
+    )
+    if preview:
+        txt += f"Текст: {preview}\n"
+    return txt
+
+
+def sched_groups_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for i, (cid, title) in enumerate(sorted(CONFIG["groups"].items())):
+        label = title if len(title) <= 30 else title[:29] + "…"
+        rows.append([InlineKeyboardButton(f"🗓 {label}", callback_data=f"spg:{i}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:sched")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -3153,8 +3389,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         allowed = {cid for cid, _ in my}
         # глобальные разделы — недоступны не-менеджерам
-        if (data in ("m:promo", "m:access", "m:approve", "bk:export", "bk:import")
-                or data.startswith(("pr:", "post:", "pto:", "dm:", "dmcast:", "dmto:", "appr:", "apt:"))):
+        if (data in ("m:promo", "m:access", "m:approve", "m:sched", "bk:export", "bk:import")
+                or data.startswith(("pr:", "post:", "pto:", "dm:", "dmcast:", "dmto:", "sp:", "spo:", "spt:",
+                                    "spp:", "spd:", "spg:", "sptz:", "appr:", "apt:"))):
             await query.answer("Это только для владельца/менеджеров бота", show_alert=True)
             return
     # Цель панели — всегда реальная группа из доступных
@@ -3450,6 +3687,67 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await safe_edit(
                 query, f"Пришли текст или фото с подписью — разошлю {n} подписчикам «{title}» в ЛС.\n(или /cancel)", None)
         return await safe_edit(query, "Группа не найдена.", dmcast_groups_kb())
+
+    if data == "m:sched":
+        if not CONFIG["groups"]:
+            return await safe_edit(query, "Пока нет известных групп для постинга.", promo_kb())
+        return await safe_edit(query, sched_menu_text(), sched_kb())
+    if data == "sp:new":
+        if not CONFIG["groups"]:
+            return await safe_edit(query, "Пока нет групп для постинга.", sched_kb())
+        context.user_data["sp_draft"] = {}
+        context.user_data["await"] = "sp_name"
+        return await safe_edit(query, "Название поста? (например: Утренний анонс)\n(или /cancel)", None)
+    if data.startswith("spg:"):
+        items = sorted(CONFIG["groups"].items())
+        i = int(data[4:])
+        if 0 <= i < len(items):
+            cid, title = items[i]
+            context.user_data.setdefault("sp_draft", {})["chat_id"] = int(cid)
+            context.user_data["await"] = "sp_content"
+            return await safe_edit(
+                query,
+                f"Группа: «{title}».\n\nТеперь пришли САМ ПОСТ: текст, фото / видео / гиф / стикер / "
+                "документ (с подписью) — что отправишь, то и будет публиковаться. Эмодзи и "
+                "форматирование сохранятся.\n(или /cancel)", None)
+        return await safe_edit(query, "Группа не найдена.", sched_groups_kb())
+    if data.startswith("spo:"):
+        p = _find_post(data[4:])
+        if not p:
+            return await safe_edit(query, sched_menu_text(), sched_kb())
+        return await safe_edit(query, sched_post_text(p), sched_post_kb(p))
+    if data.startswith("spt:"):
+        p = _find_post(data[4:])
+        if p:
+            p["enabled"] = not p.get("enabled", True)
+            save_config()
+            if p["enabled"]:
+                _schedule_post(context.job_queue, p)
+            else:
+                _unschedule_post(context.job_queue, p["id"])
+            return await safe_edit(query, sched_post_text(p), sched_post_kb(p))
+        return await safe_edit(query, sched_menu_text(), sched_kb())
+    if data.startswith("spp:"):
+        p = _find_post(data[4:])
+        if p:
+            p["pin"] = not p.get("pin", False)
+            save_config()
+            return await safe_edit(query, sched_post_text(p), sched_post_kb(p))
+        return await safe_edit(query, sched_menu_text(), sched_kb())
+    if data.startswith("spd:"):
+        pid = data[4:]
+        if _find_post(pid):
+            CONFIG["scheduled_posts"] = [x for x in CONFIG["scheduled_posts"] if x.get("id") != pid]
+            _unschedule_post(context.job_queue, pid)
+            save_config()
+        return await safe_edit(query, sched_menu_text(), sched_kb())
+    if data.startswith("sptz:"):
+        sign = data.split(":")[1]
+        tz = int(CONFIG.get("post_tz", 5)) + (1 if sign == "+" else -1)
+        CONFIG["post_tz"] = max(-12, min(14, tz))
+        save_config()
+        _reschedule_all_posts(context.job_queue)
+        return await safe_edit(query, sched_menu_text(), sched_kb())
 
     if data.startswith("dt:"):
         cfg = panel_cfg(context)
@@ -3749,10 +4047,20 @@ async def cmd_help(update, context):
 
 
 async def cmd_cancel(update, context):
+    context.user_data.pop("sp_draft", None)
     if context.user_data.pop("await", None):
         full = is_manager(update.effective_user.id)
         await update.message.reply_text(
             "Отменено.", reply_markup=main_menu_kb(panel_target_label(context), full=full))
+
+
+async def cmd_skip(update, context):
+    """Пропустить шаг кнопок в мастере поста."""
+    if context.user_data.get("await") == "sp_buttons":
+        context.user_data["await"] = "sp_time"
+        await update.message.reply_text(
+            "Ок, без кнопок. Во сколько публиковать каждый день? Формат ЧЧ:ММ, "
+            "например 13:00 (час дня) или 02:00 (два ночи).\n(или /cancel)")
 
 
 async def cmd_id(update, context):
@@ -4058,6 +4366,22 @@ async def on_private_document(update, context):
     """Импорт настроек: файл после нажатия «Загрузить» в разделе Бэкап."""
     user = update.effective_user
     awaiting = context.user_data.get("await")
+    if awaiting == "sp_content":
+        if not is_manager(user.id):
+            context.user_data.pop("await", None)
+            return
+        d = context.user_data.get("sp_draft", {})
+        if "chat_id" not in d:
+            await update.message.reply_text("Сначала выбери группу через /panel.")
+            return
+        content = _capture_post_content(update.message)
+        if content:
+            d.update(content)
+            context.user_data["await"] = "sp_buttons"
+            await update.message.reply_text(
+                "Кнопки под постом? Пришли по одной на строку: «Текст - https://ссылка». "
+                "Или /skip (либо пришли «-»), если без кнопок.")
+        return
     if awaiting not in ("import_config", "import_chat"):
         if is_manager(user.id) or await user_admin_groups(context, user.id):
             await update.message.reply_text(
@@ -4123,45 +4447,72 @@ async def on_private_document(update, context):
         reply_markup=backup_kb(owner))
 
 
-async def on_private_photo(update, context):
-    """Фото в личке во время рассылки/поста: публикуем фото с подписью."""
+async def on_private_media(update, context):
+    """Медиа в личке: содержимое запланированного поста (любой тип) или фото для рассылки/поста."""
     user = update.effective_user
     awaiting = context.user_data.get("await")
+    msg = update.message
+    # Мастер планировщика — принимаем любой контент
+    if awaiting == "sp_content":
+        if not is_manager(user.id):
+            context.user_data.pop("await", None)
+            return
+        d = context.user_data.get("sp_draft", {})
+        if "chat_id" not in d:
+            await msg.reply_text("Сначала выбери группу через /panel.")
+            return
+        content = _capture_post_content(msg)
+        if not content:
+            await msg.reply_text("Не понял контент. Пришли ещё раз или /cancel.")
+            return
+        d.update(content)
+        if d["type"] in _NO_CAPTION_TYPES:
+            context.user_data["await"] = "sp_time"
+            await msg.reply_text(
+                "Во сколько публиковать каждый день? Формат ЧЧ:ММ, например 13:00 (час дня) "
+                "или 02:00 (два ночи).\n(или /cancel)")
+        else:
+            context.user_data["await"] = "sp_buttons"
+            await msg.reply_text(
+                "Кнопки под постом? Пришли по одной на строку: «Текст - https://ссылка». "
+                "Или /skip (либо пришли «-»), если без кнопок.")
+        return
+    # Рассылка/пост одним фото (как было)
     if awaiting not in ("broadcast", "post", "dmcast"):
         return
     if not is_manager(user.id):
         context.user_data.pop("await", None)
         return
-    try:
-        photo_id = update.message.photo[-1].file_id
-    except Exception:  # noqa: BLE001
+    if not msg.photo:
+        await msg.reply_text("Для этого шага пришли фото или текст (видео/стикеры — только в планировщике постов).")
         return
-    caption = (update.message.caption or "").strip()
+    photo_id = msg.photo[-1].file_id
+    caption = (msg.caption or "").strip()
     context.user_data.pop("await", None)
     pin = CONFIG["promo"].get("pin", False)
     if awaiting == "broadcast":
         if not CONFIG["groups"]:
-            await update.message.reply_text("Пока нет известных групп.")
+            await msg.reply_text("Пока нет известных групп.")
             return
         ok, fail = await _broadcast(context, caption, photo_id, pin)
-        await update.message.reply_text(f"📣 Разослано в {ok} групп(ы), не доставлено: {fail}.", reply_markup=promo_kb())
+        await msg.reply_text(f"📣 Разослано в {ok} групп(ы), не доставлено: {fail}.", reply_markup=promo_kb())
     elif awaiting == "post":
         cid = context.user_data.pop("post_chat", None)
         if not cid:
-            await update.message.reply_text("Группа не выбрана. Попробуй снова через /panel.")
+            await msg.reply_text("Группа не выбрана. Попробуй снова через /panel.")
             return
         try:
             await _post_to_chat(context, cid, caption, photo_id, pin)
-            await update.message.reply_text("✅ Опубликовано (фото).", reply_markup=promo_kb())
+            await msg.reply_text("✅ Опубликовано (фото).", reply_markup=promo_kb())
         except Exception as e:  # noqa: BLE001
-            await update.message.reply_text(f"Не вышло опубликовать: {e}", reply_markup=promo_kb())
+            await msg.reply_text(f"Не вышло опубликовать: {e}", reply_markup=promo_kb())
     elif awaiting == "dmcast":
         cid = context.user_data.pop("dmcast_chat", None)
         if not cid:
-            await update.message.reply_text("Группа не выбрана. Попробуй снова через /panel.")
+            await msg.reply_text("Группа не выбрана. Попробуй снова через /panel.")
             return
         ok, fail = await _dm_broadcast(context, cid, caption, photo_id)
-        await update.message.reply_text(
+        await msg.reply_text(
             f"📨 Отправлено {ok} подписчикам, не доставлено: {fail}.", reply_markup=promo_kb())
 
 
@@ -4175,7 +4526,8 @@ async def on_private_text(update, context):
         await update.message.reply_text("Открой панель: /panel")
         return
     # Глобальные действия — только менеджерам
-    if awaiting in ("promo", "invite_text", "broadcast", "post") and not manager:
+    if awaiting in ("promo", "invite_text", "broadcast", "post", "dmcast",
+                    "sp_name", "sp_content", "sp_buttons", "sp_time") and not manager:
         context.user_data.pop("await", None)
         await update.message.reply_text("Это только для владельца/менеджеров бота.")
         return
@@ -4347,6 +4699,73 @@ async def on_private_text(update, context):
         ok, fail = await _dm_broadcast(context, cid, text)
         await update.message.reply_text(
             f"📨 Отправлено {ok} подписчикам, не доставлено: {fail}.", reply_markup=promo_kb())
+    elif awaiting == "sp_name":
+        name = text[:40].strip()
+        if not name:
+            context.user_data["await"] = "sp_name"
+            await update.message.reply_text("Пусто. Назови пост и пришли снова, или /cancel.")
+            return
+        context.user_data.setdefault("sp_draft", {})["name"] = name
+        if not CONFIG["groups"]:
+            await update.message.reply_text("Нет групп для постинга.")
+            return
+        await update.message.reply_text(f"Пост «{name}». В какую группу публиковать?", reply_markup=sched_groups_kb())
+    elif awaiting == "sp_content":
+        d = context.user_data.get("sp_draft", {})
+        if "chat_id" not in d:
+            await update.message.reply_text("Сначала выбери группу через /panel.")
+            return
+        content = _capture_post_content(update.effective_message)
+        if not content:
+            context.user_data["await"] = "sp_content"
+            await update.message.reply_text("Не понял контент. Пришли текст или медиа, или /cancel.")
+            return
+        d.update(content)
+        if d["type"] in _NO_CAPTION_TYPES:
+            context.user_data["await"] = "sp_time"
+            await update.message.reply_text(
+                "Во сколько публиковать каждый день? Формат ЧЧ:ММ, например 13:00 (час дня) "
+                "или 02:00 (два ночи).\n(или /cancel)")
+        else:
+            context.user_data["await"] = "sp_buttons"
+            await update.message.reply_text(
+                "Кнопки под постом? Пришли по одной на строку: «Текст - https://ссылка». "
+                "Или /skip (либо пришли «-»), если без кнопок.")
+    elif awaiting == "sp_buttons":
+        d = context.user_data.get("sp_draft", {})
+        if text.strip() not in ("-", "—", "нет", "skip"):
+            d["buttons"] = _parse_buttons(text)
+        context.user_data["await"] = "sp_time"
+        await update.message.reply_text(
+            "Во сколько публиковать каждый день? Формат ЧЧ:ММ, например 13:00 (час дня) "
+            "или 02:00 (два ночи).\n(или /cancel)")
+    elif awaiting == "sp_time":
+        mt = re.match(r"^(\d{1,2})[:.\s](\d{2})$", text.strip())
+        if not mt:
+            context.user_data["await"] = "sp_time"
+            await update.message.reply_text("Формат времени ЧЧ:ММ, например 13:00. Пришли снова или /cancel.")
+            return
+        h, m = int(mt.group(1)), int(mt.group(2))
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            context.user_data["await"] = "sp_time"
+            await update.message.reply_text("Часы 0–23, минуты 0–59. Пришли снова.")
+            return
+        d = context.user_data.pop("sp_draft", {})
+        if not d.get("chat_id"):
+            await update.message.reply_text("Группа потерялась. Начни заново через /panel.")
+            return
+        post = {
+            "id": _new_post_id(), "name": d.get("name", "пост"), "chat_id": d.get("chat_id"),
+            "time": f"{h:02d}:{m:02d}", "type": d.get("type", "text"), "text": d.get("text", ""),
+            "file_id": d.get("file_id"), "buttons": d.get("buttons", []), "pin": False, "enabled": True,
+        }
+        CONFIG.setdefault("scheduled_posts", []).append(post)
+        save_config()
+        _schedule_post(context.job_queue, post)
+        title = CONFIG.get("groups", {}).get(str(post["chat_id"]), str(post["chat_id"]))
+        await update.message.reply_text(
+            f"✅ Пост «{post['name']}» будет выходить каждый день в {post['time']} "
+            f"(UTC+{CONFIG.get('post_tz', 5)}) в «{title}».", reply_markup=sched_kb())
     elif awaiting == "import_config":
         await update.message.reply_text(
             "Жду файл config.json (документом), а не текст. /panel → 💾 Бэкап → «Загрузить».")
@@ -4422,6 +4841,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("status", cmd_status, filters=private))
     app.add_handler(CommandHandler("help", cmd_help, filters=private))
     app.add_handler(CommandHandler("cancel", cmd_cancel, filters=private))
+    app.add_handler(CommandHandler("skip", cmd_skip, filters=private))
     app.add_handler(CommandHandler("add", cmd_add, filters=private))
     app.add_handler(CommandHandler("del", cmd_del, filters=private))
     app.add_handler(CommandHandler("list", cmd_list, filters=private))
@@ -4498,7 +4918,10 @@ def build_app() -> Application:
     # Текст в ЛС
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, on_private_text))
     # Файл в ЛС (импорт настроек)
-    app.add_handler(MessageHandler(private & filters.PHOTO, on_private_photo))
+    app.add_handler(MessageHandler(
+        private & (filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Sticker.ALL
+                   | filters.VIDEO_NOTE | filters.AUDIO | filters.VOICE),
+        on_private_media))
     app.add_handler(MessageHandler(private & filters.Document.ALL, on_private_document))
 
     # Апгрейд группы в супергруппу — перенести одобрение/настройки на новый chat_id
@@ -4523,8 +4946,9 @@ def main():
         _state["last_promo"] = time.time()
         app.job_queue.run_repeating(promo_job, interval=60, first=30)
         app.job_queue.run_repeating(recurring_job, interval=60, first=20)
+        _reschedule_all_posts(app.job_queue)  # восстановить расписание постов из конфига
     else:
-        log.warning("JobQueue недоступен — авто-промо по таймеру работать не будет.")
+        log.warning("JobQueue недоступен — авто-промо и запланированные посты работать не будут.")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
