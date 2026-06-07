@@ -86,7 +86,9 @@ DEFAULT_CONFIG = {
     "spam_links": [],
     "triggers": {"банан": "300 руб"},
     "trigger_match": "word",
-    "moderation": {"warn_limit": 3, "warn_action": "mute", "warn_mute": 3600, "mod_admins_only": False},
+    "moderation": {"warn_limit": 3, "warn_action": "mute", "warn_mute": 3600, "mod_admins_only": False, "log_actions": False, "warn_expire_days": 0, "notify_delete": False},
+    # Анти-рейд: при всплеске входов включается строгий режим на время
+    "antiraid": {"enabled": False, "joins": 8, "window": 60, "lock_min": 10},
     # Кто может выполнять команды (по группам). Уровни: all|admins|owner (создатель). Владелец/менеджеры бота — всегда.
     "cmd_perms": {"ban": "admins", "mute": "admins", "warn": "admins", "all": "admins", "settings": "admins"},
     # Медиа-фильтр: какие типы сообщений удалять у обычных участников
@@ -104,7 +106,7 @@ DEFAULT_CONFIG = {
     "staff_group": 0,
     # Чёрный список пользователей этой группы: по ID и по подстрокам имени/юзернейма
     "blacklist": {"ids": [], "names": []},
-    "welcome": {"enabled": False, "text": "Добро пожаловать, {name}! Рады видеть тебя в «{chat}»."},
+    "welcome": {"enabled": False, "text": "Добро пожаловать, {name}! Рады видеть тебя в «{chat}».", "buttons": [], "delete_after": 0},
     # Язык сообщений для новичков (капча и т.п.): ru | uz | en
     "lang": "ru",
     "warns": {},
@@ -142,6 +144,11 @@ DEFAULT_CONFIG = {
     "scheduled_posts": [],
     # Часовой пояс для расписания постов (смещение от UTC в часах)
     "post_tz": 5,
+    # Глобальные списки на ВСЕ группы владельца
+    "global_blacklist": {"ids": [], "names": []},
+    "global_stop_words": [],
+    # Время последнего предупреждения (для авто-сгорания): {chat: {uid: ts}}
+    "warns_ts": {},
     # Индивидуальные настройки по чатам: {chat_id: {...только per-chat ключи...}}
     # Если для чата записи нет — используются глобальные настройки выше (как шаблон).
     "chats": {},
@@ -236,9 +243,9 @@ PER_CHAT_KEYS = ("enabled", "flood", "stop_words", "stop_words2", "stop_words2_a
                  "stop_words2_profile", "spam_links", "triggers",
                  "trigger_match", "moderation", "welcome", "captcha", "show_join_id",
                  "rules", "antinuke", "cmd_perms", "media_block", "media_action", "night", "recurring",
-                 "roles", "staff_group", "lang", "blacklist")
+                 "roles", "staff_group", "lang", "blacklist", "antiraid")
 PER_CHAT_DICTS = ("enabled", "flood", "moderation", "welcome", "captcha", "antinuke",
-                  "cmd_perms", "media_block", "night", "roles", "blacklist")
+                  "cmd_perms", "media_block", "night", "roles", "blacklist", "antiraid")
 
 
 def _fill_chat(chat: dict, base: dict) -> dict:
@@ -261,7 +268,7 @@ def _merge_defaults(data: dict) -> dict:
     if not isinstance(data, dict):
         return cfg
     for k, v in data.items():
-        if k in ("enabled", "flood", "moderation", "welcome", "promo", "antinuke", "captcha", "cmd_perms", "media_block", "night", "roles", "blacklist") and isinstance(v, dict):
+        if k in ("enabled", "flood", "moderation", "welcome", "promo", "antinuke", "captcha", "cmd_perms", "media_block", "night", "roles", "blacklist", "antiraid") and isinstance(v, dict):
             cfg[k].update(v)
         else:
             cfg[k] = v
@@ -271,6 +278,25 @@ def _merge_defaults(data: dict) -> dict:
     else:
         cfg["chats"] = {}
     return cfg
+
+
+def _split_comma_triggers(d: dict) -> None:
+    """Разбить старые автоответы вида «слово1, слово2»: один ключ → отдельные слова."""
+    tr = d.get("triggers")
+    if not isinstance(tr, dict):
+        return
+    if not any("," in k for k in tr):
+        return
+    new = {}
+    for k, v in tr.items():
+        if "," in k:
+            for w in k.split(","):
+                w = w.strip().lower()
+                if w:
+                    new[w] = v
+        else:
+            new[k] = v
+    d["triggers"] = new
 
 
 def load_config() -> dict:
@@ -284,6 +310,11 @@ def load_config() -> dict:
             # Новые чаты по-прежнему требуют одобрения владельца.
             if isinstance(raw, dict) and raw.get("groups") and not cfg.get("approved_chats"):
                 cfg["approved_chats"] = [int(c) for c in raw["groups"].keys()]
+            # Починка автоответов: старые «склеенные» ключи с запятой разбиваем на слова
+            _split_comma_triggers(cfg)
+            for ch in cfg.get("chats", {}).values():
+                if isinstance(ch, dict):
+                    _split_comma_triggers(ch)
             return cfg
         except Exception as e:  # noqa: BLE001
             log.warning("Не прочитать %s: %s", CONFIG_PATH, e)
@@ -634,22 +665,25 @@ def find_word_violation(text: str, cfg: dict):
     for w in cfg.get("stop_words", []):
         if w and w.lower() in t:
             return w
+    for w in CONFIG.get("global_stop_words", []):  # глобальные стоп-слова (на все группы)
+        if w and w.lower() in t:
+            return w
     return None
 
 
 def is_blacklisted(chat_id: int, user) -> bool:
-    """Пользователь в чёрном списке группы — по ID или по подстроке имени/фамилии/юзернейма."""
+    """Пользователь в чёрном списке — по ID или по подстроке имени/фамилии/юзернейма.
+    Проверяется список группы И глобальный список (на все группы владельца)."""
     if user is None:
         return False
-    bl = chat_cfg(chat_id).get("blacklist", {}) or {}
-    if getattr(user, "id", None) in bl.get("ids", []):
-        return True
-    names = bl.get("names", [])
-    if names:
-        prof = " ".join(filter(None, [getattr(user, "first_name", None),
-                                       getattr(user, "last_name", None),
-                                       getattr(user, "username", None)])).lower()
-        for n in names:
+    uid = getattr(user, "id", None)
+    prof = " ".join(filter(None, [getattr(user, "first_name", None),
+                                   getattr(user, "last_name", None),
+                                   getattr(user, "username", None)])).lower()
+    for bl in (chat_cfg(chat_id).get("blacklist", {}) or {}, CONFIG.get("global_blacklist", {}) or {}):
+        if uid in bl.get("ids", []):
+            return True
+        for n in bl.get("names", []):
             if n and n.lower() in prof:
                 return True
     return False
@@ -729,12 +763,21 @@ def _warns_chat(chat_id):
 
 
 def get_warn(chat_id, uid):
-    return CONFIG["warns"].get(str(chat_id), {}).get(str(uid), 0)
+    n = CONFIG["warns"].get(str(chat_id), {}).get(str(uid), 0)
+    if n:
+        days = chat_cfg(chat_id).get("moderation", {}).get("warn_expire_days", 0)
+        if days:
+            ts = CONFIG.get("warns_ts", {}).get(str(chat_id), {}).get(str(uid), 0)
+            if ts and (time.time() - ts) > days * 86400:
+                reset_warns(chat_id, uid)
+                return 0
+    return n
 
 
 def inc_warn(chat_id, uid):
     w = _warns_chat(chat_id)
     w[str(uid)] = w.get(str(uid), 0) + 1
+    CONFIG.setdefault("warns_ts", {}).setdefault(str(chat_id), {})[str(uid)] = time.time()
     save_config()
     return w[str(uid)]
 
@@ -787,6 +830,31 @@ async def notify_staff(context, chat_id: int, text: str):
         except Exception as e:  # noqa: BLE001
             log.debug("notify staff group %s: %s", sg, e)
     await alert_owners(context, text)
+
+
+async def log_action(context, chat_id: int, text: str):
+    """Журнал действий: если включён, пишем событие модерации в staff-группу/владельцам."""
+    if not chat_cfg(chat_id).get("moderation", {}).get("log_actions"):
+        return
+    title = CONFIG.get("groups", {}).get(str(chat_id), str(chat_id))
+    await notify_staff(context, chat_id, f"📋 [{title}] {text}")
+
+
+def _actor_name(update) -> str:
+    u = update.effective_user
+    return mention(u) if u else "—"
+
+
+async def notify_deleted(context, chat_id: int, reason: str):
+    """Короткое авто-удаляемое уведомление в чат, почему сообщение удалено (если включено)."""
+    if not chat_cfg(chat_id).get("moderation", {}).get("notify_delete"):
+        return
+    try:
+        m = await context.bot.send_message(chat_id, f"🗑 Сообщение удалено: {reason}.")
+        if context.job_queue:
+            context.job_queue.run_once(_delete_later, 5, data={"chat_id": chat_id, "mid": m.message_id})
+    except Exception as e:  # noqa: BLE001
+        log.debug("notify_deleted: %s", e)
 
 
 def track_nuke(chat_id, actor_id):
@@ -981,6 +1049,7 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.info("Удалено (%s) от %s", reason, user.id)
         except Exception as e:  # noqa: BLE001
             log.debug("delete link: %s", e)
+        await notify_deleted(context, chat.id, reason)
         return
 
     if cfg["enabled"].get("words2"):
@@ -1013,6 +1082,7 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log.info("Удалено (стоп-слово '%s') от %s", bad, user.id)
             except Exception as e:  # noqa: BLE001
                 log.debug("delete word: %s", e)
+            await notify_deleted(context, chat.id, "запрещённое слово")
             return
 
     if cfg["enabled"].get("flood") and check_flood(chat.id, user.id, cfg):
@@ -1040,15 +1110,20 @@ async def maybe_send_trigger(update, context, text):
 
 
 async def send_welcome(context, chat, user):
-    """Отправить приветствие новичку, если оно включено."""
+    """Отправить приветствие новичку, если оно включено (с кнопками и авто-удалением)."""
     w = chat_cfg(chat.id)["welcome"]
     if not (w.get("enabled") and w.get("text")):
         return
     text = w["text"].replace("{name}", user.first_name or "друг").replace("{chat}", chat.title or "чат")
+    markup = _post_buttons_markup(w.get("buttons"))
     try:
-        await context.bot.send_message(chat.id, text)
+        m = await context.bot.send_message(chat.id, text, reply_markup=markup)
     except Exception as e:  # noqa: BLE001
         log.debug("welcome: %s", e)
+        return
+    secs = int(w.get("delete_after", 0) or 0)
+    if secs and context.job_queue:
+        context.job_queue.run_once(_delete_later, secs, data={"chat_id": chat.id, "mid": m.message_id})
 
 
 async def announce_join_id(context, chat, user):
@@ -1422,6 +1497,27 @@ async def handle_join_request_press(update: Update, context: ContextTypes.DEFAUL
         log.debug("welcome after approve: %s", e)
 
 
+_raid_joins: dict = {}   # chat_id -> deque меток входов
+_raid_until: dict = {}   # chat_id -> ts, до которого активен строгий режим
+
+
+def _raid_tick(chat_id: int, ar: dict):
+    """Регистрирует вход и говорит, активен ли рейд-режим. Возвращает (in_raid, just_started)."""
+    now = time.time()
+    window = int(ar.get("window", 60))
+    dq = _raid_joins.setdefault(chat_id, deque())
+    dq.append(now)
+    while dq and now - dq[0] > window:
+        dq.popleft()
+    active = now < _raid_until.get(chat_id, 0)
+    just = False
+    if not active and len(dq) >= int(ar.get("joins", 8)):
+        _raid_until[chat_id] = now + int(ar.get("lock_min", 10)) * 60
+        active = True
+        just = True
+    return active, just
+
+
 async def handle_join(context, chat, u):
     """Единая обработка входа новичка: проверка имени → капча или приветствие.
     Вызывается из сервис-сообщения (on_new_members) и из события chat_member
@@ -1451,6 +1547,20 @@ async def handle_join(context, chat, u):
             return
     bump(chat.id, "joined")
     join_dates[(chat.id, u.id)] = time.time()
+    # Анти-рейд: при всплеске входов включаем строгий режим — новичков мьютим
+    ar = cfg.get("antiraid", {})
+    if ar.get("enabled"):
+        in_raid, just_started = _raid_tick(chat.id, ar)
+        if just_started:
+            await notify_staff(
+                context, chat.id,
+                f"🛡 Антирейд в «{chat.title or chat.id}»: всплеск входов "
+                f"(≥{ar.get('joins', 8)} за {ar.get('window', 60)}с). Строгий режим на "
+                f"{ar.get('lock_min', 10)} мин — новички мьютятся.")
+        if in_raid:
+            await mute_user(context, chat.id, u.id, int(ar.get("lock_min", 10)) * 60)
+            await log_action(context, chat.id, f"🛡 антирейд: новичок {mention(u)} замьючен")
+            return
     await announce_join_id(context, chat, u)
     if cfg["captcha"].get("enabled") and await start_captcha(context, chat, u):
         return  # приветствие — после прохождения капчи
@@ -1728,11 +1838,29 @@ async def cmd_ban(update, context):
     if not g:
         return
     tid, tname = g
-    reason = extract_reason(update, context)
+    chat = update.effective_chat
+    # необязательная длительность: /ban 1ч | 30м | 7д (иначе — навсегда)
+    args = list(context.args)
+    if not update.effective_message.reply_to_message and args:
+        args = args[1:]
+    duration = None
+    rest = []
+    for a in args:
+        d = parse_duration(a)
+        if d is not None and duration is None:
+            duration = d
+        else:
+            rest.append(a)
+    reason = " ".join(rest).strip()
+    until = None if not duration else datetime.now(timezone.utc) + timedelta(seconds=duration)
     try:
-        await context.bot.ban_chat_member(update.effective_chat.id, tid)
-        bump(update.effective_chat.id, "banned")
-        await update.effective_message.reply_text(f"🚫 {tname} забанен." + (f"\nПричина: {reason}" if reason else ""))
+        await context.bot.ban_chat_member(chat.id, tid, until_date=until)
+        bump(chat.id, "banned")
+        dur_txt = "навсегда" if not duration else f"на {human_duration(duration)}"
+        await update.effective_message.reply_text(
+            f"🚫 {tname} забанен {dur_txt}." + (f"\nПричина: {reason}" if reason else ""))
+        await log_action(context, chat.id, f"🚫 бан {dur_txt}: {tname} (by {_actor_name(update)})"
+                         + (f" — {reason}" if reason else ""))
     except Exception as e:  # noqa: BLE001
         await update.effective_message.reply_text(f"Не вышло: {e}\nПроверь, что я админ с правом банить.")
 
@@ -1763,6 +1891,7 @@ async def cmd_block(update, context):
         log.debug("block ban: %s", e)
     await update.effective_message.reply_text(
         f"🚷 {tname} в чёрном списке (ID {tid}). Если вернётся — забаню снова.")
+    await log_action(context, chat.id, f"🚷 в чёрный список: {tname} (ID {tid}, by {_actor_name(update)})")
 
 
 async def cmd_unblock(update, context):
@@ -1784,6 +1913,7 @@ async def cmd_unblock(update, context):
     except Exception as e:  # noqa: BLE001
         log.debug("unblock unban: %s", e)
     await update.effective_message.reply_text(f"✅ {tname} убран из чёрного списка.")
+    await log_action(context, chat.id, f"✅ из чёрного списка: {tname} (by {_actor_name(update)})")
 
 
 async def cmd_unban(update, context):
@@ -1812,6 +1942,7 @@ async def cmd_kick(update, context):
         await context.bot.unban_chat_member(chat.id, tid, only_if_banned=True)
         bump(chat.id, "kicked")
         await update.effective_message.reply_text(f"👢 {tname} удалён (сможет зайти заново).")
+        await log_action(context, chat.id, f"👢 кик: {tname} (by {_actor_name(update)})")
     except Exception as e:  # noqa: BLE001
         await update.effective_message.reply_text(f"Не вышло: {e}")
 
@@ -1840,6 +1971,8 @@ async def cmd_mute(update, context):
         dur_txt = "навсегда" if not duration else f"на {human_duration(duration)}"
         await update.effective_message.reply_text(
             f"🔇 {tname} в муте {dur_txt}." + (f"\nПричина: {reason}" if reason else ""))
+        await log_action(context, chat.id, f"🔇 мут {dur_txt}: {tname} (by {_actor_name(update)})"
+                         + (f" — {reason}" if reason else ""))
     except Exception as e:  # noqa: BLE001
         await update.effective_message.reply_text(f"Не вышло: {e}\nПроверь право ограничивать.")
 
@@ -1858,6 +1991,7 @@ async def cmd_unmute(update, context):
     except Exception as e:  # noqa: BLE001
         log.debug("unmute restrict %s: %s", tid, e)  # обычная группа — хватило снятия мягкого мута
     await update.effective_message.reply_text(f"🔊 {tname} размучен.")
+    await log_action(context, chat.id, f"🔊 размут: {tname} (by {_actor_name(update)})")
 
 
 async def cmd_warn(update, context):
@@ -1878,16 +2012,20 @@ async def cmd_warn(update, context):
                 await context.bot.ban_chat_member(chat.id, tid)
                 bump(chat.id, "banned")
                 await update.effective_message.reply_text(f"⚠️ {tname}: {n}/{limit} — бан.")
+                await log_action(context, chat.id, f"⚠️→🚫 {n}/{limit} предупреждений → бан: {tname}")
             else:
                 await mute_user(context, chat.id, tid, m["warn_mute"])
                 bump(chat.id, "muted")
                 await update.effective_message.reply_text(
                     f"⚠️ {tname}: {n}/{limit} — мут на {human_duration(m['warn_mute'])}.")
+                await log_action(context, chat.id, f"⚠️→🔇 {n}/{limit} → мут: {tname}")
         except Exception as e:  # noqa: BLE001
             await update.effective_message.reply_text(f"Лимит достигнут, но наказать не вышло: {e}")
     else:
         await update.effective_message.reply_text(
             f"⚠️ {tname}: предупреждение {n}/{limit}." + (f"\nПричина: {reason}" if reason else ""))
+        await log_action(context, chat.id, f"⚠️ пред {n}/{limit}: {tname} (by {_actor_name(update)})"
+                         + (f" — {reason}" if reason else ""))
 
 
 async def cmd_unwarn(update, context):
@@ -2313,21 +2451,23 @@ def _post_buttons_markup(buttons):
 
 
 def _parse_buttons(text):
-    """Текст «Название - https://ссылка» по строкам → список [текст, url]."""
+    """Каждая строка → кнопка-ссылка. Понимает «Текст - url», «Текст | url»,
+    «Текст url», «Текст: url» и просто url. Ссылка делает кнопку кликабельной."""
     out = []
     for line in (text or "").splitlines():
         line = line.strip()
         if not line:
             continue
-        if " - " in line:
-            txt, url = line.split(" - ", 1)
-        elif "|" in line:
-            txt, url = line.split("|", 1)
-        else:
+        m = re.search(r"(https?://\S+|tg://\S+|t\.me/\S+)", line)
+        if not m:
             continue
-        txt, url = txt.strip(), url.strip()
-        if txt and url.startswith(("http://", "https://", "tg://")):
-            out.append([txt, url])
+        url = m.group(1)
+        if url.startswith("t.me/"):
+            url = "https://" + url
+        txt = line[:m.start()].strip(" \t-|—–:•").strip()
+        if not txt:
+            txt = "Перейти"
+        out.append([txt, url])
     return out
 
 
@@ -2359,9 +2499,18 @@ def _capture_post_content(message):
 _NO_CAPTION_TYPES = {"sticker", "video_note"}
 
 
-async def _send_scheduled_post(context, post):
-    """Опубликовать запланированный пост в его группу."""
-    cid = int(post["chat_id"])
+def _post_chat_ids(post):
+    """Список групп поста (поддержка и нового chat_ids, и старого chat_id)."""
+    cids = post.get("chat_ids")
+    if cids:
+        return [int(c) for c in cids]
+    if post.get("chat_id"):
+        return [int(post["chat_id"])]
+    return []
+
+
+async def _send_one(context, cid, post):
+    """Опубликовать пост в одну группу."""
     t = post.get("type", "text")
     text = post.get("text") or ""
     fid = post.get("file_id")
@@ -2392,8 +2541,21 @@ async def _send_scheduled_post(context, post):
         try:
             await b.pin_chat_message(cid, m.message_id, disable_notification=True)
         except Exception as e:  # noqa: BLE001
-            log.debug("sched pin: %s", e)
+            log.debug("sched pin %s: %s", cid, e)
     return m
+
+
+async def _send_scheduled_post(context, post):
+    """Опубликовать запланированный пост во все его группы."""
+    last = None
+    for cid in _post_chat_ids(post):
+        try:
+            last = await _send_one(context, cid, post)
+        except Forbidden:
+            log.info("Пост «%s»: нет доступа в %s", post.get("name"), cid)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Пост «%s» в %s: %s", post.get("name"), cid, e)
+    return last
 
 
 async def _fire_scheduled_post(context):
@@ -2664,7 +2826,8 @@ def other_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("👥 Роли", callback_data="m:roles")],
         [InlineKeyboardButton("🛡 Staff-группа", callback_data="m:staff"),
          InlineKeyboardButton("🌐 Язык новичков", callback_data="m:lang")],
-        [InlineKeyboardButton("🕹 Права на команды", callback_data="m:cmdperms")],
+        [InlineKeyboardButton("🛡 Анти-рейд", callback_data="m:antiraid"),
+         InlineKeyboardButton("🕹 Права на команды", callback_data="m:cmdperms")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
     ])
 
@@ -2691,6 +2854,66 @@ def blacklist_menu_text(cfg, target_label: str) -> str:
         "Кто попал в список — баню при входе (и при заявке отклоняю), а если он уже в группе и "
         "что-то пишет — баню и удаляю. «Имя» — это подстрока: ищется в имени, фамилии и юзернейме.\n\n"
         "Быстро добавить из чата: ответь на сообщение командой /block (по ID), /unblock — убрать."
+    )
+
+
+def antiraid_kb(cfg) -> InlineKeyboardMarkup:
+    a = cfg.get("antiraid", {})
+    on = a.get("enabled")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Анти-рейд включён" if on else "🔴 Анти-рейд выключен", callback_data="ar:toggle")],
+        [InlineKeyboardButton(f"Порог входов: {a.get('joins', 8)}", callback_data="noop")],
+        [InlineKeyboardButton("➖", callback_data="ar:joins:-"), InlineKeyboardButton("➕", callback_data="ar:joins:+")],
+        [InlineKeyboardButton(f"За период: {a.get('window', 60)} сек", callback_data="noop")],
+        [InlineKeyboardButton("➖", callback_data="ar:window:-"), InlineKeyboardButton("➕", callback_data="ar:window:+")],
+        [InlineKeyboardButton(f"Строгий режим: {a.get('lock_min', 10)} мин", callback_data="noop")],
+        [InlineKeyboardButton("➖", callback_data="ar:lock:-"), InlineKeyboardButton("➕", callback_data="ar:lock:+")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="m:other")],
+    ])
+
+
+def antiraid_menu_text(cfg, target_label: str) -> str:
+    a = cfg.get("antiraid", {})
+    return (
+        f"🛡 Анти-рейд · {target_label}\n\n"
+        f"Статус: {'включён' if a.get('enabled') else 'выключен'}.\n"
+        f"Срабатывает, если в группу за {a.get('window', 60)} сек заходит "
+        f"≥ {a.get('joins', 8)} человек.\n"
+        f"Тогда на {a.get('lock_min', 10)} мин включается строгий режим: новички "
+        "автоматически мьютятся (их сообщения удаляются), а в staff приходит уведомление. "
+        "Через это время режим выключается сам."
+    )
+
+
+def global_kb() -> InlineKeyboardMarkup:
+    bl = CONFIG.get("global_blacklist", {}) or {}
+    gw = CONFIG.get("global_stop_words", [])
+    rows = [
+        [InlineKeyboardButton("➕ ID в ЧС", callback_data="add:gbid"),
+         InlineKeyboardButton("➕ имя в ЧС", callback_data="add:gbname")],
+        [InlineKeyboardButton("➕ глоб. стоп-слово", callback_data="add:gword")],
+    ]
+    for i, uid in enumerate(bl.get("ids", [])):
+        rows.append([InlineKeyboardButton(f"❌ ID {uid}", callback_data=f"dgbid:{i}")])
+    for i, nm in enumerate(bl.get("names", [])):
+        rows.append([InlineKeyboardButton(f"❌ имя: {nm}", callback_data=f"dgbname:{i}")])
+    for i, w in enumerate(gw):
+        rows.append([InlineKeyboardButton(f"❌ слово: {w}", callback_data=f"dgword:{i}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:access")])
+    return InlineKeyboardMarkup(rows)
+
+
+def global_menu_text() -> str:
+    bl = CONFIG.get("global_blacklist", {}) or {}
+    gw = CONFIG.get("global_stop_words", [])
+    return (
+        "🌍 Глобальные списки (на ВСЕ твои группы)\n\n"
+        f"Чёрный список: ID {len(bl.get('ids', []))}, имён {len(bl.get('names', []))}.\n"
+        f"Стоп-слов: {len(gw)}.\n\n"
+        "Кто/что здесь — действует сразу во всех группах бота: глобально забаненный "
+        "отлетает при входе и при сообщении везде, а глобальные стоп-слова удаляются во "
+        "всех чатах в дополнение к локальным. Удобно против спамеров, кочующих по группам.\n\n"
+        "Быстро: ответь на сообщение командой /gblock — добавит в глобальный ЧС."
     )
 
 
@@ -2770,6 +2993,8 @@ def staff_kb(cfg) -> InlineKeyboardMarkup:
     rows = []
     if cfg.get("staff_group"):
         rows.append([InlineKeyboardButton("🔌 Отвязать staff-группу", callback_data="st:unset")])
+    on = cfg.get("moderation", {}).get("log_actions")
+    rows.append([InlineKeyboardButton(f"📋 Журнал действий: {'вкл' if on else 'выкл'}", callback_data="st:log")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:other")])
     return InlineKeyboardMarkup(rows)
 
@@ -2986,6 +3211,11 @@ def mod_kb(cfg) -> InlineKeyboardMarkup:
         ]
     rows.append([InlineKeyboardButton(
         f"{'✅' if m['mod_admins_only'] else '❌'} Модерация только для владельца", callback_data="md:owneronly")])
+    exp = m.get("warn_expire_days", 0)
+    rows.append([InlineKeyboardButton(
+        f"⏳ Сгорание предов: {'выкл' if not exp else str(exp) + ' дн'}", callback_data="md:expire")])
+    rows.append([InlineKeyboardButton(
+        f"🗑 Сообщать о причине удаления: {'да' if m.get('notify_delete') else 'нет'}", callback_data="md:notify")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -2996,9 +3226,14 @@ def welcome_kb(cfg) -> InlineKeyboardMarkup:
     jid_label = {"off": "🆔 ID новичка: не показывать",
                  "all": "🆔 ID новичка: видно всем",
                  "admins": "🆔 ID новичка: только админам"}.get(jid, "🆔 ID новичка: не показывать")
+    da = int(w.get("delete_after", 0) or 0)
+    da_label = "выкл" if not da else human_duration(da)
+    nb = len(w.get("buttons", []))
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🟢 Включено" if w["enabled"] else "🔴 Выключено", callback_data="wl:toggle")],
         [InlineKeyboardButton("✏️ Изменить текст", callback_data="wl:edit")],
+        [InlineKeyboardButton(f"🔘 Кнопки-ссылки: {nb}", callback_data="wl:btns")],
+        [InlineKeyboardButton(f"⏱ Авто-удаление: {da_label}", callback_data="wl:del")],
         [InlineKeyboardButton(jid_label, callback_data="wl:joinid")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
     ])
@@ -3046,13 +3281,22 @@ _POST_TYPE_RU = {"text": "текст", "photo": "фото", "video": "видео
                  "voice": "голосовое", "video_note": "кружок"}
 
 
+def _post_groups_label(post, maxlen=14):
+    cids = _post_chat_ids(post)
+    names = [CONFIG.get("groups", {}).get(str(c), str(c)) for c in cids]
+    if not names:
+        return "—"
+    if len(names) == 1:
+        t = names[0]
+        return t if len(t) <= maxlen else t[:maxlen - 1] + "…"
+    return f"{len(names)} групп"
+
+
 def sched_kb() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("➕ Новый пост", callback_data="sp:new")]]
     for p in CONFIG.get("scheduled_posts", []):
-        title = CONFIG.get("groups", {}).get(str(p["chat_id"]), str(p["chat_id"]))
-        title = title if len(title) <= 12 else title[:11] + "…"
         flag = "🟢" if p.get("enabled", True) else "⚪"
-        rows.append([InlineKeyboardButton(f"{flag} {p['name']} · {p['time']} → {title}",
+        rows.append([InlineKeyboardButton(f"{flag} {p['name']} · {p['time']} → {_post_groups_label(p, 12)}",
                                           callback_data=f"spo:{p['id']}")])
     tz = CONFIG.get("post_tz", 5)
     rows.append([InlineKeyboardButton("🕐 −", callback_data="sptz:-"),
@@ -3067,7 +3311,7 @@ def sched_menu_text() -> str:
     tz = CONFIG.get("post_tz", 5)
     return (
         f"🗓 Запланированные посты · часовой пояс UTC+{tz}\n\n"
-        f"Постов: {len(posts)}. Каждый выходит каждый день в своё время.\n\n"
+        f"Постов: {len(posts)}. Каждый выходит каждый день в своё время и в выбранные группы (можно несколько).\n\n"
         "Контент любой: текст, фото, видео, гиф, стикер, документ — плюс кнопки-ссылки и эмодзи. "
         "Нажми на пост, чтобы включить/выключить, закрепление или удалить.\n\n"
         "⚠️ Расписание переживает перезапуск только при подключённом Volume."
@@ -3086,13 +3330,15 @@ def sched_post_kb(p) -> InlineKeyboardMarkup:
 
 
 def sched_post_text(p) -> str:
-    title = CONFIG.get("groups", {}).get(str(p["chat_id"]), str(p["chat_id"]))
+    cids = _post_chat_ids(p)
+    names = [CONFIG.get("groups", {}).get(str(c), str(c)) for c in cids]
+    groups = ", ".join(names) if names else "—"
     btns = p.get("buttons") or []
     preview = (p.get("text") or "").strip().replace("\n", " ")
     preview = preview[:60] + "…" if len(preview) > 60 else preview
     txt = (
         f"📨 Пост «{p['name']}»\n"
-        f"Группа: {title}\n"
+        f"Группы ({len(names)}): {groups}\n"
         f"Время: каждый день в {p['time']} (UTC+{CONFIG.get('post_tz', 5)})\n"
         f"Тип: {_POST_TYPE_RU.get(p.get('type'), 'пост')} · кнопок: {len(btns)}\n"
     )
@@ -3101,12 +3347,16 @@ def sched_post_text(p) -> str:
     return txt
 
 
-def sched_groups_kb() -> InlineKeyboardMarkup:
+def sched_groups_kb(selected=None) -> InlineKeyboardMarkup:
+    selected = set(int(c) for c in (selected or []))
     rows = []
     for i, (cid, title) in enumerate(sorted(CONFIG["groups"].items())):
-        label = title if len(title) <= 30 else title[:29] + "…"
-        rows.append([InlineKeyboardButton(f"🗓 {label}", callback_data=f"spg:{i}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:sched")])
+        mark = "✅ " if int(cid) in selected else "☐ "
+        label = title if len(title) <= 26 else title[:25] + "…"
+        rows.append([InlineKeyboardButton(f"{mark}{label}", callback_data=f"spg:{i}")])
+    if selected:
+        rows.append([InlineKeyboardButton(f"Готово → выбрано: {len(selected)}", callback_data="spgo")])
+    rows.append([InlineKeyboardButton("⬅️ Отмена", callback_data="m:sched")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -3115,6 +3365,7 @@ def access_kb() -> InlineKeyboardMarkup:
     for i, uid in enumerate(CONFIG["managers"]):
         rows.append([InlineKeyboardButton(f"❌ убрать {uid}", callback_data=f"dm:{i}")])
     rows.append([InlineKeyboardButton("🔐 Допуск чатов", callback_data="m:approve")])
+    rows.append([InlineKeyboardButton("🌍 Глобальные списки", callback_data="m:global")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -3391,7 +3642,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # глобальные разделы — недоступны не-менеджерам
         if (data in ("m:promo", "m:access", "m:approve", "m:sched", "bk:export", "bk:import")
                 or data.startswith(("pr:", "post:", "pto:", "dm:", "dmcast:", "dmto:", "sp:", "spo:", "spt:",
-                                    "spp:", "spd:", "spg:", "sptz:", "appr:", "apt:"))):
+                                    "spp:", "spd:", "spg:", "spgo", "sptz:", "appr:", "apt:"))):
             await query.answer("Это только для владельца/менеджеров бота", show_alert=True)
             return
     # Цель панели — всегда реальная группа из доступных
@@ -3429,6 +3680,51 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 CONFIG["managers"].pop(i)
                 save_config()
         return await safe_edit(query, access_menu_text(), access_kb())
+
+    # Глобальные списки — только владелец
+    if data == "m:global" or data.startswith(("add:gbid", "add:gbname", "add:gword", "dgbid:", "dgbname:", "dgword:")):
+        if not is_owner(user.id):
+            return await query.answer("Только для главного владельца", show_alert=True)
+        gbl = CONFIG.setdefault("global_blacklist", {"ids": [], "names": []})
+        gw = CONFIG.setdefault("global_stop_words", [])
+        if data == "add:gbid":
+            context.user_data["await"] = "gbid"
+            return await safe_edit(query, "Пришли числовой ID для ГЛОБАЛЬНОГО чёрного списка.\n(или /cancel)", None)
+        if data == "add:gbname":
+            context.user_data["await"] = "gbname"
+            return await safe_edit(query, "Пришли имя/@юзернейм для ГЛОБАЛЬНОГО чёрного списка.\n(или /cancel)", None)
+        if data == "add:gword":
+            context.user_data["await"] = "gword"
+            return await safe_edit(query, "Пришли ГЛОБАЛЬНОЕ стоп-слово (удаляется во всех группах).\n(или /cancel)", None)
+        if data.startswith("dgbid:"):
+            i = int(data.split(":")[1])
+            if 0 <= i < len(gbl["ids"]):
+                gbl["ids"].pop(i); save_config()
+        elif data.startswith("dgbname:"):
+            i = int(data.split(":")[1])
+            if 0 <= i < len(gbl["names"]):
+                gbl["names"].pop(i); save_config()
+        elif data.startswith("dgword:"):
+            i = int(data.split(":")[1])
+            if 0 <= i < len(gw):
+                gw.pop(i); save_config()
+        return await safe_edit(query, global_menu_text(), global_kb())
+
+    # Анти-рейд
+    if data.startswith("ar:"):
+        cfg = panel_cfg(context)
+        a = cfg.setdefault("antiraid", {"enabled": False, "joins": 8, "window": 60, "lock_min": 10})
+        parts = data.split(":")
+        if parts[1] == "toggle":
+            a["enabled"] = not a.get("enabled")
+        elif parts[1] == "joins":
+            a["joins"] = max(3, min(50, a.get("joins", 8) + (1 if parts[2] == "+" else -1)))
+        elif parts[1] == "window":
+            a["window"] = max(10, min(600, a.get("window", 60) + (10 if parts[2] == "+" else -10)))
+        elif parts[1] == "lock":
+            a["lock_min"] = max(1, min(120, a.get("lock_min", 10) + (5 if parts[2] == "+" else -5)))
+        save_config()
+        return await safe_edit(query, antiraid_menu_text(cfg, label), antiraid_kb(cfg))
 
     # Раздел «Бэкап»
     if data == "m:backup" or data.startswith("bk:"):
@@ -3513,6 +3809,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "m:words2": (words2_menu_text(cfg, label), words2_kb(cfg)),
         "m:lang": (lang_menu_text(cfg, label), lang_kb(cfg)),
         "m:blacklist": (blacklist_menu_text(cfg, label), blacklist_kb(cfg)),
+        "m:antiraid": (antiraid_menu_text(cfg, label), antiraid_kb(cfg)),
         "m:links": (f"🔗 Спам-домены · {label}:", links_kb(cfg)),
         "m:flood": (f"⚙️ Антифлуд · {label}:", flood_kb(cfg)),
         "m:mod": (f"🛡 Модерация · {label}\nКоманды — в группе (/ban, /mute…). Здесь — предупреждения:", mod_kb(cfg)),
@@ -3602,6 +3899,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             m["warn_limit"] = max(1, m["warn_limit"] + (1 if parts[2] == "+" else -1))
         elif parts[1] == "mute":
             m["warn_mute"] = max(300, m["warn_mute"] + (1800 if parts[2] == "+" else -1800))
+        elif parts[1] == "expire":
+            order = [0, 1, 3, 7, 14, 30]
+            cur = m.get("warn_expire_days", 0)
+            m["warn_expire_days"] = order[(order.index(cur) + 1) % len(order)] if cur in order else 0
+        elif parts[1] == "notify":
+            m["notify_delete"] = not m.get("notify_delete")
         save_config()
         return await safe_edit(query, f"🛡 Модерация · {label}\nНастройки предупреждений:", mod_kb(cfg))
 
@@ -3614,6 +3917,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["await"] = "welcome"
         return await safe_edit(query, f"Пришли новый текст приветствия для «{label}» одним сообщением.\n"
                                        "Можно вставить {name} и {chat}.\n\n(или /cancel)", None)
+    if data == "wl:btns":
+        context.user_data["await"] = "welcome_btns"
+        return await safe_edit(
+            query,
+            "Пришли кнопки-ссылки для приветствия: по одной на строку «Текст - https://ссылка».\n"
+            "Пришли «-», чтобы убрать кнопки.\n\n(или /cancel)", None)
+    if data == "wl:del":
+        cfg = panel_cfg(context)
+        order = [0, 30, 60, 120, 300]
+        cur = int(cfg["welcome"].get("delete_after", 0) or 0)
+        cfg["welcome"]["delete_after"] = order[(order.index(cur) + 1) % len(order)] if cur in order else 0
+        save_config()
+        return await safe_edit(query, welcome_menu_text(cfg), welcome_kb(cfg))
     if data == "wl:joinid":
         cfg = panel_cfg(context)
         order = ["off", "all", "admins"]
@@ -3695,22 +4011,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "sp:new":
         if not CONFIG["groups"]:
             return await safe_edit(query, "Пока нет групп для постинга.", sched_kb())
-        context.user_data["sp_draft"] = {}
+        context.user_data["sp_draft"] = {"chat_ids": []}
         context.user_data["await"] = "sp_name"
         return await safe_edit(query, "Название поста? (например: Утренний анонс)\n(или /cancel)", None)
     if data.startswith("spg:"):
         items = sorted(CONFIG["groups"].items())
         i = int(data[4:])
+        d = context.user_data.setdefault("sp_draft", {})
+        sel = d.setdefault("chat_ids", [])
         if 0 <= i < len(items):
-            cid, title = items[i]
-            context.user_data.setdefault("sp_draft", {})["chat_id"] = int(cid)
-            context.user_data["await"] = "sp_content"
-            return await safe_edit(
-                query,
-                f"Группа: «{title}».\n\nТеперь пришли САМ ПОСТ: текст, фото / видео / гиф / стикер / "
-                "документ (с подписью) — что отправишь, то и будет публиковаться. Эмодзи и "
-                "форматирование сохранятся.\n(или /cancel)", None)
-        return await safe_edit(query, "Группа не найдена.", sched_groups_kb())
+            cid = int(items[i][0])
+            if cid in sel:
+                sel.remove(cid)
+            else:
+                sel.append(cid)
+        return await safe_edit(query, "Выбери группы для поста (можно несколько), затем «Готово»:",
+                               sched_groups_kb(sel))
+    if data == "spgo":
+        d = context.user_data.setdefault("sp_draft", {})
+        if not d.get("chat_ids"):
+            return await safe_edit(query, "Отметь хотя бы одну группу:", sched_groups_kb(d.get("chat_ids")))
+        context.user_data["await"] = "sp_content"
+        return await safe_edit(
+            query,
+            "Теперь пришли САМ ПОСТ: текст, фото / видео / гиф / стикер / документ (с подписью) — "
+            "что отправишь, то и будет публиковаться. Эмодзи и форматирование сохранятся.\n(или /cancel)", None)
     if data.startswith("spo:"):
         p = _find_post(data[4:])
         if not p:
@@ -3914,10 +4239,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wcfg["staff_group"] = 0
         save_config()
         return await safe_edit(query, staff_menu_text(wcfg, label), staff_kb(wcfg))
+    if data == "st:log":
+        wcfg = panel_cfg(context)
+        wcfg.setdefault("moderation", {})["log_actions"] = not wcfg.get("moderation", {}).get("log_actions")
+        save_config()
+        return await safe_edit(query, staff_menu_text(wcfg, label), staff_kb(wcfg))
 
     if data == "add:trigger":
         context.user_data["await"] = "trigger"
-        return await safe_edit(query, f"Пришли строку: слово = ответ (для «{label}»)\nНапример: банан = 300 руб\n\n(или /cancel)", None)
+        return await safe_edit(query, f"Пришли строку: слово = ответ (для «{label}»).\nМожно несколько слов через запятую на один ответ, например: банан, яблоко, груша = это фрукт\n\n(или /cancel)", None)
     if data == "add:word":
         context.user_data["await"] = "word"
         return await safe_edit(query, f"Пришли стоп-слово для «{label}» одним сообщением.\n(или /cancel)", None)
@@ -4044,6 +4374,190 @@ async def cmd_help(update, context):
         "защищать от сноса и помогать с модерацией. Настройками управляет владелец бота "
         "и админы своих групп.",
         reply_markup=InlineKeyboardMarkup([[add_btn]]))
+
+
+async def cmd_purge(update, context):
+    """Удалить сообщения от отвеченного до текущего (чистка спама). Только модераторы."""
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not await can_moderate(context, chat.id, update.effective_user.id, "ban"):
+        return await _deny(update)
+    if not msg.reply_to_message:
+        await msg.reply_text("Ответь командой /purge на сообщение, начиная с которого удалить.")
+        return
+    start = msg.reply_to_message.message_id
+    end = msg.message_id
+    ids = list(range(start, end + 1))
+    if len(ids) > 200:
+        await msg.reply_text("Слишком большой диапазон (>200). Ответь ближе к началу спама.")
+        return
+    deleted = 0
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i + 100]
+        try:
+            await context.bot.delete_messages(chat.id, chunk)
+            deleted += len(chunk)
+        except Exception:  # noqa: BLE001
+            for mid in chunk:  # по одному, если пачкой не вышло
+                try:
+                    await context.bot.delete_message(chat.id, mid)
+                    deleted += 1
+                except Exception:  # noqa: BLE001
+                    pass
+    bump(chat.id, "deleted")
+    await log_action(context, chat.id, f"🧹 очистка: удалено ~{deleted} сообщений (by {_actor_name(update)})")
+    try:
+        note = await context.bot.send_message(chat.id, f"🧹 Удалено ~{deleted} сообщений.")
+        if context.job_queue:
+            context.job_queue.run_once(_delete_later, 5, data={"chat_id": chat.id, "mid": note.message_id})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _delete_later(context):
+    d = context.job.data
+    try:
+        await context.bot.delete_message(d["chat_id"], d["mid"])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_report_cd: dict = {}  # (chat_id, user_id) -> ts последней жалобы (антиспам жалоб)
+
+
+async def cmd_report(update, context):
+    """Жалоба от пользователя: ответом на плохое сообщение /report (или @admin). Уходит в staff/владельцам."""
+    chat = update.effective_chat
+    msg = update.effective_message
+    reporter = update.effective_user
+    if not msg.reply_to_message:
+        await msg.reply_text("Чтобы пожаловаться, ответь этой командой на нужное сообщение.")
+        return
+    key = (chat.id, reporter.id)
+    now = time.time()
+    if now - _report_cd.get(key, 0) < 30:
+        return  # не чаще раза в 30 сек
+    _report_cd[key] = now
+    target = msg.reply_to_message.from_user
+    title = CONFIG.get("groups", {}).get(str(chat.id), str(chat.id))
+    head = (f"🚨 Жалоба в «{title}»\n"
+            f"От: {mention(reporter)}\n"
+            f"На: {mention(target) if target else '—'}")
+    sent_to_staff = False
+    sg = chat_cfg(chat.id).get("staff_group", 0)
+    if sg:
+        try:
+            await context.bot.send_message(sg, head)
+            await context.bot.forward_message(sg, chat.id, msg.reply_to_message.message_id)
+            sent_to_staff = True
+        except Exception as e:  # noqa: BLE001
+            log.debug("report→staff: %s", e)
+    if not sent_to_staff:
+        await alert_staff(context, head + "\n(переслать сообщение не вышло — посмотри в чате)")
+    try:
+        await msg.delete()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        ack = await context.bot.send_message(chat.id, "✅ Жалоба отправлена администрации.")
+        if context.job_queue:
+            context.job_queue.run_once(_delete_later, 5, data={"chat_id": chat.id, "mid": ack.message_id})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def cmd_me(update, context):
+    """Пользователь смотрит свой статус: предупреждения и т.п. Доступно всем."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or chat.type == "private":
+        await update.effective_message.reply_text("Эта команда работает в группе.")
+        return
+    n = get_warn(chat.id, user.id)
+    limit = chat_cfg(chat.id)["moderation"]["warn_limit"]
+    muted = "да" if is_soft_muted(chat.id, user.id) else "нет"
+    lines = [
+        f"👤 {mention(user)}",
+        f"ID: <code>{user.id}</code>",
+        f"Предупреждения: {n}/{limit}",
+        f"В муте: {muted}",
+    ]
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+_appeal_cd: dict = {}
+
+
+async def cmd_appeal(update, context):
+    """Апелляция: пользователь пишет боту в ЛС /appeal текст — уходит владельцам."""
+    user = update.effective_user
+    text = _args_text(update)
+    if not text:
+        await update.message.reply_text(
+            "Чтобы подать апелляцию, напиши: /appeal и текст обращения (например, почему тебя стоит разбанить).")
+        return
+    now = time.time()
+    if now - _appeal_cd.get(user.id, 0) < 120:
+        await update.message.reply_text("Апелляцию можно отправлять раз в пару минут. Попробуй позже.")
+        return
+    _appeal_cd[user.id] = now
+    head = (f"📨 Апелляция от {mention(user)} (ID <code>{user.id}</code>"
+            + (f", @{user.username}" if user.username else "") + f"):\n{text}")
+    await alert_owners(context, head)
+    await update.message.reply_text("✅ Обращение отправлено администрации. Жди ответа.")
+
+
+async def cmd_gblock(update, context):
+    """Глобальный бан: ответом на сообщение /gblock — в глобальный ЧС (все группы). Только владелец."""
+    if not is_owner(update.effective_user.id):
+        return await _deny(update)
+    chat = update.effective_chat
+    tid, tname = await resolve_target(update, context)
+    if not tid:
+        await update.effective_message.reply_text("Кого в глобальный ЧС? Ответь на сообщение или /gblock id.")
+        return
+    ids = CONFIG.setdefault("global_blacklist", {"ids": [], "names": []}).setdefault("ids", [])
+    if tid not in ids:
+        ids.append(tid)
+        save_config()
+    try:
+        await context.bot.ban_chat_member(chat.id, tid)
+        bump(chat.id, "banned")
+    except Exception as e:  # noqa: BLE001
+        log.debug("gblock ban: %s", e)
+    await update.effective_message.reply_text(f"🌍🚷 {tname} в глобальном чёрном списке (ID {tid}) — банится во всех группах.")
+
+
+async def cmd_gunblock(update, context):
+    if not is_owner(update.effective_user.id):
+        return await _deny(update)
+    tid, tname = await resolve_target(update, context)
+    if not tid:
+        await update.effective_message.reply_text("Кого убрать из глобального ЧС? Ответь или /gunblock id.")
+        return
+    ids = CONFIG.setdefault("global_blacklist", {"ids": [], "names": []}).setdefault("ids", [])
+    if tid in ids:
+        ids.remove(tid)
+        save_config()
+    await update.effective_message.reply_text(f"✅ {tname} убран из глобального чёрного списка.")
+
+
+async def weekly_digest_job(context):
+    """Раз в неделю шлём в staff-группы краткую сводку по группе."""
+    for cid in list(CONFIG.get("groups", {}).keys()):
+        try:
+            cfg = chat_cfg(int(cid))
+            if not cfg.get("staff_group"):
+                continue
+            st = stats_store.get(int(cid), {})
+            title = CONFIG["groups"].get(cid, cid)
+            text = (f"📊 Недельная сводка «{title}»\n"
+                    f"Входов: {st.get('joined', 0)} · банов: {st.get('banned', 0)} · "
+                    f"мутов: {st.get('muted', 0)} · удалено: {st.get('deleted', 0)} · "
+                    f"предупреждений: {st.get('warns', 0)} · капча пройдена: {st.get('captcha_pass', 0)}")
+            await context.bot.send_message(cfg["staff_group"], text)
+        except Exception as e:  # noqa: BLE001
+            log.debug("digest %s: %s", cid, e)
 
 
 async def cmd_cancel(update, context):
@@ -4250,18 +4764,24 @@ async def cmd_add(update, context):
         return
     body = _args_text(update)
     if "=" not in body:
-        await update.message.reply_text("Формат: /add слово = ответ")
+        await update.message.reply_text("Формат: /add слово = ответ (можно несколько слов через запятую)")
         return
-    key, resp = body.split("=", 1)
-    key, resp = key.strip().lower(), resp.strip()
-    if not key or not resp:
-        await update.message.reply_text("Пусто. Формат: /add слово = ответ")
+    keys_part, resp = body.split("=", 1)
+    resp = resp.strip()
+    words = [w.strip().lower() for w in keys_part.split(",") if w.strip()]
+    if not words or not resp:
+        await update.message.reply_text("Пусто. Формат: /add слово1, слово2 = ответ")
         return
     cfg = panel_cfg(context)
-    cfg["triggers"][key] = resp
+    for w in words:
+        cfg["triggers"][w] = resp
     save_config()
-    await update.message.reply_text(
-        f"✅ Добавлено: «{key}» → «{resp}» ({panel_target_label(context)})", reply_markup=triggers_kb(cfg))
+    if len(words) == 1:
+        msg = f"✅ Добавлено: «{words[0]}» → «{resp}» ({panel_target_label(context)})"
+    else:
+        msg = (f"✅ Добавлено {len(words)} слов → один ответ «{resp}» ({panel_target_label(context)}):\n"
+               + ", ".join(words))
+    await update.message.reply_text(msg, reply_markup=triggers_kb(cfg))
 
 
 async def cmd_del(update, context):
@@ -4371,16 +4891,16 @@ async def on_private_document(update, context):
             context.user_data.pop("await", None)
             return
         d = context.user_data.get("sp_draft", {})
-        if "chat_id" not in d:
-            await update.message.reply_text("Сначала выбери группу через /panel.")
+        if not d.get("chat_ids"):
+            await update.message.reply_text("Сначала выбери группы через /panel.")
             return
         content = _capture_post_content(update.message)
         if content:
             d.update(content)
             context.user_data["await"] = "sp_buttons"
             await update.message.reply_text(
-                "Кнопки под постом? Пришли по одной на строку: «Текст - https://ссылка». "
-                "Или /skip (либо пришли «-»), если без кнопок.")
+                "Кнопки-ссылки под постом? Пришли по одной на строку: «Текст - https://ссылка» "
+                "(по нажатию откроется ссылка). Или /skip (либо пришли «-»), если без кнопок.")
         return
     if awaiting not in ("import_config", "import_chat"):
         if is_manager(user.id) or await user_admin_groups(context, user.id):
@@ -4458,8 +4978,8 @@ async def on_private_media(update, context):
             context.user_data.pop("await", None)
             return
         d = context.user_data.get("sp_draft", {})
-        if "chat_id" not in d:
-            await msg.reply_text("Сначала выбери группу через /panel.")
+        if not d.get("chat_ids"):
+            await msg.reply_text("Сначала выбери группы через /panel.")
             return
         content = _capture_post_content(msg)
         if not content:
@@ -4474,8 +4994,8 @@ async def on_private_media(update, context):
         else:
             context.user_data["await"] = "sp_buttons"
             await msg.reply_text(
-                "Кнопки под постом? Пришли по одной на строку: «Текст - https://ссылка». "
-                "Или /skip (либо пришли «-»), если без кнопок.")
+                "Кнопки-ссылки под постом? Пришли по одной на строку: «Текст - https://ссылка» "
+                "(по нажатию откроется ссылка). Или /skip (либо пришли «-»), если без кнопок.")
         return
     # Рассылка/пост одним фото (как было)
     if awaiting not in ("broadcast", "post", "dmcast"):
@@ -4527,12 +5047,13 @@ async def on_private_text(update, context):
         return
     # Глобальные действия — только менеджерам
     if awaiting in ("promo", "invite_text", "broadcast", "post", "dmcast",
-                    "sp_name", "sp_content", "sp_buttons", "sp_time") and not manager:
+                    "sp_name", "sp_content", "sp_buttons", "sp_time",
+                    "gbid", "gbname", "gword") and not manager:
         context.user_data.pop("await", None)
         await update.message.reply_text("Это только для владельца/менеджеров бота.")
         return
     # Настройки конкретной цели — проверяем право на неё
-    if awaiting in ("trigger", "word", "word2", "blid", "blname", "link", "welcome", "rules", "recurring", "role_new"):
+    if awaiting in ("trigger", "word", "word2", "blid", "blname", "link", "welcome", "welcome_btns", "rules", "recurring", "role_new"):
         tgt = context.user_data.get("cfg_target", "defaults")
         if not await can_edit_target(context, user.id, tgt):
             context.user_data.pop("await", None)
@@ -4543,18 +5064,27 @@ async def on_private_text(update, context):
 
     if awaiting == "trigger":
         if "=" not in text:
-            await update.message.reply_text("Нужен формат: слово = ответ. Попробуй снова через /panel.")
-            return
-        key, resp = text.split("=", 1)
-        key, resp = key.strip().lower(), resp.strip()
-        if key and resp:
-            cfg = panel_cfg(context)
-            cfg["triggers"][key] = resp
-            save_config()
+            context.user_data["await"] = "trigger"
             await update.message.reply_text(
-                f"✅ Добавлено: «{key}» → «{resp}» ({panel_target_label(context)})", reply_markup=triggers_kb(cfg))
+                "Нужен формат: слово = ответ (можно несколько слов через запятую). Попробуй снова или /cancel.")
+            return
+        keys_part, resp = text.split("=", 1)
+        resp = resp.strip()
+        words = [w.strip().lower() for w in keys_part.split(",") if w.strip()]
+        if words and resp:
+            cfg = panel_cfg(context)
+            for w in words:
+                cfg["triggers"][w] = resp
+            save_config()
+            if len(words) == 1:
+                msg = f"✅ Добавлено: «{words[0]}» → «{resp}» ({panel_target_label(context)})"
+            else:
+                msg = (f"✅ Добавлено {len(words)} слов → один ответ «{resp}» ({panel_target_label(context)}):\n"
+                       + ", ".join(words))
+            await update.message.reply_text(msg, reply_markup=triggers_kb(cfg))
         else:
-            await update.message.reply_text("Пусто. Попробуй снова через /panel.")
+            context.user_data["await"] = "trigger"
+            await update.message.reply_text("Пусто. Формат: слово1, слово2 = ответ. Попробуй снова или /cancel.")
     elif awaiting == "word":
         w = text.lower()
         cfg = panel_cfg(context)
@@ -4602,6 +5132,40 @@ async def on_private_text(update, context):
             save_config()
         await update.message.reply_text(
             f"✅ Домен: {d} ({panel_target_label(context)})", reply_markup=links_kb(cfg))
+    elif awaiting == "gbid":
+        digits = "".join(ch for ch in text if ch.isdigit() or ch == "-")
+        if not digits.lstrip("-").isdigit():
+            await update.message.reply_text("Это не похоже на ID. Попробуй снова через /panel.")
+            return
+        uid = int(digits)
+        ids = CONFIG.setdefault("global_blacklist", {"ids": [], "names": []}).setdefault("ids", [])
+        if uid not in ids:
+            ids.append(uid); save_config()
+        await update.message.reply_text(f"🌍🚷 ID {uid} в глобальном чёрном списке.", reply_markup=global_kb())
+    elif awaiting == "gbname":
+        nm = text.lstrip("@").lower().strip()
+        names = CONFIG.setdefault("global_blacklist", {"ids": [], "names": []}).setdefault("names", [])
+        if nm and nm not in names:
+            names.append(nm); save_config()
+        await update.message.reply_text(f"🌍🚷 Имя «{nm}» в глобальном чёрном списке.", reply_markup=global_kb())
+    elif awaiting == "gword":
+        w = text.lower().strip()
+        gw = CONFIG.setdefault("global_stop_words", [])
+        if w and w not in gw:
+            gw.append(w); save_config()
+        await update.message.reply_text(f"🌍 Глобальное стоп-слово: {w}.", reply_markup=global_kb())
+    elif awaiting == "welcome_btns":
+        cfg = panel_cfg(context)
+        if text.strip() in ("-", "—", "нет"):
+            cfg["welcome"]["buttons"] = []
+            save_config()
+            await update.message.reply_text("Кнопки приветствия убраны.", reply_markup=welcome_kb(cfg))
+        else:
+            btns = _parse_buttons(text)
+            cfg["welcome"]["buttons"] = btns
+            save_config()
+            await update.message.reply_text(
+                f"✅ Кнопок приветствия: {len(btns)} ({panel_target_label(context)}).", reply_markup=welcome_kb(cfg))
     elif awaiting == "welcome":
         if text:
             cfg = panel_cfg(context)
@@ -4705,15 +5269,18 @@ async def on_private_text(update, context):
             context.user_data["await"] = "sp_name"
             await update.message.reply_text("Пусто. Назови пост и пришли снова, или /cancel.")
             return
-        context.user_data.setdefault("sp_draft", {})["name"] = name
+        d = context.user_data.setdefault("sp_draft", {})
+        d["name"] = name
         if not CONFIG["groups"]:
             await update.message.reply_text("Нет групп для постинга.")
             return
-        await update.message.reply_text(f"Пост «{name}». В какую группу публиковать?", reply_markup=sched_groups_kb())
+        await update.message.reply_text(
+            f"Пост «{name}». Выбери группы (можно несколько), затем «Готово»:",
+            reply_markup=sched_groups_kb(d.get("chat_ids")))
     elif awaiting == "sp_content":
         d = context.user_data.get("sp_draft", {})
-        if "chat_id" not in d:
-            await update.message.reply_text("Сначала выбери группу через /panel.")
+        if not d.get("chat_ids"):
+            await update.message.reply_text("Сначала выбери группы через /panel.")
             return
         content = _capture_post_content(update.effective_message)
         if not content:
@@ -4729,8 +5296,8 @@ async def on_private_text(update, context):
         else:
             context.user_data["await"] = "sp_buttons"
             await update.message.reply_text(
-                "Кнопки под постом? Пришли по одной на строку: «Текст - https://ссылка». "
-                "Или /skip (либо пришли «-»), если без кнопок.")
+                "Кнопки-ссылки под постом? Пришли по одной на строку: «Текст - https://ссылка» "
+                "(по нажатию откроется ссылка). Или /skip (либо пришли «-»), если без кнопок.")
     elif awaiting == "sp_buttons":
         d = context.user_data.get("sp_draft", {})
         if text.strip() not in ("-", "—", "нет", "skip"):
@@ -4751,21 +5318,22 @@ async def on_private_text(update, context):
             await update.message.reply_text("Часы 0–23, минуты 0–59. Пришли снова.")
             return
         d = context.user_data.pop("sp_draft", {})
-        if not d.get("chat_id"):
-            await update.message.reply_text("Группа потерялась. Начни заново через /panel.")
+        cids = d.get("chat_ids") or ([d["chat_id"]] if d.get("chat_id") else [])
+        if not cids:
+            await update.message.reply_text("Группы потерялись. Начни заново через /panel.")
             return
         post = {
-            "id": _new_post_id(), "name": d.get("name", "пост"), "chat_id": d.get("chat_id"),
+            "id": _new_post_id(), "name": d.get("name", "пост"), "chat_ids": [int(c) for c in cids],
             "time": f"{h:02d}:{m:02d}", "type": d.get("type", "text"), "text": d.get("text", ""),
             "file_id": d.get("file_id"), "buttons": d.get("buttons", []), "pin": False, "enabled": True,
         }
         CONFIG.setdefault("scheduled_posts", []).append(post)
         save_config()
         _schedule_post(context.job_queue, post)
-        title = CONFIG.get("groups", {}).get(str(post["chat_id"]), str(post["chat_id"]))
+        names = [CONFIG.get("groups", {}).get(str(c), str(c)) for c in post["chat_ids"]]
         await update.message.reply_text(
             f"✅ Пост «{post['name']}» будет выходить каждый день в {post['time']} "
-            f"(UTC+{CONFIG.get('post_tz', 5)}) в «{title}».", reply_markup=sched_kb())
+            f"(UTC+{CONFIG.get('post_tz', 5)}) в: {', '.join(names)}.", reply_markup=sched_kb())
     elif awaiting == "import_config":
         await update.message.reply_text(
             "Жду файл config.json (документом), а не текст. /panel → 💾 Бэкап → «Загрузить».")
@@ -4795,6 +5363,9 @@ async def _post_init(app: Application):
             BotCommand("unban", "Разбанить (ответом или @user)"),
             BotCommand("block", "🚷 В чёрный список + бан (ответом)"),
             BotCommand("unblock", "Убрать из чёрного списка (ответом)"),
+            BotCommand("purge", "🧹 Удалить сообщения (ответом на начало)"),
+            BotCommand("report", "🚨 Пожаловаться (ответом) — для всех"),
+            BotCommand("me", "👤 Мои предупреждения/статус"),
             BotCommand("role", "👥 Выдать роль (ответом): /role Имя"),
             BotCommand("unrole", "Снять роли (ответом)"),
             BotCommand("all", "📣 Позвать всех"),
@@ -4809,9 +5380,13 @@ async def _post_init(app: Application):
         ]
         # Команды модерации показываем ТОЛЬКО админам группы (обычные участники их не видят)
         await app.bot.set_my_commands(group_cmds, scope=BotCommandScopeAllChatAdministrators())
-        # Обычным участникам в группах — пустой список (как у GroupHelp: команд не видно)
+        # Обычным участникам в группах — только то, что для них (жалоба и свой статус)
+        member_cmds = [
+            BotCommand("report", "🚨 Пожаловаться (ответом на сообщение)"),
+            BotCommand("me", "👤 Мои предупреждения/статус"),
+        ]
         try:
-            await app.bot.set_my_commands([], scope=BotCommandScopeAllGroupChats())
+            await app.bot.set_my_commands(member_cmds, scope=BotCommandScopeAllGroupChats())
         except Exception:  # noqa: BLE001
             pass
         priv_cmds = [
@@ -4873,6 +5448,12 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("unban", cmd_unban, filters=groups))
     app.add_handler(CommandHandler("block", cmd_block, filters=groups))
     app.add_handler(CommandHandler("unblock", cmd_unblock, filters=groups))
+    app.add_handler(CommandHandler("purge", cmd_purge, filters=groups))
+    app.add_handler(CommandHandler("report", cmd_report, filters=groups))
+    app.add_handler(CommandHandler(["me", "status"], cmd_me, filters=groups))
+    app.add_handler(CommandHandler("appeal", cmd_appeal, filters=private))
+    app.add_handler(CommandHandler("gblock", cmd_gblock, filters=groups))
+    app.add_handler(CommandHandler("gunblock", cmd_gunblock, filters=groups))
     app.add_handler(CommandHandler("kick", cmd_kick, filters=groups))
     app.add_handler(CommandHandler("mute", cmd_mute, filters=groups))
     app.add_handler(CommandHandler("unmute", cmd_unmute, filters=groups))
@@ -4946,6 +5527,7 @@ def main():
         _state["last_promo"] = time.time()
         app.job_queue.run_repeating(promo_job, interval=60, first=30)
         app.job_queue.run_repeating(recurring_job, interval=60, first=20)
+        app.job_queue.run_repeating(weekly_digest_job, interval=7 * 86400, first=7 * 86400)
         _reschedule_all_posts(app.job_queue)  # восстановить расписание постов из конфига
     else:
         log.warning("JobQueue недоступен — авто-промо и запланированные посты работать не будут.")
