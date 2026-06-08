@@ -19,6 +19,7 @@ import copy
 import html
 import io
 import asyncio
+import random
 import logging
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
@@ -2367,6 +2368,7 @@ async def cmd_setrules(update, context):
 
 async def _post_to_chat(context, cid, text=None, photo_id=None, pin=False):
     """Опубликовать в группе текст или фото (с подписью), при желании — закрепить."""
+    text = _spintax(text) if text else text
     if photo_id:
         m = await context.bot.send_photo(int(cid), photo_id, caption=(text or None))
     else:
@@ -2384,7 +2386,7 @@ async def _dm_broadcast(context, cid, text=None, photo_id=None):
     subs = list(CONFIG.get("dm_subscribers", {}).get(str(cid), []))
     title = CONFIG.get("groups", {}).get(str(cid), "группа")
     header = f"📢 От «{title}»:\n"
-    body = header + (text or "")
+    body = header + (_spintax(text) if text else "")
     ok = fail = 0
     blocked = []
     for uid in subs:
@@ -2436,18 +2438,66 @@ def _post_tz():
 
 
 def _post_buttons_markup(buttons):
-    """buttons: список [текст, url] → инлайн-клавиатура (по кнопке на строку)."""
+    """Кнопки-ссылки. Поддерживает два формата:
+    плоский [[текст,url], ...] (по кнопке на ряд) и ряды [[[т,u],[т,u]], [[т,u]]]."""
     if not buttons:
         return None
     rows = []
-    for b in buttons:
-        try:
-            txt, url = b[0], b[1]
-            if txt and url:
-                rows.append([InlineKeyboardButton(txt, url=url)])
-        except Exception:  # noqa: BLE001
-            continue
+    is_rows = isinstance(buttons[0], list) and buttons[0] and isinstance(buttons[0][0], list)
+    if is_rows:
+        for row in buttons:
+            r = [InlineKeyboardButton(b[0], url=b[1]) for b in row if len(b) >= 2 and b[0] and b[1]]
+            if r:
+                rows.append(r)
+    else:
+        for b in buttons:
+            if len(b) >= 2 and b[0] and b[1]:
+                rows.append([InlineKeyboardButton(b[0], url=b[1])])
     return InlineKeyboardMarkup(rows) if rows else None
+
+
+def _one_button(part):
+    part = part.strip()
+    if not part:
+        return None
+    m = re.search(r"(https?://\S+|tg://\S+|t\.me/\S+)", part)
+    if not m:
+        return None
+    url = m.group(1)
+    if url.startswith("t.me/"):
+        url = "https://" + url
+    txt = part[:m.start()].strip(" \t-|—–:•").strip() or "Перейти"
+    return [txt, url]
+
+
+def _parse_button_rows(text):
+    """Каждая строка — ряд кнопок; внутри строки кнопки разделяются ';'.
+    Кнопка — «Текст - https://ссылка». Возвращает список рядов."""
+    rows = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row = [b for b in (_one_button(p) for p in line.split(";")) if b]
+        if row:
+            rows.append(row)
+    return rows
+
+
+_SPINTAX_RE = re.compile(r"\{([^{}]*\|[^{}]*)\}")
+
+
+def _spintax(text):
+    """Рандомизация: {Привет|Здравствуй} → один из вариантов (выбор при каждой отправке)."""
+    if not text or "{" not in text:
+        return text
+    def repl(m):
+        opts = [o.strip() for o in m.group(1).split("|")]
+        return random.choice(opts) if opts else ""
+    out, prev, guard = text, None, 0
+    while out != prev and guard < 10:
+        prev, out, guard = out, _SPINTAX_RE.sub(repl, out), guard + 1
+    return out
 
 
 def _parse_buttons(text):
@@ -2472,26 +2522,30 @@ def _parse_buttons(text):
 
 
 def _capture_post_content(message):
-    """Извлечь из сообщения тип/файл/текст для будущей публикации."""
-    cap = (message.caption or "").strip()
+    """Извлечь из сообщения тип/файл/текст для будущей публикации.
+    Текст и подпись берём в HTML — чтобы сохранить форматирование (жирный, курсив,
+    ссылки, моноширинный, спойлер) ровно так, как набрал пользователь."""
+    cap_html = getattr(message, "caption_html", None)
+    cap = (cap_html if cap_html is not None else (message.caption or "")).strip()
     if message.photo:
-        return {"type": "photo", "file_id": message.photo[-1].file_id, "text": cap}
+        return {"type": "photo", "file_id": message.photo[-1].file_id, "text": cap, "html": True}
     if getattr(message, "video", None):
-        return {"type": "video", "file_id": message.video.file_id, "text": cap}
+        return {"type": "video", "file_id": message.video.file_id, "text": cap, "html": True}
     if getattr(message, "animation", None):
-        return {"type": "animation", "file_id": message.animation.file_id, "text": cap}
+        return {"type": "animation", "file_id": message.animation.file_id, "text": cap, "html": True}
     if getattr(message, "sticker", None):
         return {"type": "sticker", "file_id": message.sticker.file_id, "text": ""}
     if getattr(message, "document", None):
-        return {"type": "document", "file_id": message.document.file_id, "text": cap}
+        return {"type": "document", "file_id": message.document.file_id, "text": cap, "html": True}
     if getattr(message, "audio", None):
-        return {"type": "audio", "file_id": message.audio.file_id, "text": cap}
+        return {"type": "audio", "file_id": message.audio.file_id, "text": cap, "html": True}
     if getattr(message, "voice", None):
-        return {"type": "voice", "file_id": message.voice.file_id, "text": cap}
+        return {"type": "voice", "file_id": message.voice.file_id, "text": cap, "html": True}
     if getattr(message, "video_note", None):
         return {"type": "video_note", "file_id": message.video_note.file_id, "text": ""}
     if message.text:
-        return {"type": "text", "file_id": None, "text": message.text}
+        th = getattr(message, "text_html", None)
+        return {"type": "text", "file_id": None, "text": (th if th is not None else message.text), "html": True}
     return None
 
 
@@ -2510,31 +2564,35 @@ def _post_chat_ids(post):
 
 
 async def _send_one(context, cid, post):
-    """Опубликовать пост в одну группу."""
+    """Опубликовать пост в одну группу (с форматированием, кнопками, тонкими опциями)."""
     t = post.get("type", "text")
-    text = post.get("text") or ""
+    text = _spintax(post.get("text") or "")
     fid = post.get("file_id")
     markup = None if t in _NO_CAPTION_TYPES else _post_buttons_markup(post.get("buttons"))
     cap = None if t in _NO_CAPTION_TYPES else (text or None)
+    pm = "HTML" if post.get("html") else None
+    silent = bool(post.get("silent"))
     b = context.bot
     if t == "text":
-        m = await b.send_message(cid, text or "‎", reply_markup=markup)
+        m = await b.send_message(cid, text or "‎", reply_markup=markup, parse_mode=pm,
+                                 disable_web_page_preview=bool(post.get("no_preview")),
+                                 disable_notification=silent)
     elif t == "photo":
-        m = await b.send_photo(cid, fid, caption=cap, reply_markup=markup)
+        m = await b.send_photo(cid, fid, caption=cap, reply_markup=markup, parse_mode=pm, disable_notification=silent)
     elif t == "video":
-        m = await b.send_video(cid, fid, caption=cap, reply_markup=markup)
+        m = await b.send_video(cid, fid, caption=cap, reply_markup=markup, parse_mode=pm, disable_notification=silent)
     elif t == "animation":
-        m = await b.send_animation(cid, fid, caption=cap, reply_markup=markup)
+        m = await b.send_animation(cid, fid, caption=cap, reply_markup=markup, parse_mode=pm, disable_notification=silent)
     elif t == "document":
-        m = await b.send_document(cid, fid, caption=cap, reply_markup=markup)
+        m = await b.send_document(cid, fid, caption=cap, reply_markup=markup, parse_mode=pm, disable_notification=silent)
     elif t == "audio":
-        m = await b.send_audio(cid, fid, caption=cap, reply_markup=markup)
+        m = await b.send_audio(cid, fid, caption=cap, reply_markup=markup, parse_mode=pm, disable_notification=silent)
     elif t == "voice":
-        m = await b.send_voice(cid, fid, caption=cap, reply_markup=markup)
+        m = await b.send_voice(cid, fid, caption=cap, reply_markup=markup, parse_mode=pm, disable_notification=silent)
     elif t == "video_note":
-        m = await b.send_video_note(cid, fid)
+        m = await b.send_video_note(cid, fid, disable_notification=silent)
     elif t == "sticker":
-        m = await b.send_sticker(cid, fid)
+        m = await b.send_sticker(cid, fid, disable_notification=silent)
     else:
         m = await b.send_message(cid, text or "‎")
     if post.get("pin"):
@@ -2587,34 +2645,56 @@ def _new_post_id():
     return f"p{n}"
 
 
+_WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+_post_last_fired: dict = {}  # post_id -> "YYYY-MM-DD HH:MM" (защита от двойной публикации в ту же минуту)
+
+
+def _post_due(p, now) -> bool:
+    """Пора ли публиковать пост в момент now (datetime в нужном поясе)."""
+    if not p.get("enabled", True):
+        return False
+    if p.get("time") != now.strftime("%H:%M"):
+        return False
+    mode = p.get("mode", "daily")
+    if mode == "weekly":
+        return now.weekday() in (p.get("days") or [])
+    if mode == "once":
+        return p.get("date") == now.strftime("%Y-%m-%d")
+    return True  # daily
+
+
+async def scheduled_posts_job(context):
+    """Раз в минуту проверяем все посты и публикуем те, чьё время настало."""
+    now = datetime.now(_post_tz())
+    key = now.strftime("%Y-%m-%d %H:%M")
+    for p in list(CONFIG.get("scheduled_posts", [])):
+        try:
+            if not _post_due(p, now):
+                continue
+            if _post_last_fired.get(p["id"]) == key:
+                continue
+            _post_last_fired[p["id"]] = key
+            await _send_scheduled_post(context, p)
+            log.info("Запланированный пост «%s» опубликован", p.get("name"))
+            if p.get("mode") == "once":
+                p["enabled"] = False  # разовый — после публикации выключаем
+                save_config()
+        except Exception as e:  # noqa: BLE001
+            log.warning("Пост «%s»: %s", p.get("name"), e)
+
+
+# Совместимость: раньше посты планировались отдельными заданиями; теперь работает
+# единый минутный чекер (scheduled_posts_job), поэтому эти функции больше ничего не делают.
 def _schedule_post(jq, post):
-    if jq is None or not post.get("enabled", True):
-        return
-    try:
-        h, m = map(int, str(post["time"]).split(":"))
-    except Exception:  # noqa: BLE001
-        return
-    from datetime import time as _dtime
-    jq.run_daily(_fire_scheduled_post, time=_dtime(h, m, tzinfo=_post_tz()),
-                 data={"id": post["id"]}, name=f"sched:{post['id']}")
+    return None
 
 
 def _unschedule_post(jq, pid):
-    if jq is None:
-        return
-    for job in jq.get_jobs_by_name(f"sched:{pid}"):
-        job.schedule_removal()
+    return None
 
 
 def _reschedule_all_posts(jq):
-    """Снять все задания постов и создать заново из конфига (после старта/смены пояса)."""
-    if jq is None:
-        return
-    for job in list(jq.jobs()):
-        if job.name and job.name.startswith("sched:"):
-            job.schedule_removal()
-    for p in CONFIG.get("scheduled_posts", []):
-        _schedule_post(jq, p)
+    return None
 
 
 async def cmd_broadcast(update, context):
@@ -3296,7 +3376,7 @@ def sched_kb() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("➕ Новый пост", callback_data="sp:new")]]
     for p in CONFIG.get("scheduled_posts", []):
         flag = "🟢" if p.get("enabled", True) else "⚪"
-        rows.append([InlineKeyboardButton(f"{flag} {p['name']} · {p['time']} → {_post_groups_label(p, 12)}",
+        rows.append([InlineKeyboardButton(f"{flag} {p.get('name','пост')} · {p.get('time','--:--')} → {_post_groups_label(p, 12)}",
                                           callback_data=f"spo:{p['id']}")])
     tz = CONFIG.get("post_tz", 5)
     rows.append([InlineKeyboardButton("🕐 −", callback_data="sptz:-"),
@@ -3312,35 +3392,73 @@ def sched_menu_text() -> str:
     return (
         f"🗓 Запланированные посты · часовой пояс UTC+{tz}\n\n"
         f"Постов: {len(posts)}. Каждый выходит каждый день в своё время и в выбранные группы (можно несколько).\n\n"
-        "Контент любой: текст, фото, видео, гиф, стикер, документ — плюс кнопки-ссылки и эмодзи. "
-        "Нажми на пост, чтобы включить/выключить, закрепление или удалить.\n\n"
+        "Контент любой: текст, фото, видео, гиф, стикер, документ — с форматированием (жирный, "
+        "курсив, ссылки), кнопками-ссылками и эмодзи. У каждого поста: предпросмотр, закреп, "
+        "без звука, без превью ссылок. Нажми на пост, чтобы настроить или удалить.\n\n"
         "⚠️ Расписание переживает перезапуск только при подключённом Volume."
     )
 
 
 def sched_post_kb(p) -> InlineKeyboardMarkup:
     pid = p["id"]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🟢 Включён" if p.get("enabled", True) else "⚪ Выключен",
-                              callback_data=f"spt:{pid}")],
-        [InlineKeyboardButton(f"📌 Закреплять: {'да' if p.get('pin') else 'нет'}", callback_data=f"spp:{pid}")],
+    mode = p.get("mode", "daily")
+    mode_ru = {"daily": "ежедневно", "weekly": "по дням", "once": "разовый"}.get(mode, mode)
+    rows = [
+        [InlineKeyboardButton("👁 Предпросмотр", callback_data=f"spv:{pid}")],
+        [InlineKeyboardButton("🟢 Включён" if p.get("enabled", True) else "⚪ Выключен", callback_data=f"spt:{pid}")],
+        [InlineKeyboardButton(f"🔁 Режим: {mode_ru}", callback_data=f"spmode:{pid}")],
+    ]
+    if mode == "weekly":
+        days = set(p.get("days") or [])
+        row = []
+        for n, nm in enumerate(_WEEKDAYS_RU):
+            row.append(InlineKeyboardButton(("✅" if n in days else "") + nm, callback_data=f"spdow:{pid}:{n}"))
+            if len(row) == 4:
+                rows.append(row); row = []
+        if row:
+            rows.append(row)
+    elif mode == "once":
+        rows.append([InlineKeyboardButton(f"📅 Дата: {p.get('date') or 'задать'}", callback_data=f"spdate:{pid}")])
+    rows += [
+        [InlineKeyboardButton(f"📌 Закреплять: {'да' if p.get('pin') else 'нет'}", callback_data=f"spp:{pid}"),
+         InlineKeyboardButton(f"🔕 Без звука: {'да' if p.get('silent') else 'нет'}", callback_data=f"spsil:{pid}")],
+        [InlineKeyboardButton(f"🔗 Без превью ссылок: {'да' if p.get('no_preview') else 'нет'}", callback_data=f"sppre:{pid}")],
         [InlineKeyboardButton("🗑 Удалить пост", callback_data=f"spd:{pid}")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="m:sched")],
-    ])
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def sched_post_text(p) -> str:
     cids = _post_chat_ids(p)
     names = [CONFIG.get("groups", {}).get(str(c), str(c)) for c in cids]
     groups = ", ".join(names) if names else "—"
+    mode = p.get("mode", "daily")
+    if mode == "weekly":
+        dd = ", ".join(_WEEKDAYS_RU[n] for n in sorted(p.get("days") or [])) or "дни не выбраны"
+        when = f"по дням ({dd}) в {p.get('time')}"
+    elif mode == "once":
+        when = f"разово {p.get('date') or '(дата не задана)'} в {p.get('time')}"
+    else:
+        when = f"каждый день в {p.get('time')}"
     btns = p.get("buttons") or []
     preview = (p.get("text") or "").strip().replace("\n", " ")
     preview = preview[:60] + "…" if len(preview) > 60 else preview
+    flags = []
+    if p.get("pin"):
+        flags.append("закреп")
+    if p.get("silent"):
+        flags.append("без звука")
+    if p.get("no_preview"):
+        flags.append("без превью")
+    if p.get("html"):
+        flags.append("формат.")
     txt = (
-        f"📨 Пост «{p['name']}»\n"
+        f"📨 Пост «{p.get('name','пост')}»\n"
         f"Группы ({len(names)}): {groups}\n"
-        f"Время: каждый день в {p['time']} (UTC+{CONFIG.get('post_tz', 5)})\n"
-        f"Тип: {_POST_TYPE_RU.get(p.get('type'), 'пост')} · кнопок: {len(btns)}\n"
+        f"Когда: {when} (UTC+{CONFIG.get('post_tz', 5)})\n"
+        f"Тип: {_POST_TYPE_RU.get(p.get('type'), 'пост')} · кнопок: {len(btns)}"
+        + (f" · {', '.join(flags)}" if flags else "") + "\n"
     )
     if preview:
         txt += f"Текст: {preview}\n"
@@ -3642,7 +3760,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # глобальные разделы — недоступны не-менеджерам
         if (data in ("m:promo", "m:access", "m:approve", "m:sched", "bk:export", "bk:import")
                 or data.startswith(("pr:", "post:", "pto:", "dm:", "dmcast:", "dmto:", "sp:", "spo:", "spt:",
-                                    "spp:", "spd:", "spg:", "spgo", "sptz:", "appr:", "apt:"))):
+                                    "spp:", "spsil:", "sppre:", "spv:", "spmode:", "spdow:", "spdate:",
+                                    "spd:", "spg:", "spgo", "sptz:", "appr:", "apt:"))):
             await query.answer("Это только для владельца/менеджеров бота", show_alert=True)
             return
     # Цель панели — всегда реальная группа из доступных
@@ -4035,7 +4154,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await safe_edit(
             query,
             "Теперь пришли САМ ПОСТ: текст, фото / видео / гиф / стикер / документ (с подписью) — "
-            "что отправишь, то и будет публиковаться. Эмодзи и форматирование сохранятся.\n(или /cancel)", None)
+            "что отправишь, то и будет публиковаться. Форматируй как обычно в Telegram "
+            "(жирный, курсив, ссылки, моноширинный) — всё сохранится.\n(или /cancel)", None)
     if data.startswith("spo:"):
         p = _find_post(data[4:])
         if not p:
@@ -4058,6 +4178,56 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             p["pin"] = not p.get("pin", False)
             save_config()
             return await safe_edit(query, sched_post_text(p), sched_post_kb(p))
+        return await safe_edit(query, sched_menu_text(), sched_kb())
+    if data.startswith("spsil:"):
+        p = _find_post(data[6:])
+        if p:
+            p["silent"] = not p.get("silent", False)
+            save_config()
+            return await safe_edit(query, sched_post_text(p), sched_post_kb(p))
+        return await safe_edit(query, sched_menu_text(), sched_kb())
+    if data.startswith("sppre:"):
+        p = _find_post(data[6:])
+        if p:
+            p["no_preview"] = not p.get("no_preview", False)
+            save_config()
+            return await safe_edit(query, sched_post_text(p), sched_post_kb(p))
+        return await safe_edit(query, sched_menu_text(), sched_kb())
+    if data.startswith("spv:"):
+        p = _find_post(data[4:])
+        if p:
+            try:
+                await _send_one(context, query.from_user.id, p)
+                await query.answer("Предпросмотр отправлен в этот чат")
+            except Exception as e:  # noqa: BLE001
+                await query.answer(f"Не вышло: {e}", show_alert=True)
+        return
+    if data.startswith("spmode:"):
+        p = _find_post(data.split(":")[1])
+        if p:
+            order = ["daily", "weekly", "once"]
+            cur = p.get("mode", "daily")
+            p["mode"] = order[(order.index(cur) + 1) % len(order)] if cur in order else "daily"
+            save_config()
+            return await safe_edit(query, sched_post_text(p), sched_post_kb(p))
+        return await safe_edit(query, sched_menu_text(), sched_kb())
+    if data.startswith("spdow:"):
+        _, pid, n = data.split(":")
+        p = _find_post(pid)
+        if p:
+            days = set(p.get("days") or [])
+            n = int(n)
+            days.symmetric_difference_update({n})
+            p["days"] = sorted(days)
+            save_config()
+            return await safe_edit(query, sched_post_text(p), sched_post_kb(p))
+        return await safe_edit(query, sched_menu_text(), sched_kb())
+    if data.startswith("spdate:"):
+        pid = data.split(":")[1]
+        if _find_post(pid):
+            context.user_data["sp_date_for"] = pid
+            context.user_data["await"] = "sp_date"
+            return await safe_edit(query, "Пришли дату публикации в формате ГГГГ-ММ-ДД (например 2026-06-15).\n(или /cancel)", None)
         return await safe_edit(query, sched_menu_text(), sched_kb())
     if data.startswith("spd:"):
         pid = data[4:]
@@ -4899,8 +5069,9 @@ async def on_private_document(update, context):
             d.update(content)
             context.user_data["await"] = "sp_buttons"
             await update.message.reply_text(
-                "Кнопки-ссылки под постом? Пришли по одной на строку: «Текст - https://ссылка» "
-                "(по нажатию откроется ссылка). Или /skip (либо пришли «-»), если без кнопок.")
+                "Кнопки-ссылки под постом? По одной на строку: «Текст - https://ссылка». "
+                "Чтобы несколько кнопок в ОДИН ряд — раздели их «;» в одной строке. "
+                "Или /skip (либо пришли «-»), если без кнопок.")
         return
     if awaiting not in ("import_config", "import_chat"):
         if is_manager(user.id) or await user_admin_groups(context, user.id):
@@ -4994,8 +5165,9 @@ async def on_private_media(update, context):
         else:
             context.user_data["await"] = "sp_buttons"
             await msg.reply_text(
-                "Кнопки-ссылки под постом? Пришли по одной на строку: «Текст - https://ссылка» "
-                "(по нажатию откроется ссылка). Или /skip (либо пришли «-»), если без кнопок.")
+                "Кнопки-ссылки под постом? По одной на строку: «Текст - https://ссылка». "
+                "Чтобы несколько кнопок в ОДИН ряд — раздели их «;» в одной строке. "
+                "Или /skip (либо пришли «-»), если без кнопок.")
         return
     # Рассылка/пост одним фото (как было)
     if awaiting not in ("broadcast", "post", "dmcast"):
@@ -5047,7 +5219,7 @@ async def on_private_text(update, context):
         return
     # Глобальные действия — только менеджерам
     if awaiting in ("promo", "invite_text", "broadcast", "post", "dmcast",
-                    "sp_name", "sp_content", "sp_buttons", "sp_time",
+                    "sp_name", "sp_content", "sp_buttons", "sp_time", "sp_date",
                     "gbid", "gbname", "gword") and not manager:
         context.user_data.pop("await", None)
         await update.message.reply_text("Это только для владельца/менеджеров бота.")
@@ -5132,6 +5304,23 @@ async def on_private_text(update, context):
             save_config()
         await update.message.reply_text(
             f"✅ Домен: {d} ({panel_target_label(context)})", reply_markup=links_kb(cfg))
+    elif awaiting == "sp_date":
+        pid = context.user_data.pop("sp_date_for", None)
+        p = _find_post(pid) if pid else None
+        mt = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", text.strip())
+        if not p:
+            await update.message.reply_text("Пост не найден. Открой его заново через /panel.")
+            return
+        if not mt:
+            context.user_data["await"] = "sp_date"
+            context.user_data["sp_date_for"] = pid
+            await update.message.reply_text("Формат даты ГГГГ-ММ-ДД, например 2026-06-15. Пришли снова или /cancel.")
+            return
+        p["date"] = text.strip()
+        p["mode"] = "once"
+        save_config()
+        await update.message.reply_text(
+            f"📅 Дата поста «{p.get('name', 'пост')}»: {p['date']} в {p.get('time')}.", reply_markup=sched_post_kb(p))
     elif awaiting == "gbid":
         digits = "".join(ch for ch in text if ch.isdigit() or ch == "-")
         if not digits.lstrip("-").isdigit():
@@ -5296,12 +5485,13 @@ async def on_private_text(update, context):
         else:
             context.user_data["await"] = "sp_buttons"
             await update.message.reply_text(
-                "Кнопки-ссылки под постом? Пришли по одной на строку: «Текст - https://ссылка» "
-                "(по нажатию откроется ссылка). Или /skip (либо пришли «-»), если без кнопок.")
+                "Кнопки-ссылки под постом? По одной на строку: «Текст - https://ссылка». "
+                "Чтобы несколько кнопок в ОДИН ряд — раздели их «;» в одной строке. "
+                "Или /skip (либо пришли «-»), если без кнопок.")
     elif awaiting == "sp_buttons":
         d = context.user_data.get("sp_draft", {})
         if text.strip() not in ("-", "—", "нет", "skip"):
-            d["buttons"] = _parse_buttons(text)
+            d["buttons"] = _parse_button_rows(text)
         context.user_data["await"] = "sp_time"
         await update.message.reply_text(
             "Во сколько публиковать каждый день? Формат ЧЧ:ММ, например 13:00 (час дня) "
@@ -5528,7 +5718,7 @@ def main():
         app.job_queue.run_repeating(promo_job, interval=60, first=30)
         app.job_queue.run_repeating(recurring_job, interval=60, first=20)
         app.job_queue.run_repeating(weekly_digest_job, interval=7 * 86400, first=7 * 86400)
-        _reschedule_all_posts(app.job_queue)  # восстановить расписание постов из конфига
+        app.job_queue.run_repeating(scheduled_posts_job, interval=60, first=15)  # публикация постов по расписанию
     else:
         log.warning("JobQueue недоступен — авто-промо и запланированные посты работать не будут.")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
