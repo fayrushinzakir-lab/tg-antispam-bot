@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AntiSpam Moriarty Bot  —  версия 4
+Group Help Bot  —  версия 4
 ================================================
 Антиспам + автоответы + панель в ЛС + модерация (варн/мут/бан/кик) + приветствие
 + привлечение людей: ссылка-приглашение, рассылка по всем группам, авто-промо по
@@ -2745,7 +2745,7 @@ async def send_backup(context, chat_id: int):
         bio = io.BytesIO(raw)
         bio.name = "config.json"
         await context.bot.send_document(
-            chat_id, document=bio, filename="config.json", caption="💾 Полный бэкап настроек AntiSpam.")
+            chat_id, document=bio, filename="config.json", caption="💾 Полный бэкап настроек Group Help.")
     except Exception as e:  # noqa: BLE001
         log.debug("send backup: %s", e)
         try:
@@ -2777,8 +2777,8 @@ def _slug(label: str) -> str:
 
 async def send_chat_backup(context, dm_chat_id: int, settings: dict, label: str):
     """Отправить файл с настройками одной группы/шаблона в ЛС."""
-    payload = {"_type": "moriarty_chat_settings", "label": label, "settings": settings}
-    fname = f"moriarty_{_slug(label)}.json"
+    payload = {"_type": "grouphelp_chat_settings", "label": label, "settings": settings}
+    fname = f"grouphelp_{_slug(label)}.json"
     try:
         raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
         bio = io.BytesIO(raw)
@@ -3877,7 +3877,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Группа недоступна" if manager else "Это не твоя группа", show_alert=True)
         context.user_data["cfg_target"] = val
         return await safe_edit(
-            query, "🛠 Панель управления AntiSpam",
+            query, "🛠 Панель управления Group Help",
             main_menu_kb(panel_target_label(context), full=manager))
 
     # Раздел «Доступ» — только для главного владельца
@@ -4021,7 +4021,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await safe_edit(query, cmdperms_menu_text(cfg, label), cmdperms_kb(cfg))
 
     nav = {
-        "m:main": ("🛠 Панель управления AntiSpam\n\nНе знаешь, с чего начать — жми «🚀 Быстрая настройка». "
+        "m:main": ("🛠 Панель управления Group Help\n\nНе знаешь, с чего начать — жми «🚀 Быстрая настройка». "
                    "Бота ещё нет в группе — «➕ Добавить в группу».", main_menu_kb(label, full=manager)),
         "m:quick": (quick_menu_text(cfg, label), quick_kb(cfg)),
         "m:status": (status_text(cfg, label, show_global=manager), main_menu_kb(label, full=manager)),
@@ -4624,7 +4624,7 @@ async def cmd_start(update, context):
             [InlineKeyboardButton("ℹ️ Помощь по настройкам", callback_data="m:help")],
         ])
         await update.message.reply_text(
-            "👋 Привет! Я AntiSpam Moriarty.\n\n"
+            "👋 Привет! Я Group Help.\n\n"
             "Добавь меня в группу администратором — буду чистить спам, защищать от сноса "
             "и помогать с модерацией.\n\n"
             "Проще всего: «➕ Добавить меня в группу», затем «🚀 Быстрая настройка» — "
@@ -4648,7 +4648,7 @@ async def cmd_start(update, context):
             [InlineKeyboardButton("❓ Как добавить — инструкция", callback_data="m:add")],
         ])
         await update.message.reply_text(
-            "👋 Привет! Я AntiSpam Moriarty.\n\n"
+            "👋 Привет! Я Group Help.\n\n"
             "Я ещё не добавлен ни в одну группу. Нажми «➕ Добавить меня в группу», "
             "выбери чат и дай права администратора — и в /panel появятся настройки этой группы.\n\n"
             "Не получается — жми «❓ Как добавить» — там пошаговая инструкция.",
@@ -4671,7 +4671,7 @@ async def cmd_panel(update, context):
             reply_markup=InlineKeyboardMarkup([[add_btn]]))
         return
     await update.message.reply_text(
-        "🛠 Панель управления AntiSpam", reply_markup=main_menu_kb(label, full=full))
+        "🛠 Панель управления Group Help", reply_markup=main_menu_kb(label, full=full))
 
 
 async def cmd_status(update, context):
