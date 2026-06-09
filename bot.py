@@ -35,7 +35,7 @@ from telegram import (
     BotCommandScopeAllChatAdministrators,
     BotCommandScopeAllPrivateChats,
 )
-from telegram.error import BadRequest, Forbidden
+from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -375,6 +375,23 @@ _state = {"last_promo": 0.0}
 def bump(chat_id: int, metric: str, n: int = 1) -> None:
     """Счётчик статистики в памяти (для /stats). Сбрасывается при рестарте."""
     stats_store[chat_id][metric] += n
+
+
+_throttle_store: dict = {}
+
+
+def _throttle(key, seconds: float) -> bool:
+    """Анти-флуд: True, если действие по ключу разрешено (прошло >= seconds с прошлого раза).
+    Самоочищается, чтобы словарь не рос бесконечно."""
+    now = time.time()
+    if now - _throttle_store.get(key, 0.0) < seconds:
+        return False
+    _throttle_store[key] = now
+    if len(_throttle_store) > 5000:
+        cutoff = now - 3600
+        for k in [k for k, v in list(_throttle_store.items()) if v < cutoff]:
+            _throttle_store.pop(k, None)
+    return True
 
 URL_HINT_RE = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/|tg://)", re.IGNORECASE)
 
@@ -799,11 +816,11 @@ def reset_warns(chat_id, uid):
     save_config()
 
 
-async def alert_owners(context, text):
+async def alert_owners(context, text, reply_markup=None):
     """Личное оповещение всем главным владельцам (ADMIN_IDS)."""
     for oid in ADMIN_IDS:
         try:
-            await context.bot.send_message(oid, text)
+            await context.bot.send_message(oid, text, reply_markup=reply_markup)
         except Exception as e:  # noqa: BLE001
             log.debug("alert owner %s: %s", oid, e)
 
@@ -1606,20 +1623,29 @@ async def on_my_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Свежо добавили и чат ещё не одобрен — спрашиваем разрешение у владельца
         if old in ("left", "kicked") and CONFIG.get("require_approval", True) \
                 and cm.chat.id not in CONFIG.get("approved_chats", []):
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Разрешить", callback_data=f"appr:ok:{cm.chat.id}"),
-                InlineKeyboardButton("🚫 Не разрешать", callback_data=f"appr:no:{cm.chat.id}"),
-            ]])
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Разрешить", callback_data=f"appr:ok:{cm.chat.id}"),
+                 InlineKeyboardButton("🚫 Не разрешать", callback_data=f"appr:no:{cm.chat.id}")],
+                [InlineKeyboardButton("🚀 Быстрая настройка", callback_data="m:quick")],
+            ])
             for oid in ADMIN_IDS:
                 try:
                     await context.bot.send_message(
                         oid,
                         f"🔔 Меня добавили в «{html.escape(cm.chat.title or str(cm.chat.id))}» "
                         f"(id <code>{cm.chat.id}</code>).\nКто добавил: {html.escape(mention(actor))}.\n\n"
-                        f"Пока не разрешишь — я в этом чате ничего не делаю.",
+                        f"Пока не разрешишь — я в этом чате ничего не делаю. Нажми «✅ Разрешить», "
+                        f"затем «🚀 Быстрая настройка» — включишь защиту в пару касаний.",
                         reply_markup=kb, parse_mode="HTML")
                 except Exception as e:  # noqa: BLE001
                     log.debug("approval ask %s: %s", oid, e)
+        elif old in ("left", "kicked"):
+            # Чат уже разрешён (или допуск выключен) — сразу подсказываем быстрый старт
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Быстрая настройка", callback_data="m:quick")]])
+            await alert_owners(
+                context,
+                f"✅ Меня добавили в «{cm.chat.title or cm.chat.id}». "
+                f"Жми «🚀 Быстрая настройка» — включишь защиту в пару касаний.", reply_markup=kb)
         if old == "administrator" and status == "member" and chat_cfg(cm.chat.id)["antinuke"].get("enabled"):
             await alert_owners(
                 context,
@@ -2812,6 +2838,8 @@ async def recurring_job(context: ContextTypes.DEFAULT_TYPE):
 def main_menu_kb(target_label: str = "— группа —", full: bool = True) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(f"⚙️ Настраиваю: {target_label}", callback_data="pick:list")],
+        [InlineKeyboardButton("🚀 Быстрая настройка", callback_data="m:quick")],
+        [InlineKeyboardButton("➕ Добавить в группу", callback_data="m:add")],
         [InlineKeyboardButton("📊 Статус", callback_data="m:status"),
          InlineKeyboardButton("🔘 Функции", callback_data="m:toggles")],
         [InlineKeyboardButton("⚙️ Антифлуд", callback_data="m:flood"),
@@ -2831,6 +2859,52 @@ def main_menu_kb(target_label: str = "— группа —", full: bool = True) 
     rows.append([InlineKeyboardButton("💾 Бэкап", callback_data="m:backup"),
                  InlineKeyboardButton("ℹ️ Помощь", callback_data="m:help")])
     return InlineKeyboardMarkup(rows)
+
+
+def _quick_links_on(cfg) -> bool:
+    e = cfg.get("enabled", {})
+    return bool(e.get("invites") or e.get("shorteners") or e.get("spam_domains"))
+
+
+def quick_kb(cfg) -> InlineKeyboardMarkup:
+    e = cfg.get("enabled", {})
+    def mark(v):
+        return "🟢" if v else "🔴"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{mark(_quick_links_on(cfg))} Блок спам-ссылок", callback_data="q:links")],
+        [InlineKeyboardButton(f"{mark(e.get('words'))} Фильтр стоп-слов", callback_data="q:words")],
+        [InlineKeyboardButton(f"{mark(e.get('flood'))} Антифлуд", callback_data="q:flood")],
+        [InlineKeyboardButton(f"{mark(cfg.get('captcha', {}).get('enabled'))} Капча для новичков", callback_data="q:captcha")],
+        [InlineKeyboardButton(f"{mark(cfg.get('welcome', {}).get('enabled'))} Приветствие новичков", callback_data="q:welcome")],
+        [InlineKeyboardButton("✅ Включить всё рекомендуемое", callback_data="q:reco")],
+        [InlineKeyboardButton("⚙️ Все настройки", callback_data="m:main")],
+    ])
+
+
+def quick_menu_text(cfg, label: str) -> str:
+    return (
+        f"🚀 Быстрая настройка · {label}\n\n"
+        "Включи нужное одним касанием — этого хватает большинству групп:\n\n"
+        "🔗 Блок спам-ссылок — удаляет рекламные ссылки и приглашения в другие чаты (работает сразу).\n"
+        "🚫 Фильтр стоп-слов — удаляет сообщения с запрещёнными словами (слова добавь в «Стоп-слова»).\n"
+        "⚡ Антифлуд — не даёт заваливать чат частыми сообщениями.\n"
+        "🤖 Капча — проверяет новичков, отсекает ботов-спамеров.\n"
+        "👋 Приветствие — здоровается с новыми участниками.\n\n"
+        "Не уверен — жми «✅ Включить всё рекомендуемое». Тонкие настройки — в «⚙️ Все настройки»."
+    )
+
+
+def add_help_text() -> str:
+    return (
+        "➕ Как добавить бота в группу — за 4 шага:\n\n"
+        "1️⃣ Нажми кнопку «Добавить меня в группу» ниже.\n"
+        "2️⃣ Выбери свою группу из списка.\n"
+        "3️⃣ Telegram попросит права администратора — подтверди. Нужны: удалять сообщения, "
+        "ограничивать участников, приглашать, закреплять.\n"
+        "4️⃣ Вернись сюда и нажми «🚀 Быстрая настройка».\n\n"
+        "После этого бот начнёт чистить спам и защищать чат. У каждой группы — свои настройки.\n"
+        "⚠️ Важно: дай боту именно права администратора, иначе он не сможет удалять и банить."
+    )
 
 
 def pick_kb(manager: bool = True, allowed=None) -> InlineKeyboardMarkup:
@@ -3770,6 +3844,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
+    # Быстрая настройка КОНКРЕТНОЙ группы (из сообщения о добавлении/допуске).
+    # Переключаем цель на этот чат и показываем быстрый экран; qgreco — сразу включает рекомендуемое.
+    if data.startswith("qg:") or data.startswith("qgreco:"):
+        cid = data.split(":", 1)[1]
+        if allowed and cid not in allowed:
+            return await query.answer("Этот чат тебе недоступен", show_alert=True)
+        context.user_data["cfg_target"] = cid
+        wcfg = panel_cfg(context)
+        if data.startswith("qgreco:"):
+            for k in ("invites", "shorteners", "spam_domains", "words", "flood", "name_check"):
+                wcfg["enabled"][k] = True
+            wcfg.setdefault("captcha", {})["enabled"] = True
+            wcfg.setdefault("welcome", {})["enabled"] = True
+            save_config()
+        lbl = panel_target_label(context)
+        return await safe_edit(query, quick_menu_text(wcfg, lbl), quick_kb(wcfg))
+
     # Конфиг выбранной группы — для ПОКАЗА (read-only). Копия для правки берётся при изменении.
     cfg = panel_cfg_view(context)
     label = panel_target_label(context)
@@ -3892,6 +3983,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         cid, "✅ Бот активирован владельцем. Антиспам и модерация включены.")
                 except Exception:  # noqa: BLE001
                     pass
+                title = CONFIG.get("groups", {}).get(str(cid), str(cid))
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Включить рекомендуемое", callback_data=f"qgreco:{cid}")],
+                    [InlineKeyboardButton("🚀 Быстрая настройка", callback_data=f"qg:{cid}")],
+                    [InlineKeyboardButton("⬅️ К списку чатов", callback_data="m:approve")],
+                ])
+                return await safe_edit(
+                    query,
+                    f"✅ «{title}» разрешён.\n\nХочешь сразу включить защиту? Нажми «✅ Включить рекомендуемое» — "
+                    "и антиспам, капча и приветствие заработают одним касанием.", kb)
             elif act == "no" and cid in appr:
                 appr.remove(cid)
                 save_config()
@@ -3920,18 +4021,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await safe_edit(query, cmdperms_menu_text(cfg, label), cmdperms_kb(cfg))
 
     nav = {
-        "m:main": ("🛠 Панель управления AntiSpam", main_menu_kb(label, full=manager)),
+        "m:main": ("🛠 Панель управления AntiSpam\n\nНе знаешь, с чего начать — жми «🚀 Быстрая настройка». "
+                   "Бота ещё нет в группе — «➕ Добавить в группу».", main_menu_kb(label, full=manager)),
+        "m:quick": (quick_menu_text(cfg, label), quick_kb(cfg)),
         "m:status": (status_text(cfg, label, show_global=manager), main_menu_kb(label, full=manager)),
-        "m:toggles": (f"🔘 Функции · {label}\nВключение/выключение:", toggles_kb(cfg)),
-        "m:triggers": (f"💬 Автоответы (слово → ответ) · {label}:", triggers_kb(cfg)),
-        "m:words": (f"🚫 Стоп-слова · {label}\nСообщения с этими словами удаляются:", words_kb(cfg)),
+        "m:toggles": (f"🔘 Функции · {label}\nПростыми словами: что бот ловит и удаляет. "
+                      "Зелёный — работает, красный — выключено. Жми, чтобы переключить:", toggles_kb(cfg)),
+        "m:triggers": (f"💬 Автоответы · {label}\nПростыми словами: бот сам отвечает на ключевые слова. "
+                       "Пример: «банан, яблоко = это фрукт» — на любое из слов придёт ответ.", triggers_kb(cfg)),
+        "m:words": (f"🚫 Стоп-слова · {label}\nПростыми словами: сообщения с этими словами бот удаляет. "
+                    "Добавь запрещённые слова — по одному:", words_kb(cfg)),
         "m:words2": (words2_menu_text(cfg, label), words2_kb(cfg)),
         "m:lang": (lang_menu_text(cfg, label), lang_kb(cfg)),
         "m:blacklist": (blacklist_menu_text(cfg, label), blacklist_kb(cfg)),
         "m:antiraid": (antiraid_menu_text(cfg, label), antiraid_kb(cfg)),
-        "m:links": (f"🔗 Спам-домены · {label}:", links_kb(cfg)),
-        "m:flood": (f"⚙️ Антифлуд · {label}:", flood_kb(cfg)),
-        "m:mod": (f"🛡 Модерация · {label}\nКоманды — в группе (/ban, /mute…). Здесь — предупреждения:", mod_kb(cfg)),
+        "m:links": (f"🔗 Спам-ссылки · {label}\nПростыми словами: бот удаляет рекламные ссылки, "
+                    "приглашения в другие чаты и ссылки из списка спам-доменов. Список доменов "
+                    "можно дополнять:", links_kb(cfg)),
+        "m:flood": (f"⚙️ Антифлуд · {label}\nПростыми словами: не даёт заваливать чат — если человек "
+                    "шлёт слишком много сообщений за короткое время, бот его придержит:", flood_kb(cfg)),
+        "m:mod": (f"🛡 Модерация · {label}\nПростыми словами: предупреждения и наказания. Команды пишутся "
+                  "в группе ответом на сообщение (/ban, /mute, /warn…). Здесь — что будет при N предупреждениях:", mod_kb(cfg)),
         "m:welcome": (welcome_menu_text(cfg), welcome_kb(cfg)),
         "m:promo": (promo_menu_text(), promo_kb()),
         "m:antinuke": (antinuke_menu_text(cfg), antinuke_kb(cfg)),
@@ -3946,6 +4056,39 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     if data in nav:
         return await safe_edit(query, *nav[data])
+
+    if data == "m:add":
+        add_btn = await add_group_button(context)
+        kb = InlineKeyboardMarkup([
+            [add_btn],
+            [InlineKeyboardButton("🚀 Быстрая настройка", callback_data="m:quick")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
+        ])
+        return await safe_edit(query, add_help_text(), kb)
+
+    if data.startswith("q:"):
+        wcfg = panel_cfg(context)
+        what = data[2:]
+        if what == "links":
+            new = not _quick_links_on(wcfg)
+            for k in ("invites", "shorteners", "spam_domains"):
+                wcfg["enabled"][k] = new
+        elif what == "words":
+            wcfg["enabled"]["words"] = not wcfg["enabled"].get("words", False)
+        elif what == "flood":
+            wcfg["enabled"]["flood"] = not wcfg["enabled"].get("flood", False)
+        elif what == "captcha":
+            wcfg.setdefault("captcha", {})["enabled"] = not wcfg.get("captcha", {}).get("enabled", False)
+        elif what == "welcome":
+            wcfg.setdefault("welcome", {})["enabled"] = not wcfg.get("welcome", {}).get("enabled", False)
+        elif what == "reco":
+            for k in ("invites", "shorteners", "spam_domains", "words", "flood", "name_check"):
+                wcfg["enabled"][k] = True
+            wcfg.setdefault("captcha", {})["enabled"] = True
+            wcfg.setdefault("welcome", {})["enabled"] = True
+            await query.answer("Включено рекомендуемое ✅")
+        save_config()
+        return await safe_edit(query, quick_menu_text(wcfg, label), quick_kb(wcfg))
 
     if data == "noop":
         return
@@ -4469,37 +4612,47 @@ async def _ensure_panel_target(update, context):
 
 
 async def cmd_start(update, context):
+    if update.effective_user and not _throttle(("start", update.effective_user.id), 2.0):
+        return  # анти-флуд: не отвечаем на частый повтор /start
     add_btn = await add_group_button(context)
     level, label, full = await _ensure_panel_target(update, context)
     if level == "manager":
         kb = InlineKeyboardMarkup([
             [add_btn],
+            [InlineKeyboardButton("🚀 Быстрая настройка", callback_data="m:quick")],
             [InlineKeyboardButton("🛠 Открыть панель", callback_data="m:main")],
             [InlineKeyboardButton("ℹ️ Помощь по настройкам", callback_data="m:help")],
         ])
         await update.message.reply_text(
             "👋 Привет! Я AntiSpam Moriarty.\n\n"
             "Добавь меня в группу администратором — буду чистить спам, защищать от сноса "
-            "и помогать с модерацией. У каждой группы могут быть свои настройки.\n\n"
-            "🛠 «Открыть панель» — настройки   ·   /help — помощь",
+            "и помогать с модерацией.\n\n"
+            "Проще всего: «➕ Добавить меня в группу», затем «🚀 Быстрая настройка» — "
+            "включишь защиту в пару касаний. Тонкие настройки — в «🛠 Открыть панель».",
             reply_markup=kb)
     elif level == "groupadmin":
         kb = InlineKeyboardMarkup([
             [add_btn],
+            [InlineKeyboardButton("🚀 Быстрая настройка", callback_data="m:quick")],
             [InlineKeyboardButton("🛠 Настроить мои группы", callback_data="m:main")],
             [InlineKeyboardButton("ℹ️ Помощь", callback_data="m:help")],
         ])
         await update.message.reply_text(
             "👋 Привет! Ты администратор группы с этим ботом.\n\n"
-            "Можешь настроить свои группы (где ты админ): антиспам, приветствие, "
-            "капчу, правила и т.д. Нажми «Настроить мои группы».",
+            "Самое простое — «🚀 Быстрая настройка»: включишь антиспам, капчу и приветствие "
+            "в пару касаний. Все настройки — в «🛠 Настроить мои группы».",
             reply_markup=kb)
     elif level == "nogroups":
+        kb = InlineKeyboardMarkup([
+            [add_btn],
+            [InlineKeyboardButton("❓ Как добавить — инструкция", callback_data="m:add")],
+        ])
         await update.message.reply_text(
             "👋 Привет! Я AntiSpam Moriarty.\n\n"
-            "Я ещё не добавлен ни в одну группу. Нажми кнопку ниже, добавь меня "
-            "администратором — и тогда в /panel появятся настройки этой группы.",
-            reply_markup=InlineKeyboardMarkup([[add_btn]]))
+            "Я ещё не добавлен ни в одну группу. Нажми «➕ Добавить меня в группу», "
+            "выбери чат и дай права администратора — и в /panel появятся настройки этой группы.\n\n"
+            "Не получается — жми «❓ Как добавить» — там пошаговая инструкция.",
+            reply_markup=kb)
     else:
         await update.message.reply_text(
             "👋 Я антиспам-бот. Добавь меня в группу администратором — и я буду следить за порядком.\n\n"
@@ -5535,7 +5688,28 @@ async def on_private_text(update, context):
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.error("Ошибка при обработке апдейта: %s", context.error)
+    """Глобальный перехват ошибок: бот не падает из-за одного плохого апдейта.
+    Порядок важен: в PTB BadRequest — подкласс NetworkError, поэтому частные типы проверяем первыми."""
+    err = context.error
+    if isinstance(err, RetryAfter):
+        log.warning("Лимит Telegram (429), повтор позже: %s", err)
+        return
+    if isinstance(err, Forbidden):
+        log.info("Forbidden (бот заблокирован/исключён): %s", err)
+        return
+    if isinstance(err, BadRequest):
+        if "not modified" not in str(err).lower():
+            log.debug("BadRequest: %s", err)  # «chat not found», «message to delete not found» и т.п. — не крах
+        return
+    if isinstance(err, (NetworkError, TimedOut)):
+        log.warning("Временный сбой связи с Telegram: %s", err)
+        return
+    try:
+        import traceback
+        tb = "".join(traceback.format_exception(type(err), err, err.__traceback__)) if err else ""
+        log.error("Ошибка при обработке апдейта: %s\n%s", err, tb[-2000:])
+    except Exception:  # noqa: BLE001
+        log.error("Ошибка при обработке апдейта: %s", err)
 
 
 async def _post_init(app: Application):
@@ -5591,7 +5765,16 @@ async def _post_init(app: Application):
 
 
 def build_app() -> Application:
-    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
+    builder = Application.builder().token(BOT_TOKEN).post_init(_post_init)
+    # Авто-соблюдение лимитов Telegram (повтор при 429) — защита от срыва при массовых
+    # операциях и спаме. Работает, если установлен extra rate-limiter; иначе тихо без него.
+    try:
+        from telegram.ext import AIORateLimiter
+        builder = builder.rate_limiter(AIORateLimiter(max_retries=3))
+        log.info("AIORateLimiter включён (соблюдение лимитов Telegram).")
+    except Exception as e:  # noqa: BLE001
+        log.info("AIORateLimiter недоступен (%s) — работаю без него.", e)
+    app = builder.build()
 
     private = filters.ChatType.PRIVATE
     groups = filters.ChatType.GROUPS
