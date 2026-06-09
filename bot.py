@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Group Help Bot  —  версия 4
+Channel Guard Bot  —  версия 4
 ================================================
 Антиспам + автоответы + панель в ЛС + модерация (варн/мут/бан/кик) + приветствие
 + привлечение людей: ссылка-приглашение, рассылка по всем группам, авто-промо по
@@ -30,6 +30,7 @@ from telegram import (
     ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LabeledPrice,
     BotCommand,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllChatAdministrators,
@@ -44,6 +45,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ChatMemberHandler,
     ChatJoinRequestHandler,
+    PreCheckoutQueryHandler,
     ContextTypes,
     filters,
 )
@@ -72,6 +74,7 @@ DEFAULT_CONFIG = {
         "words": True, "flood": True, "name_check": True, "triggers": True,
         "words2": False,
         "clean_service": False,
+        "clean_commands": False,
     },
     "flood": {"limit": 5, "period": 10, "mute": 300},
     "stop_words": [
@@ -141,6 +144,8 @@ DEFAULT_CONFIG = {
     "approved_chats": [],
     # Подписчики ЛС по группам (кто прошёл капчу-заявку или запускал бота): {chat_id: [user_ids]}
     "dm_subscribers": {},
+    # Подписки на тариф «Профессиональный»: {chat_id: ts окончания}
+    "subscriptions": {},
     # Запланированные посты (ежедневно в заданное время): список объектов
     "scheduled_posts": [],
     # Часовой пояс для расписания постов (смещение от UTC в часах)
@@ -171,6 +176,7 @@ FEATURES = [
     ("name_check", "Проверка имён при входе"),
     ("triggers", "Автоответы (ключевые слова)"),
     ("clean_service", "Чистить сервис-сообщения (вход/выход)"),
+    ("clean_commands", "Чистить команды в чате (/start, /ban…)"),
 ]
 
 # ── Языки сообщений для новичков (капча и т.п.) ──────────────────────────────
@@ -1609,6 +1615,27 @@ async def on_service_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE)
         log.debug("clean service: %s", e)
 
 
+async def on_command_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Авто-удаление командных сообщений в группе, чтобы чат был чистым.
+    /start, /help, /panel (команды для лички) удаляем всегда; остальные — если включено «Чистить команды»."""
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not chat or not msg or chat.type not in ("group", "supergroup"):
+        return
+    txt = (msg.text or "")
+    always = txt.startswith(("/start", "/help", "/panel"))
+    if not (always or chat_cfg(chat.id)["enabled"].get("clean_commands")):
+        return
+    # небольшая задержка, чтобы команда успела обработаться и человек увидел, что нажал
+    if context.job_queue:
+        context.job_queue.run_once(_delete_later, 3, data={"chat_id": chat.id, "mid": msg.message_id})
+    else:
+        try:
+            await msg.delete()
+        except Exception as e:  # noqa: BLE001
+            log.debug("clean command: %s", e)
+
+
 async def on_my_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Бота добавили/удалили/сняли — обновляем список групп и оповещаем владельца."""
     cm = update.my_chat_member
@@ -2689,6 +2716,112 @@ def _post_due(p, now) -> bool:
     return True  # daily
 
 
+PRO_PLANS = {
+    "1m": {"days": 30, "stars": 225, "label": "1 месяц"},
+    "3m": {"days": 90, "stars": 651, "label": "3 месяца"},
+    "6m": {"days": 180, "stars": 1254, "label": "6 месяцев"},
+    "1y": {"days": 365, "stars": 2304, "label": "1 год"},
+}
+_PLAN_ORDER = ("1m", "3m", "6m", "1y")
+
+
+def pro_until(chat_id) -> float:
+    return CONFIG.get("subscriptions", {}).get(str(chat_id), 0)
+
+
+def is_pro(chat_id) -> bool:
+    return pro_until(chat_id) > time.time()
+
+
+def extend_pro(chat_id, days: int) -> float:
+    base = max(pro_until(chat_id), time.time())
+    new = base + days * 86400
+    CONFIG.setdefault("subscriptions", {})[str(chat_id)] = new
+    save_config()
+    return new
+
+
+def _pro_status_line(chat_id) -> str:
+    until = pro_until(chat_id)
+    if until > time.time():
+        d = datetime.fromtimestamp(until, _post_tz()).strftime("%d.%m.%Y")
+        left = int((until - time.time()) / 86400)
+        return f"✅ «Профессиональный» активен до {d} (осталось ~{left} дн.)"
+    return "Активной подписки сейчас нет."
+
+
+def tariff_text(chat_id, label: str) -> str:
+    lines = [f"💎 Тариф «Профессиональный» · {label}", "", _pro_status_line(chat_id), "",
+             "Оплата звёздами Telegram ⭐. Подписка продлевает доступ для этой группы:"]
+    for k in _PLAN_ORDER:
+        p = PRO_PLANS[k]
+        lines.append(f"• {p['label']} — {p['stars']} ⭐")
+    lines.append("")
+    lines.append("Выбери срок — пришлю счёт на оплату звёздами.")
+    return "\n".join(lines)
+
+
+def tariff_kb(chat_id) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"{PRO_PLANS[k]['label']} — {PRO_PLANS[k]['stars']} ⭐",
+                                  callback_data=f"buy:{k}")] for k in _PLAN_ORDER]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def on_pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение оплаты до списания звёзд — отвечаем ok в течение 10 сек."""
+    q = update.pre_checkout_query
+    try:
+        ok = bool(q and (q.invoice_payload or "").startswith("sub:"))
+        await q.answer(ok=ok, error_message=None if ok else "Счёт устарел, попробуй заново.")
+    except Exception as e:  # noqa: BLE001
+        log.debug("pre_checkout: %s", e)
+
+
+async def on_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Оплата прошла — продлеваем подписку группы и уведомляем владельца."""
+    msg = update.effective_message
+    sp = getattr(msg, "successful_payment", None)
+    if not sp:
+        return
+    parts = (sp.invoice_payload or "").split(":")
+    if len(parts) == 3 and parts[0] == "sub":
+        cid, plan = parts[1], parts[2]
+        p = PRO_PLANS.get(plan)
+        if p:
+            until = extend_pro(int(cid), p["days"])
+            d = datetime.fromtimestamp(until, _post_tz()).strftime("%d.%m.%Y")
+            title = CONFIG.get("groups", {}).get(cid, cid)
+            await msg.reply_text(
+                f"✅ Оплата получена, спасибо! Тариф «Профессиональный» для «{title}» "
+                f"действует до {d}.")
+            await alert_owners(
+                context,
+                f"💎 Оплата ⭐{sp.total_amount}: «{title}» — {p['label']}. "
+                f"Плательщик: {mention(update.effective_user)}. Активно до {d}.")
+
+
+async def cmd_grantpro(update, context):
+    """Выдать/продлить «Профессиональный» бесплатно. Только владелец. В группе: /grantpro 30 (дней)."""
+    if not is_owner(update.effective_user.id):
+        return await _deny(update)
+    chat = update.effective_chat
+    args = context.args or []
+    days = 30
+    cid = chat.id
+    nums = [a for a in args if a.lstrip("-").isdigit()]
+    if len(nums) == 1:
+        days = int(nums[0])
+    elif len(nums) >= 2:
+        cid = int(nums[0])
+        days = int(nums[1])
+    until = extend_pro(cid, days)
+    d = datetime.fromtimestamp(until, _post_tz()).strftime("%d.%m.%Y")
+    title = CONFIG.get("groups", {}).get(str(cid), str(cid))
+    await update.effective_message.reply_text(
+        f"💎 «Профессиональный» для «{title}» продлён на {days} дн. — до {d}.")
+
+
 async def scheduled_posts_job(context):
     """Раз в минуту проверяем все посты и публикуем те, чьё время настало."""
     now = datetime.now(_post_tz())
@@ -2745,7 +2878,7 @@ async def send_backup(context, chat_id: int):
         bio = io.BytesIO(raw)
         bio.name = "config.json"
         await context.bot.send_document(
-            chat_id, document=bio, filename="config.json", caption="💾 Полный бэкап настроек Group Help.")
+            chat_id, document=bio, filename="config.json", caption="💾 Полный бэкап настроек Channel Guard.")
     except Exception as e:  # noqa: BLE001
         log.debug("send backup: %s", e)
         try:
@@ -2858,6 +2991,8 @@ def main_menu_kb(target_label: str = "— группа —", full: bool = True) 
                      InlineKeyboardButton("👥 Доступ", callback_data="m:access")])
     rows.append([InlineKeyboardButton("💾 Бэкап", callback_data="m:backup"),
                  InlineKeyboardButton("ℹ️ Помощь", callback_data="m:help")])
+    rows.append([InlineKeyboardButton("ℹ️ О боте", callback_data="m:about"),
+                 InlineKeyboardButton("💎 Тариф", callback_data="m:tariff")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2891,6 +3026,25 @@ def quick_menu_text(cfg, label: str) -> str:
         "🤖 Капча — проверяет новичков, отсекает ботов-спамеров.\n"
         "👋 Приветствие — здоровается с новыми участниками.\n\n"
         "Не уверен — жми «✅ Включить всё рекомендуемое». Тонкие настройки — в «⚙️ Все настройки»."
+    )
+
+
+def about_text() -> str:
+    return (
+        "ℹ️ <b>Channel Guard</b> — бот для защиты и модерации Telegram-групп.\n\n"
+        "Что умею:\n"
+        "🛡 <b>Антиспам</b> — ловлю рекламные ссылки, приглашения в другие чаты, спам-домены, "
+        "стоп-слова и флуд; чёрные списки (в т.ч. глобальные на все группы).\n"
+        "🤖 <b>Капча</b> для новичков и 👋 <b>приветствие</b> — отсекаю ботов, встречаю людей.\n"
+        "🚓 <b>Модерация</b> — бан/мут/кик (в т.ч. на время), предупреждения с авто-сгоранием, "
+        "/purge (чистка), /report (жалобы), журнал действий, роли модераторов.\n"
+        "🧱 <b>Анти-снос и анти-рейд</b> — защита от массовых атак и сноса чата.\n"
+        "🗓 <b>Постинг по расписанию</b> (каждый день / по дням / разово) сразу в несколько групп: "
+        "текст и медиа, кнопки-ссылки, форматирование, предпросмотр.\n"
+        "📣 <b>Рассылки и промо</b>, привлечение участников.\n"
+        "🌐 Несколько языков для новичков; у каждой группы — свои настройки.\n\n"
+        "Начать просто: добавь меня в группу администратором и нажми «🚀 Быстрая настройка».\n"
+        "Версия 4."
     )
 
 
@@ -3777,9 +3931,12 @@ GROUPADMIN_HELP = (
 )
 
 
-async def safe_edit(query, text, kb):
+async def safe_edit(query, text, kb, parse_mode=None):
     try:
-        await query.edit_message_text(text, reply_markup=kb)
+        if parse_mode is None:
+            await query.edit_message_text(text, reply_markup=kb)
+        else:
+            await query.edit_message_text(text, reply_markup=kb, parse_mode=parse_mode)
     except BadRequest as e:
         if "not modified" not in str(e).lower():
             log.debug("safe_edit: %s", e)
@@ -3877,7 +4034,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Группа недоступна" if manager else "Это не твоя группа", show_alert=True)
         context.user_data["cfg_target"] = val
         return await safe_edit(
-            query, "🛠 Панель управления Group Help",
+            query, "🛠 Панель управления Channel Guard",
             main_menu_kb(panel_target_label(context), full=manager))
 
     # Раздел «Доступ» — только для главного владельца
@@ -4021,9 +4178,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await safe_edit(query, cmdperms_menu_text(cfg, label), cmdperms_kb(cfg))
 
     nav = {
-        "m:main": ("🛠 Панель управления Group Help\n\nНе знаешь, с чего начать — жми «🚀 Быстрая настройка». "
+        "m:main": ("🛠 Панель управления Channel Guard\n\nНе знаешь, с чего начать — жми «🚀 Быстрая настройка». "
                    "Бота ещё нет в группе — «➕ Добавить в группу».", main_menu_kb(label, full=manager)),
         "m:quick": (quick_menu_text(cfg, label), quick_kb(cfg)),
+        "m:tariff": (tariff_text(context.user_data.get("cfg_target"), label),
+                     tariff_kb(context.user_data.get("cfg_target"))),
         "m:status": (status_text(cfg, label, show_global=manager), main_menu_kb(label, full=manager)),
         "m:toggles": (f"🔘 Функции · {label}\nПростыми словами: что бот ловит и удаляет. "
                       "Зелёный — работает, красный — выключено. Жми, чтобы переключить:", toggles_kb(cfg)),
@@ -4065,6 +4224,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
         ])
         return await safe_edit(query, add_help_text(), kb)
+
+    if data == "m:about":
+        add_btn = await add_group_button(context)
+        kb = InlineKeyboardMarkup([
+            [add_btn],
+            [InlineKeyboardButton("🚀 Быстрая настройка", callback_data="m:quick")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
+        ])
+        return await safe_edit(query, about_text(), kb, parse_mode="HTML")
+
+    if data.startswith("buy:"):
+        plan = data[4:]
+        p = PRO_PLANS.get(plan)
+        if not p:
+            return await query.answer("Неизвестный тариф", show_alert=True)
+        cid = context.user_data.get("cfg_target")
+        try:
+            await context.bot.send_invoice(
+                chat_id=user.id,
+                title=f"Профессиональный — {p['label']}",
+                description=f"Тариф «Профессиональный» для группы на {p['label']}. Оплата звёздами Telegram.",
+                payload=f"sub:{cid}:{plan}",
+                currency="XTR",
+                prices=[LabeledPrice(p["label"], p["stars"])],
+                provider_token="",
+            )
+            return await query.answer("Счёт отправлен — оплати звёздами ⭐ в этом чате")
+        except Exception as e:  # noqa: BLE001
+            return await query.answer(f"Оплата сейчас недоступна: {e}", show_alert=True)
 
     if data.startswith("q:"):
         wcfg = panel_cfg(context)
@@ -4624,7 +4812,7 @@ async def cmd_start(update, context):
             [InlineKeyboardButton("ℹ️ Помощь по настройкам", callback_data="m:help")],
         ])
         await update.message.reply_text(
-            "👋 Привет! Я Group Help.\n\n"
+            "👋 Привет! Я Channel Guard.\n\n"
             "Добавь меня в группу администратором — буду чистить спам, защищать от сноса "
             "и помогать с модерацией.\n\n"
             "Проще всего: «➕ Добавить меня в группу», затем «🚀 Быстрая настройка» — "
@@ -4648,7 +4836,7 @@ async def cmd_start(update, context):
             [InlineKeyboardButton("❓ Как добавить — инструкция", callback_data="m:add")],
         ])
         await update.message.reply_text(
-            "👋 Привет! Я Group Help.\n\n"
+            "👋 Привет! Я Channel Guard.\n\n"
             "Я ещё не добавлен ни в одну группу. Нажми «➕ Добавить меня в группу», "
             "выбери чат и дай права администратора — и в /panel появятся настройки этой группы.\n\n"
             "Не получается — жми «❓ Как добавить» — там пошаговая инструкция.",
@@ -4671,7 +4859,7 @@ async def cmd_panel(update, context):
             reply_markup=InlineKeyboardMarkup([[add_btn]]))
         return
     await update.message.reply_text(
-        "🛠 Панель управления Group Help", reply_markup=main_menu_kb(label, full=full))
+        "🛠 Панель управления Channel Guard", reply_markup=main_menu_kb(label, full=full))
 
 
 async def cmd_status(update, context):
@@ -4881,6 +5069,14 @@ async def weekly_digest_job(context):
             await context.bot.send_message(cfg["staff_group"], text)
         except Exception as e:  # noqa: BLE001
             log.debug("digest %s: %s", cid, e)
+
+
+async def cmd_about(update, context):
+    """Короткая визитка бота — доступно всем, в личке и в группе."""
+    add_btn = await add_group_button(context)
+    await update.effective_message.reply_text(
+        about_text(), parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[add_btn]]))
 
 
 async def cmd_cancel(update, context):
@@ -5756,6 +5952,7 @@ async def _post_init(app: Application):
         priv_cmds = [
             BotCommand("panel", "⚙️ Панель настроек"),
             BotCommand("status", "📊 Статус и настройки"),
+            BotCommand("about", "ℹ️ О боте"),
             BotCommand("start", "Старт"),
             BotCommand("help", "Что я умею"),
         ]
@@ -5788,6 +5985,11 @@ def build_app() -> Application:
     app.add_handler(CommandHandler(["config", "settings"], cmd_settings_hint, filters=groups))
     app.add_handler(CommandHandler("status", cmd_status, filters=private))
     app.add_handler(CommandHandler("help", cmd_help, filters=private))
+    app.add_handler(CommandHandler("about", cmd_about))
+    app.add_handler(CommandHandler("grantpro", cmd_grantpro, filters=groups))
+    # Оплата звёздами Telegram (тариф «Профессиональный»)
+    app.add_handler(PreCheckoutQueryHandler(on_pre_checkout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_successful_payment), group=1)
     app.add_handler(CommandHandler("cancel", cmd_cancel, filters=private))
     app.add_handler(CommandHandler("skip", cmd_skip, filters=private))
     app.add_handler(CommandHandler("add", cmd_add, filters=private))
@@ -5884,6 +6086,8 @@ def build_app() -> Application:
     # Чистка сервис-сообщений (вход/выход/закреп/смена фото) — отдельная группа,
     # чтобы работать вместе с приветствием/капчей/анти-сносом, а не вместо них
     app.add_handler(MessageHandler(groups & filters.StatusUpdate.ALL, on_service_cleanup), group=1)
+    # Авто-чистка командных сообщений в группах (отдельная группа, чтобы не мешать обработке команд)
+    app.add_handler(MessageHandler(groups & filters.COMMAND, on_command_cleanup), group=2)
 
     app.add_error_handler(on_error)
     return app
