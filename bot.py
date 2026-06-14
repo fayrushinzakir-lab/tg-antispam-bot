@@ -125,6 +125,10 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "interval": 3600,
         "text": "Заходи к нам почаще и зови друзей! 🙌",
+        "type": "text",
+        "file_id": None,
+        "buttons": [],
+        "html": False,
         "pin": False,
     },
     # Текст «зазывалы» — сообщения с кнопкой «Пригласить друга»
@@ -146,6 +150,8 @@ DEFAULT_CONFIG = {
     "dm_subscribers": {},
     # Подписки на тариф «Профессиональный»: {chat_id: ts окончания}
     "subscriptions": {},
+    # Статистика сообщений (в стиле Silent Stats): {chat_id: {users, names, days, total}}
+    "msg_stats": {},
     # Запланированные посты (ежедневно в заданное время): список объектов
     "scheduled_posts": [],
     # Часовой пояс для расписания постов (смещение от UTC в часах)
@@ -381,6 +387,54 @@ _state = {"last_promo": 0.0}
 def bump(chat_id: int, metric: str, n: int = 1) -> None:
     """Счётчик статистики в памяти (для /stats). Сбрасывается при рестарте."""
     stats_store[chat_id][metric] += n
+
+
+_stats_dirty = False  # есть несохранённые изменения статистики сообщений
+
+
+def track_message(chat_id: int, user) -> None:
+    """Учёт сообщений в стиле Silent Stats: всего, по дням и по пользователям.
+    Пишем в память (CONFIG), на диск сбрасываем периодически — без записи на каждое сообщение."""
+    global _stats_dirty
+    ms = CONFIG.setdefault("msg_stats", {}).setdefault(
+        str(chat_id), {"users": {}, "names": {}, "days": {}, "total": 0})
+    uid = str(user.id)
+    ms["users"][uid] = ms["users"].get(uid, 0) + 1
+    nm = (getattr(user, "full_name", None) or getattr(user, "first_name", None) or "—")
+    if getattr(user, "username", None):
+        nm = f"@{user.username}"
+    ms["names"][uid] = nm[:40]
+    today = datetime.now(_post_tz()).strftime("%Y-%m-%d")
+    ms["days"][today] = ms["days"].get(today, 0) + 1
+    ms["total"] = ms.get("total", 0) + 1
+    if len(ms["days"]) > 40:  # храним ~месяц
+        for d in sorted(ms["days"])[:-35]:
+            ms["days"].pop(d, None)
+    _stats_dirty = True
+
+
+async def stats_flush_job(context):
+    """Периодически сохраняет накопленную статистику сообщений на диск."""
+    global _stats_dirty
+    if _stats_dirty:
+        _stats_dirty = False
+        save_config()
+
+
+def _msg_stats_summary(chat_id):
+    """Возвращает (total, today, week, top[(name,count)…]) по сообщениям чата."""
+    ms = CONFIG.get("msg_stats", {}).get(str(chat_id))
+    if not ms:
+        return 0, 0, 0, []
+    tz = _post_tz()
+    today = datetime.now(tz).strftime("%Y-%m-%d")
+    days = ms.get("days", {})
+    week_days = {(datetime.now(tz) - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)}
+    week = sum(c for d, c in days.items() if d in week_days)
+    names = ms.get("names", {})
+    top = sorted(ms.get("users", {}).items(), key=lambda kv: kv[1], reverse=True)[:10]
+    top_named = [(names.get(uid, uid), cnt) for uid, cnt in top]
+    return ms.get("total", 0), days.get(today, 0), week, top_named
 
 
 _throttle_store: dict = {}
@@ -1001,6 +1055,7 @@ async def on_group_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not chat_allowed(chat.id):
         return
+    track_message(chat.id, user)  # статистика сообщений (Silent Stats-стиль) — считаем всех
     if await is_exempt(context, chat.id, user.id):
         return
     # Чёрный список: баним и удаляем сообщение (по ID или имени)
@@ -2214,27 +2269,54 @@ async def cmd_warns(update, context):
 
 
 async def cmd_stats(update, context):
-    """Статистика по текущей группе (с последнего перезапуска бота)."""
+    """Статистика по текущей группе."""
     chat = update.effective_chat
     if not await can_moderate(context, chat.id, update.effective_user.id):
         return await _deny(update)
     s = stats_store.get(chat.id, {})
     active = len(members_store.get(chat.id, {}))
     warned_now = len(CONFIG["warns"].get(str(chat.id), {}))
+    total, today, week, top = _msg_stats_summary(chat.id)
     lines = [
         f"📊 Статистика «{chat.title or chat.id}»",
-        "(с последнего перезапуска бота)",
         "",
-        f"🗑 Удалено спама: {s.get('deleted', 0)}",
-        f"🔇 Мутов за флуд: {s.get('flood_muted', 0)}",
+        f"💬 Сообщений: всего {total} · сегодня {today} · за неделю {week}",
+    ]
+    if top:
+        lines.append("")
+        lines.append("🏆 Самые активные:")
+        medals = ["🥇", "🥈", "🥉"] + ["▫️"] * 7
+        for i, (name, cnt) in enumerate(top[:5]):
+            lines.append(f"{medals[i]} {name} — {cnt}")
+    lines += [
+        "",
+        "🛡 Модерация (с перезапуска бота):",
+        f"🗑 Удалено спама: {s.get('deleted', 0)} · 🔇 за флуд: {s.get('flood_muted', 0)}",
         f"🚫 Банов: {s.get('banned', 0)} · 👢 киков: {s.get('kicked', 0)} · 🔇 мутов: {s.get('muted', 0)}",
-        f"⚠️ Выдано предупреждений: {s.get('warns', 0)}",
-        f"🪪 Бан по спам-имени: {s.get('name_bans', 0)}",
+        f"⚠️ Предупреждений: {s.get('warns', 0)} · 🪪 бан по имени: {s.get('name_bans', 0)}",
         f"🤖 Капча: прошли {s.get('captcha_pass', 0)} · не прошли {s.get('captcha_fail', 0)}",
         "",
-        f"👥 Активных участников вижу: {active}",
-        f"📌 Сейчас с предупреждениями: {warned_now}",
+        f"👥 Активных вижу: {active} · 📌 с предупреждениями: {warned_now}",
+        "",
+        "Подробный топ — /top",
     ]
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+async def cmd_top(update, context):
+    """Топ самых активных участников по числу сообщений (Silent Stats-стиль)."""
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return await update.effective_message.reply_text("Команда работает в группе.")
+    total, today, week, top = _msg_stats_summary(chat.id)
+    if not top:
+        return await update.effective_message.reply_text(
+            "Пока нет данных о сообщениях. Я начинаю считать с момента запуска — подожди немного.")
+    medals = ["🥇", "🥈", "🥉"] + [f"{i}." for i in range(4, 11)]
+    lines = [f"🏆 Топ активных «{chat.title or chat.id}»", "",
+             f"💬 Всего {total} · сегодня {today} · за неделю {week}", ""]
+    for i, (name, cnt) in enumerate(top):
+        lines.append(f"{medals[i]} {name} — {cnt}")
     await update.effective_message.reply_text("\n".join(lines))
 
 
@@ -2967,13 +3049,31 @@ async def send_chat_backup(context, dm_chat_id: int, settings: dict, label: str)
 
 async def promo_job(context: ContextTypes.DEFAULT_TYPE):
     p = CONFIG["promo"]
-    if not p.get("enabled") or not p.get("text"):
+    if not p.get("enabled") or not (p.get("text") or p.get("file_id")):
         return
     now = time.time()
     if now - _state["last_promo"] < p.get("interval", 3600):
         return
     _state["last_promo"] = now
-    ok, _fail = await _broadcast(context, p["text"])
+    post = {
+        "type": p.get("type", "text"), "text": _spintax(p.get("text", "")),
+        "file_id": p.get("file_id"), "buttons": p.get("buttons", []),
+        "pin": p.get("pin", False), "html": p.get("html", False),
+    }
+    ok = 0
+    for cid in list(CONFIG["groups"].keys()):
+        try:
+            await _send_one(context, int(cid), post)
+            ok += 1
+        except Forbidden:
+            forget_group(int(cid))
+        except BadRequest as e:
+            if any(s in str(e).lower() for s in ("chat not found", "chat_id is empty", "group chat was upgraded")):
+                forget_group(int(cid))
+            else:
+                log.debug("promo %s: %s", cid, e)
+        except Exception as e:  # noqa: BLE001
+            log.debug("promo %s: %s", cid, e)
     log.info("Авто-промо отправлено в %s групп", ok)
 
 
@@ -3598,18 +3698,23 @@ def welcome_kb(cfg) -> InlineKeyboardMarkup:
 
 def promo_kb() -> InlineKeyboardMarkup:
     p = CONFIG["promo"]
+    nb = len(p.get("buttons") or [])
+    ptype = _POST_TYPE_RU.get(p.get("type", "text"), "текст")
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🟢 Авто-промо включено" if p["enabled"] else "🔴 Авто-промо выключено",
                               callback_data="pr:toggle")],
         [InlineKeyboardButton(f"Интервал: {human_duration(p['interval'])}", callback_data="noop")],
         [InlineKeyboardButton("➖", callback_data="pr:int:-"), InlineKeyboardButton("➕", callback_data="pr:int:+")],
-        [InlineKeyboardButton("✏️ Изменить текст промо", callback_data="pr:edit")],
-        [InlineKeyboardButton("✏️ Текст кнопки-зазывалы", callback_data="pr:invtext")],
-        [InlineKeyboardButton("📨 Разослать сообщение сейчас", callback_data="pr:cast")],
+        [InlineKeyboardButton(f"🖼 Контент промо ({ptype})", callback_data="pr:content")],
+        [InlineKeyboardButton(f"🔘 Кнопки промо: {nb}", callback_data="pr:btns")],
+        [InlineKeyboardButton("👁 Предпросмотр", callback_data="pr:preview"),
+         InlineKeyboardButton(f"📌 Закреплять: {'да' if p.get('pin') else 'нет'}", callback_data="pr:pin")],
+        [InlineKeyboardButton("— разовые действия —", callback_data="noop")],
+        [InlineKeyboardButton("📨 Разослать сейчас", callback_data="pr:cast")],
         [InlineKeyboardButton("📝 Запостить в группу", callback_data="post:list")],
-        [InlineKeyboardButton(f"📌 Закреплять посты: {'да' if p.get('pin') else 'нет'}", callback_data="pr:pin")],
         [InlineKeyboardButton("💬 Рассылка подписчикам в ЛС", callback_data="dmcast:list")],
         [InlineKeyboardButton("🗓 Запланированные посты", callback_data="m:sched")],
+        [InlineKeyboardButton("✏️ Текст кнопки «Пригласить друга»", callback_data="pr:invtext")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
     ])
 
@@ -3758,6 +3863,10 @@ def sched_groups_kb(selected=None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def sched_skip_btns_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Без кнопок (далее)", callback_data="sp_skipbtns")]])
+
+
 def access_kb() -> InlineKeyboardMarkup:
     rows = []
     for i, uid in enumerate(CONFIG["managers"]):
@@ -3833,15 +3942,20 @@ def status_text(cfg, target_label: str = "— группа —", show_global: bo
 
 def promo_menu_text() -> str:
     p = CONFIG["promo"]
+    ptype = _POST_TYPE_RU.get(p.get("type", "text"), "текст")
+    nb = len(p.get("buttons") or [])
+    body = (p.get("text") or "").strip().replace("\n", " ")
+    body = body[:80] + "…" if len(body) > 80 else (body or "—")
     return (
-        "📣 Промо и рассылка.\n\n"
-        f"Авто-промо: {'включено' if p['enabled'] else 'выключено'}, каждые {human_duration(p['interval'])}\n"
-        f"Групп на учёте: {len(CONFIG['groups'])}\n\n"
-        "Текст промо:\n" + (p["text"] or "—") + "\n\n"
-        "«Разослать сейчас» — отправит одно сообщение во все группы.\n"
-        "Кнопка-зазывала «Пригласить друга»: команда /zazyvala в группе.\n"
-        "Текст зазывалы: " + (CONFIG.get("invite_text") or "—") + "\n"
-        "В группе доступна команда /invite — ссылка-приглашение."
+        "📣 Промо и рассылка — это разные вещи.\n\n"
+        "🔁 АВТО-ПРОМО — бот сам, по таймеру, постит во все группы один и тот же материал. "
+        "Это полноценный пост: фото/видео/текст + кнопки-ссылки + закреп.\n"
+        f"Сейчас: {'включено' if p['enabled'] else 'выключено'}, каждые {human_duration(p['interval'])}.\n"
+        f"Контент: {ptype} · кнопок: {nb}\n"
+        f"Текст/подпись: {body}\n\n"
+        "📨 РАЗОВЫЕ ДЕЙСТВИЯ (ниже): «Разослать сейчас» — одно сообщение во все группы; "
+        "«Запостить в группу» — в одну; «Рассылка в ЛС» — подписчикам.\n\n"
+        "Кнопка «Пригласить друга»: команда /zazyvala в группе; ссылка-приглашение: /invite."
     )
 
 
@@ -4079,7 +4193,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if (data in ("m:promo", "m:access", "m:approve", "m:sched", "bk:export", "bk:import")
                 or data.startswith(("pr:", "post:", "pto:", "dm:", "dmcast:", "dmto:", "sp:", "spo:", "spt:",
                                     "spp:", "spsil:", "sppre:", "spv:", "spmode:", "spdow:", "spdate:", "spe:",
-                                    "spd:", "spg:", "spgo", "sptz:", "appr:", "apt:"))):
+                                    "sp_skipbtns", "spd:", "spg:", "spgo", "sptz:", "appr:", "apt:"))):
             await query.answer("Это только для владельца/менеджеров бота", show_alert=True)
             return
     # Цель панели — всегда реальная группа из доступных
@@ -4462,7 +4576,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Пришли «-», чтобы убрать кнопки.\n\n(или /cancel)", None)
     if data == "wl:del":
         cfg = panel_cfg(context)
-        order = [0, 30, 60, 120, 300]
+        order = [0, 5, 10, 30, 60, 120, 300]
         cur = int(cfg["welcome"].get("delete_after", 0) or 0)
         cfg["welcome"]["delete_after"] = order[(order.index(cur) + 1) % len(order)] if cur in order else 0
         save_config()
@@ -4486,9 +4600,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             CONFIG["promo"]["interval"] = max(600, CONFIG["promo"]["interval"] + (600 if sign == "+" else -600))
             save_config()
             return await safe_edit(query, promo_menu_text(), promo_kb())
-        if what == "edit":
-            context.user_data["await"] = "promo"
-            return await safe_edit(query, "Пришли текст авто-промо одним сообщением.\n(или /cancel)", None)
+        if what == "content":
+            context.user_data["await"] = "promo_content"
+            return await safe_edit(
+                query, "Пришли контент авто-промо: текст ИЛИ фото/видео/гиф/документ с подписью. "
+                "Форматирование сохранится. Это сообщение бот будет периодически постить во все группы.\n(или /cancel)", None)
+        if what == "edit":  # совместимость со старой кнопкой — теперь это контент
+            context.user_data["await"] = "promo_content"
+            return await safe_edit(query, "Пришли текст или медиа для авто-промо.\n(или /cancel)", None)
+        if what == "btns":
+            context.user_data["await"] = "promo_btns"
+            return await safe_edit(
+                query, "Пришли кнопки-ссылки для промо: по одной на строку «Текст - https://ссылка». "
+                "Несколько в один ряд — раздели «;». Пришли «-», чтобы убрать кнопки.\n(или /cancel)", None)
+        if what == "preview":
+            p = CONFIG["promo"]
+            if not (p.get("text") or p.get("file_id")):
+                return await query.answer("Сначала задай контент промо", show_alert=True)
+            try:
+                await _send_one(context, query.from_user.id,
+                                {"type": p.get("type", "text"), "text": p.get("text", ""),
+                                 "file_id": p.get("file_id"), "buttons": p.get("buttons", []),
+                                 "html": p.get("html", False)})
+                return await query.answer("Предпросмотр отправлен в этот чат")
+            except Exception as e:  # noqa: BLE001
+                return await query.answer(f"Не вышло: {e}", show_alert=True)
         if what == "invtext":
             context.user_data["await"] = "invite_text"
             return await safe_edit(
@@ -4550,7 +4686,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await safe_edit(query, "Пока нет групп для постинга.", sched_kb())
         context.user_data["sp_draft"] = {"chat_ids": []}
         context.user_data["await"] = "sp_name"
-        return await safe_edit(query, "Название поста? (например: Утренний анонс)\n(или /cancel)", None)
+        return await safe_edit(query, "🆕 Новый пост · Шаг 1 из 5\n\nКак назвать пост (для тебя, в списке)? Например: Утренний анонс.\n(или /cancel)", None)
     if data.startswith("spg:"):
         items = sorted(CONFIG["groups"].items())
         i = int(data[4:])
@@ -4562,7 +4698,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sel.remove(cid)
             else:
                 sel.append(cid)
-        return await safe_edit(query, "Выбери группы для поста (можно несколько), затем «Готово»:",
+        return await safe_edit(query, "📌 Шаг 2 из 5 · Куда публиковать\n\nОтметь группы (можно несколько) и нажми «Готово»:",
                                sched_groups_kb(sel))
     if data == "spgo":
         d = context.user_data.setdefault("sp_draft", {})
@@ -4571,9 +4707,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["await"] = "sp_content"
         return await safe_edit(
             query,
-            "Теперь пришли САМ ПОСТ: текст, фото / видео / гиф / стикер / документ (с подписью) — "
-            "что отправишь, то и будет публиковаться. Форматируй как обычно в Telegram "
-            "(жирный, курсив, ссылки, моноширинный) — всё сохранится.\n(или /cancel)", None)
+            "🖼 Шаг 3 из 5 · Сам пост\n\nПришли то, что будет публиковаться: текст, фото / видео / гиф / стикер / документ (с подписью). "
+            "Форматирование (жирный, курсив, ссылки) сохранится.\n(или /cancel)", None)
+    if data == "sp_skipbtns":
+        d = context.user_data.setdefault("sp_draft", {})
+        d["buttons"] = []
+        context.user_data["await"] = "sp_time"
+        return await safe_edit(
+            query,
+            "🕒 Шаг 5 из 5 · Время\n\nВо сколько публиковать каждый день? Формат ЧЧ:ММ, "
+            "например 13:00 (час дня) или 02:00 (два ночи).\n(или /cancel)", None)
     if data.startswith("spo:"):
         p = _find_post(data[4:])
         if not p:
@@ -5559,6 +5702,17 @@ async def on_private_document(update, context):
                 "Чтобы несколько кнопок в ОДИН ряд — раздели их «;» в одной строке. "
                 "Или /skip (либо пришли «-»), если без кнопок.")
         return
+    if awaiting == "promo_content":
+        if not is_manager(user.id):
+            context.user_data.pop("await", None)
+            return
+        content = _capture_post_content(update.message)
+        if content:
+            CONFIG["promo"].update({"type": content["type"], "file_id": content.get("file_id"),
+                                    "text": content.get("text", ""), "html": content.get("html", False)})
+            save_config()
+            await update.message.reply_text("✅ Контент промо сохранён (документ).", reply_markup=promo_kb())
+        return
     if awaiting == "sp_edit_media":
         if not is_manager(user.id):
             context.user_data.pop("await", None)
@@ -5672,6 +5826,20 @@ async def on_private_media(update, context):
                 "Чтобы несколько кнопок в ОДИН ряд — раздели их «;» в одной строке. "
                 "Или /skip (либо пришли «-»), если без кнопок.")
         return
+    # Контент авто-промо (медиа)
+    if awaiting == "promo_content":
+        if not is_manager(user.id):
+            context.user_data.pop("await", None)
+            return
+        content = _capture_post_content(msg)
+        if not content:
+            await msg.reply_text("Не понял контент. Пришли фото/видео/гиф/документ или текст, или /cancel.")
+            return
+        CONFIG["promo"].update({"type": content["type"], "file_id": content.get("file_id"),
+                                "text": content.get("text", ""), "html": content.get("html", False)})
+        save_config()
+        await msg.reply_text("✅ Контент промо сохранён (медиа).", reply_markup=promo_kb())
+        return
     # Замена медиа у существующего поста
     if awaiting == "sp_edit_media":
         if not is_manager(user.id):
@@ -5743,7 +5911,7 @@ async def on_private_text(update, context):
         await update.message.reply_text("Открой панель: /panel")
         return
     # Глобальные действия — только менеджерам
-    if awaiting in ("promo", "invite_text", "broadcast", "post", "dmcast",
+    if awaiting in ("promo", "promo_content", "promo_btns", "invite_text", "broadcast", "post", "dmcast",
                     "sp_name", "sp_content", "sp_buttons", "sp_time", "sp_date",
                     "sp_edit_text", "sp_edit_btns", "sp_edit_media",
                     "gbid", "gbname", "gword") and not manager:
@@ -5945,13 +6113,24 @@ async def on_private_text(update, context):
                 f"✅ Приветствие сохранено и включено ({panel_target_label(context)}).", reply_markup=welcome_kb(cfg))
         else:
             await update.message.reply_text("Пусто. Попробуй снова через /panel.")
-    elif awaiting == "promo":
+    elif awaiting in ("promo", "promo_content"):
         if text:
-            CONFIG["promo"]["text"] = text
+            th = getattr(update.effective_message, "text_html", None)
+            CONFIG["promo"].update({"type": "text", "file_id": None,
+                                    "text": (th if th is not None else text), "html": True})
             save_config()
-            await update.message.reply_text("✅ Текст промо сохранён.", reply_markup=promo_kb())
+            await update.message.reply_text("✅ Контент промо сохранён (текст).", reply_markup=promo_kb())
         else:
-            await update.message.reply_text("Пусто. Попробуй снова через /panel.")
+            await update.message.reply_text("Пусто. Пришли текст или медиа через /panel.")
+    elif awaiting == "promo_btns":
+        if text.strip() in ("-", "—", "нет"):
+            CONFIG["promo"]["buttons"] = []
+        else:
+            CONFIG["promo"]["buttons"] = _parse_button_rows(text)
+        save_config()
+        await update.message.reply_text(
+            f"✅ Кнопки промо обновлены ({len(CONFIG['promo'].get('buttons') or [])} ряд(ов)).",
+            reply_markup=promo_kb())
     elif awaiting == "invite_text":
         if text:
             CONFIG["invite_text"] = text
@@ -6044,7 +6223,7 @@ async def on_private_text(update, context):
             await update.message.reply_text("Нет групп для постинга.")
             return
         await update.message.reply_text(
-            f"Пост «{name}». Выбери группы (можно несколько), затем «Готово»:",
+            f"📌 Шаг 2 из 5 · Куда публиковать\n\nПост «{name}». Отметь группы (можно несколько) и нажми «Готово»:",
             reply_markup=sched_groups_kb(d.get("chat_ids")))
     elif awaiting == "sp_content":
         d = context.user_data.get("sp_draft", {})
@@ -6060,22 +6239,23 @@ async def on_private_text(update, context):
         if d["type"] in _NO_CAPTION_TYPES:
             context.user_data["await"] = "sp_time"
             await update.message.reply_text(
-                "Во сколько публиковать каждый день? Формат ЧЧ:ММ, например 13:00 (час дня) "
-                "или 02:00 (два ночи).\n(или /cancel)")
+                "🕒 Шаг 5 из 5 · Время\n\nВо сколько публиковать каждый день? Формат ЧЧ:ММ, "
+                "например 13:00 (час дня) или 02:00 (два ночи).\n(или /cancel)")
         else:
             context.user_data["await"] = "sp_buttons"
             await update.message.reply_text(
-                "Кнопки-ссылки под постом? По одной на строку: «Текст - https://ссылка». "
-                "Чтобы несколько кнопок в ОДИН ряд — раздели их «;» в одной строке. "
-                "Или /skip (либо пришли «-»), если без кнопок.")
+                "🔘 Шаг 4 из 5 · Кнопки-ссылки (необязательно)\n\n"
+                "Пришли кнопки: по одной на строку «Текст - https://ссылка». "
+                "Несколько в один ряд — раздели «;». Или нажми «⏭ Без кнопок».",
+                reply_markup=sched_skip_btns_kb())
     elif awaiting == "sp_buttons":
         d = context.user_data.get("sp_draft", {})
         if text.strip() not in ("-", "—", "нет", "skip"):
             d["buttons"] = _parse_button_rows(text)
         context.user_data["await"] = "sp_time"
         await update.message.reply_text(
-            "Во сколько публиковать каждый день? Формат ЧЧ:ММ, например 13:00 (час дня) "
-            "или 02:00 (два ночи).\n(или /cancel)")
+            "🕒 Шаг 5 из 5 · Время\n\nВо сколько публиковать каждый день? Формат ЧЧ:ММ, "
+            "например 13:00 (час дня) или 02:00 (два ночи).\n(или /cancel)")
     elif awaiting == "sp_time":
         mt = re.match(r"^(\d{1,2})[:.\s](\d{2})$", text.strip())
         if not mt:
@@ -6101,9 +6281,15 @@ async def on_private_text(update, context):
         save_config()
         _schedule_post(context.job_queue, post)
         names = [CONFIG.get("groups", {}).get(str(c), str(c)) for c in post["chat_ids"]]
+        nb = len(post.get("buttons") or [])
         await update.message.reply_text(
-            f"✅ Пост «{post['name']}» будет выходить каждый день в {post['time']} "
-            f"(UTC+{CONFIG.get('post_tz', 5)}) в: {', '.join(names)}.", reply_markup=sched_kb())
+            f"✅ Готово! Пост «{post['name']}» создан.\n\n"
+            f"📅 Выходит каждый день в {post['time']} (UTC+{CONFIG.get('post_tz', 5)})\n"
+            f"📍 Группы: {', '.join(names)}\n"
+            f"🔘 Кнопок: {nb}\n\n"
+            "Ниже в карточке можно включить закреп/без звука, сменить режим (по дням/разово) "
+            "или отредактировать текст, медиа и кнопки.",
+            reply_markup=sched_post_kb(post))
     elif awaiting == "import_config":
         await update.message.reply_text(
             "Жду файл config.json (документом), а не текст. /panel → 💾 Бэкап → «Загрузить».")
@@ -6268,6 +6454,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("unwarn", cmd_unwarn, filters=groups))
     app.add_handler(CommandHandler(["warns", "warnings"], cmd_warns, filters=groups))
     app.add_handler(CommandHandler("stats", cmd_stats, filters=groups))
+    app.add_handler(CommandHandler("top", cmd_top, filters=groups))
     app.add_handler(CommandHandler("say", cmd_say, filters=groups))
     app.add_handler(CommandHandler("invite", cmd_invite, filters=groups))
     app.add_handler(CommandHandler("link", cmd_link, filters=groups))
@@ -6339,6 +6526,7 @@ def main():
         app.job_queue.run_repeating(recurring_job, interval=60, first=20)
         app.job_queue.run_repeating(weekly_digest_job, interval=7 * 86400, first=7 * 86400)
         app.job_queue.run_repeating(scheduled_posts_job, interval=60, first=15)  # публикация постов по расписанию
+        app.job_queue.run_repeating(stats_flush_job, interval=120, first=120)  # сохранение статистики сообщений
     else:
         log.warning("JobQueue недоступен — авто-промо и запланированные посты работать не будут.")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
