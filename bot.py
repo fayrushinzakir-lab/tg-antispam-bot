@@ -881,6 +881,17 @@ async def notify_deleted(context, chat_id: int, reason: str):
         log.debug("notify_deleted: %s", e)
 
 
+async def reply_tidy(update, context, text, seconds: int = 12, **kwargs):
+    """Ответ бота в группе, который сам исчезает через seconds, если включена «Чистить команды».
+    В личке или при выключенной чистке — обычный ответ, который остаётся."""
+    msg = await update.effective_message.reply_text(text, **kwargs)
+    chat = update.effective_chat
+    if (chat and chat.type in ("group", "supergroup")
+            and chat_cfg(chat.id)["enabled"].get("clean_commands") and context.job_queue):
+        context.job_queue.run_once(_delete_later, seconds, data={"chat_id": chat.id, "mid": msg.message_id})
+    return msg
+
+
 def track_nuke(chat_id, actor_id):
     a = chat_cfg(chat_id)["antinuke"]
     now = time.time()
@@ -1398,12 +1409,20 @@ async def handle_captcha_press(update: Update, context: ContextTypes.DEFAULT_TYP
         await context.bot.restrict_chat_member(chat.id, user.id, permissions=FULL_PERMS)
     except Exception as e:  # noqa: BLE001
         log.debug("captcha unmute %s: %s", user.id, e)
-    try:
-        await context.bot.delete_message(chat.id, mid)
-    except Exception:  # noqa: BLE001
-        pass
     bump(chat.id, "captcha_pass")
     await query.answer(tr(chat.id, "cap_ok"))
+    # Показываем «проверка пройдена» и убираем сообщение капчи через 5 секунд
+    try:
+        await query.edit_message_text(tr(chat.id, "cap_ok"))
+    except Exception:  # noqa: BLE001
+        pass
+    if context.job_queue:
+        context.job_queue.run_once(_delete_later, 5, data={"chat_id": chat.id, "mid": mid})
+    else:
+        try:
+            await context.bot.delete_message(chat.id, mid)
+        except Exception:  # noqa: BLE001
+            pass
     await send_welcome(context, chat, user)
 
 
@@ -1911,7 +1930,7 @@ async def cmd_ban(update, context):
         await context.bot.ban_chat_member(chat.id, tid, until_date=until)
         bump(chat.id, "banned")
         dur_txt = "навсегда" if not duration else f"на {human_duration(duration)}"
-        await update.effective_message.reply_text(
+        await reply_tidy(update, context,
             f"🚫 {tname} забанен {dur_txt}." + (f"\nПричина: {reason}" if reason else ""))
         await log_action(context, chat.id, f"🚫 бан {dur_txt}: {tname} (by {_actor_name(update)})"
                          + (f" — {reason}" if reason else ""))
@@ -1995,7 +2014,7 @@ async def cmd_kick(update, context):
         await context.bot.ban_chat_member(chat.id, tid)
         await context.bot.unban_chat_member(chat.id, tid, only_if_banned=True)
         bump(chat.id, "kicked")
-        await update.effective_message.reply_text(f"👢 {tname} удалён (сможет зайти заново).")
+        await reply_tidy(update, context, f"👢 {tname} удалён (сможет зайти заново).")
         await log_action(context, chat.id, f"👢 кик: {tname} (by {_actor_name(update)})")
     except Exception as e:  # noqa: BLE001
         await update.effective_message.reply_text(f"Не вышло: {e}")
@@ -2023,7 +2042,7 @@ async def cmd_mute(update, context):
         await mute_user(context, chat.id, tid, duration)
         bump(chat.id, "muted")
         dur_txt = "навсегда" if not duration else f"на {human_duration(duration)}"
-        await update.effective_message.reply_text(
+        await reply_tidy(update, context,
             f"🔇 {tname} в муте {dur_txt}." + (f"\nПричина: {reason}" if reason else ""))
         await log_action(context, chat.id, f"🔇 мут {dur_txt}: {tname} (by {_actor_name(update)})"
                          + (f" — {reason}" if reason else ""))
@@ -2044,7 +2063,7 @@ async def cmd_unmute(update, context):
         await context.bot.restrict_chat_member(chat.id, tid, permissions=FULL_PERMS)
     except Exception as e:  # noqa: BLE001
         log.debug("unmute restrict %s: %s", tid, e)  # обычная группа — хватило снятия мягкого мута
-    await update.effective_message.reply_text(f"🔊 {tname} размучен.")
+    await reply_tidy(update, context, f"🔊 {tname} размучен.")
     await log_action(context, chat.id, f"🔊 размут: {tname} (by {_actor_name(update)})")
 
 
@@ -2065,18 +2084,18 @@ async def cmd_warn(update, context):
             if m["warn_action"] == "ban":
                 await context.bot.ban_chat_member(chat.id, tid)
                 bump(chat.id, "banned")
-                await update.effective_message.reply_text(f"⚠️ {tname}: {n}/{limit} — бан.")
+                await reply_tidy(update, context, f"⚠️ {tname}: {n}/{limit} — бан.")
                 await log_action(context, chat.id, f"⚠️→🚫 {n}/{limit} предупреждений → бан: {tname}")
             else:
                 await mute_user(context, chat.id, tid, m["warn_mute"])
                 bump(chat.id, "muted")
-                await update.effective_message.reply_text(
+                await reply_tidy(update, context,
                     f"⚠️ {tname}: {n}/{limit} — мут на {human_duration(m['warn_mute'])}.")
                 await log_action(context, chat.id, f"⚠️→🔇 {n}/{limit} → мут: {tname}")
         except Exception as e:  # noqa: BLE001
             await update.effective_message.reply_text(f"Лимит достигнут, но наказать не вышло: {e}")
     else:
-        await update.effective_message.reply_text(
+        await reply_tidy(update, context,
             f"⚠️ {tname}: предупреждение {n}/{limit}." + (f"\nПричина: {reason}" if reason else ""))
         await log_action(context, chat.id, f"⚠️ пред {n}/{limit}: {tname} (by {_actor_name(update)})"
                          + (f" — {reason}" if reason else ""))
@@ -2286,6 +2305,9 @@ def _optout_list(chat_id):
     return CONFIG["all_optout"].setdefault(str(chat_id), [])
 
 
+_all_active: dict = {}  # chat_id -> идёт ли сейчас призыв /all (для остановки кнопкой/командой)
+
+
 async def cmd_all(update, context):
     """Призыв: тихо тегнуть всех активных участников.
 
@@ -2313,16 +2335,20 @@ async def cmd_all(update, context):
     except Exception:  # noqa: BLE001
         pass
 
-    # видимое объявление — остаётся в чате
+    # видимое объявление — остаётся в чате, с кнопкой остановки
+    stop_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Остановить", callback_data="allstop")]])
     try:
-        await context.bot.send_message(chat.id, f"📣 {html.escape(text)}", parse_mode="HTML")
+        await context.bot.send_message(chat.id, f"📣 {html.escape(text)}", parse_mode="HTML", reply_markup=stop_kb)
     except Exception as e:  # noqa: BLE001
         log.debug("all announce: %s", e)
 
+    _all_active[chat.id] = True
     # меншены «бегущей строкой»: каждая новая пачка удаляет предыдущую
     prev_id = None
     batch = []
     for i, (uid, name) in enumerate(targets, 1):
+        if not _all_active.get(chat.id):
+            break  # остановлено кнопкой «⏹ Остановить» или /stopall
         batch.append(f'<a href="tg://user?id={uid}">{html.escape(name or "друг")}</a>')
         if len(batch) >= 5 or i == len(targets):
             try:
@@ -2346,6 +2372,19 @@ async def cmd_all(update, context):
             await context.bot.delete_message(chat.id, prev_id)
         except Exception:  # noqa: BLE001
             pass
+    _all_active.pop(chat.id, None)
+
+
+async def cmd_stopall(update, context):
+    """Остановить идущий призыв /all."""
+    chat = update.effective_chat
+    if not await can_moderate(context, chat.id, update.effective_user.id, "all"):
+        return await _deny(update)
+    if _all_active.get(chat.id):
+        _all_active[chat.id] = False
+        await update.effective_message.reply_text("⏹ Призыв остановлен.")
+    else:
+        await update.effective_message.reply_text("Сейчас активного призыва нет.")
 
 
 async def cmd_anreg(update, context):
@@ -2950,6 +2989,8 @@ async def recurring_job(context: ContextTypes.DEFAULT_TYPE):
             text = (it or {}).get("text")
             if not text:
                 continue
+            if not (it or {}).get("enabled", True):
+                continue  # авто-сообщение на паузе (стоп)
             interval = max(60, int((it.get("interval") or 60)) * 60)
             key = (chat_id, idx)
             if key not in _recurring_last:
@@ -2958,7 +2999,7 @@ async def recurring_job(context: ContextTypes.DEFAULT_TYPE):
             if now - _recurring_last[key] >= interval:
                 _recurring_last[key] = now
                 try:
-                    await context.bot.send_message(chat_id, text)
+                    await context.bot.send_message(chat_id, _spintax(text))
                 except Exception as e:  # noqa: BLE001
                     log.debug("recurring send %s: %s", chat_id, e)
 
@@ -3382,20 +3423,28 @@ def recurring_kb(cfg) -> InlineKeyboardMarkup:
     items = cfg.get("recurring", []) or []
     rows = [[InlineKeyboardButton("➕ Добавить авто-сообщение", callback_data="add:recurring")]]
     for i, it in enumerate(items):
-        txt = ((it or {}).get("text", "") or "")[:18]
-        rows.append([InlineKeyboardButton(f"❌ {(it or {}).get('interval', '?')}м: {txt}", callback_data=f"rec:del:{i}")])
+        it = it or {}
+        txt = (it.get("text", "") or "")[:16]
+        on = it.get("enabled", True)
+        rows.append([
+            InlineKeyboardButton(f"{'🟢' if on else '⏸'} {it.get('interval', '?')}м: {txt}",
+                                 callback_data=f"rec:tog:{i}"),
+            InlineKeyboardButton("❌", callback_data=f"rec:del:{i}"),
+        ])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:other")])
     return InlineKeyboardMarkup(rows)
 
 
 def recurring_menu_text(cfg, target_label: str) -> str:
     items = cfg.get("recurring", []) or []
+    active = sum(1 for it in items if (it or {}).get("enabled", True))
     return (
-        f"🔁 Авто-сообщения · {target_label}\n\n"
-        f"Сейчас настроено: {len(items)}\n\n"
-        "Бот периодически сам публикует сообщение в группе. "
-        "Добавляя, укажи интервал и текст в формате: минуты = текст\n"
-        "Например: 120 = Не забывайте читать правила! /group"
+        f"🔁 Авто-сообщения (зазывала) · {target_label}\n\n"
+        f"Настроено: {len(items)} · активно: {active}\n\n"
+        "Бот периодически сам публикует сообщение в группе. Нажми на сообщение, чтобы "
+        "🟢 включить / ⏸ остановить (пауза), или ❌ — удалить.\n\n"
+        "Добавляя, укажи интервал и текст: минуты = текст\n"
+        "Например: 120 = Зовите друзей! /zazyvala"
     )
 
 
@@ -3648,6 +3697,9 @@ def sched_post_kb(p) -> InlineKeyboardMarkup:
     elif mode == "once":
         rows.append([InlineKeyboardButton(f"📅 Дата: {p.get('date') or 'задать'}", callback_data=f"spdate:{pid}")])
     rows += [
+        [InlineKeyboardButton("✏️ Текст/подпись", callback_data=f"spe:text:{pid}"),
+         InlineKeyboardButton("🖼 Медиа", callback_data=f"spe:media:{pid}")],
+        [InlineKeyboardButton("🔘 Кнопки-ссылки", callback_data=f"spe:btns:{pid}")],
         [InlineKeyboardButton(f"📌 Закреплять: {'да' if p.get('pin') else 'нет'}", callback_data=f"spp:{pid}"),
          InlineKeyboardButton(f"🔕 Без звука: {'да' if p.get('silent') else 'нет'}", callback_data=f"spsil:{pid}")],
         [InlineKeyboardButton(f"🔗 Без превью ссылок: {'да' if p.get('no_preview') else 'нет'}", callback_data=f"sppre:{pid}")],
@@ -3962,6 +4014,41 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data or ""
 
+    # Кнопка покупки тарифа из группы (/pro) — счёт в звёздах прямо в группе
+    if data.startswith("buyg:"):
+        try:
+            _, cid, plan = data.split(":", 2)
+        except ValueError:
+            return await query.answer()
+        p = PRO_PLANS.get(plan)
+        if not p:
+            return await query.answer("Неизвестный тариф", show_alert=True)
+        if not (is_manager(user.id) or user.id in await group_admin_ids(context, int(cid))):
+            return await query.answer("Тариф оформляют администраторы группы", show_alert=True)
+        try:
+            await context.bot.send_invoice(
+                chat_id=int(cid),
+                title=f"Профессиональный — {p['label']}",
+                description=f"Тариф «Профессиональный» для этой группы на {p['label']}. Оплата звёздами Telegram.",
+                payload=f"sub:{cid}:{plan}",
+                currency="XTR",
+                prices=[LabeledPrice(p["label"], p["stars"])],
+                provider_token="",
+            )
+            return await query.answer("Счёт отправлен — оплати звёздами ⭐")
+        except Exception as e:  # noqa: BLE001
+            return await query.answer(f"Оплата сейчас недоступна: {e}", show_alert=True)
+
+    # Кнопка «⏹ Остановить» под призывом /all — жмёт админ прямо в группе
+    if data == "allstop":
+        chat = update.effective_chat
+        if not await can_moderate(context, chat.id, user.id, "all"):
+            return await query.answer("Недостаточно прав", show_alert=True)
+        if _all_active.get(chat.id):
+            _all_active[chat.id] = False
+            return await query.answer("⏹ Призыв остановлен")
+        return await query.answer("Призыв уже завершён")
+
     # Капча — кнопку жмёт новичок (не менеджер), поэтому обрабатываем до проверки прав
     if data.startswith("cap:"):
         return await handle_captcha_press(update, context)
@@ -3991,7 +4078,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # глобальные разделы — недоступны не-менеджерам
         if (data in ("m:promo", "m:access", "m:approve", "m:sched", "bk:export", "bk:import")
                 or data.startswith(("pr:", "post:", "pto:", "dm:", "dmcast:", "dmto:", "sp:", "spo:", "spt:",
-                                    "spp:", "spsil:", "sppre:", "spv:", "spmode:", "spdow:", "spdate:",
+                                    "spp:", "spsil:", "sppre:", "spv:", "spmode:", "spdow:", "spdate:", "spe:",
                                     "spd:", "spg:", "spgo", "sptz:", "appr:", "apt:"))):
             await query.answer("Это только для владельца/менеджеров бота", show_alert=True)
             return
@@ -4062,7 +4149,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await safe_edit(query, "Пришли имя/@юзернейм для ГЛОБАЛЬНОГО чёрного списка.\n(или /cancel)", None)
         if data == "add:gword":
             context.user_data["await"] = "gword"
-            return await safe_edit(query, "Пришли ГЛОБАЛЬНОЕ стоп-слово (удаляется во всех группах).\n(или /cancel)", None)
+            return await safe_edit(query, "Пришли ГЛОБАЛЬНЫЕ стоп-слова (на все группы). Можно несколько через запятую.\n(или /cancel)", None)
         if data.startswith("dgbid:"):
             i = int(data.split(":")[1])
             if 0 <= i < len(gbl["ids"]):
@@ -4560,6 +4647,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["await"] = "sp_date"
             return await safe_edit(query, "Пришли дату публикации в формате ГГГГ-ММ-ДД (например 2026-06-15).\n(или /cancel)", None)
         return await safe_edit(query, sched_menu_text(), sched_kb())
+    if data.startswith("spe:"):
+        _, kind, pid = data.split(":", 2)
+        if not _find_post(pid):
+            return await safe_edit(query, sched_menu_text(), sched_kb())
+        context.user_data["sp_edit_for"] = pid
+        if kind == "text":
+            context.user_data["await"] = "sp_edit_text"
+            return await safe_edit(query, "Пришли новый текст/подпись поста (форматирование сохранится). "
+                                          "Пришли «-», чтобы убрать текст.\n(или /cancel)", None)
+        if kind == "media":
+            context.user_data["await"] = "sp_edit_media"
+            return await safe_edit(query, "Пришли новое фото / видео / гиф / документ для поста "
+                                          "(подпись возьму из него). Пришли «-», чтобы сделать пост без медиа (только текст).\n(или /cancel)", None)
+        if kind == "btns":
+            context.user_data["await"] = "sp_edit_btns"
+            return await safe_edit(
+                query,
+                "Пришли кнопки-ссылки: по одной на строку «Текст - https://ссылка». Несколько в один ряд — "
+                "раздели «;». Пришли «-», чтобы убрать кнопки.\n\n"
+                "Подсказка: цвет инлайн-кнопок в Telegram задать нельзя — он единый по теме.\n(или /cancel)", None)
+        return
     if data.startswith("spd:"):
         pid = data[4:]
         if _find_post(pid):
@@ -4675,6 +4783,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_config()
         return await safe_edit(query, night_menu_text(wcfg, label), night_kb(wcfg))
 
+    if data.startswith("rec:tog:"):
+        wcfg = panel_cfg(context)
+        i = int(data.split(":")[2])
+        items = wcfg.setdefault("recurring", [])
+        if 0 <= i < len(items) and isinstance(items[i], dict):
+            items[i]["enabled"] = not items[i].get("enabled", True)
+            save_config()
+        return await safe_edit(query, recurring_menu_text(wcfg, label), recurring_kb(wcfg))
+
     if data.startswith("rec:del:"):
         wcfg = panel_cfg(context)
         i = int(data.split(":")[2])
@@ -4751,10 +4868,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await safe_edit(query, f"Пришли строку: слово = ответ (для «{label}»).\nМожно несколько слов через запятую на один ответ, например: банан, яблоко, груша = это фрукт\n\n(или /cancel)", None)
     if data == "add:word":
         context.user_data["await"] = "word"
-        return await safe_edit(query, f"Пришли стоп-слово для «{label}» одним сообщением.\n(или /cancel)", None)
+        return await safe_edit(query, f"Пришли стоп-слово(а) для «{label}». Можно несколько через запятую: спам, реклама, казино\n(или /cancel)", None)
     if data == "add:word2":
         context.user_data["await"] = "word2"
-        return await safe_edit(query, f"Пришли слово для ВТОРОГО списка «{label}» одним сообщением.\n(или /cancel)", None)
+        return await safe_edit(query, f"Пришли слова для ВТОРОГО списка «{label}». Можно несколько через запятую.\n(или /cancel)", None)
     if data == "add:blid":
         context.user_data["await"] = "blid"
         return await safe_edit(query, f"Пришли числовой ID пользователя для чёрного списка «{label}».\n(или /cancel)", None)
@@ -5079,6 +5196,21 @@ async def cmd_about(update, context):
         reply_markup=InlineKeyboardMarkup([[add_btn]]))
 
 
+async def cmd_pro(update, context):
+    """Тариф «Профессиональный» и оплата звёздами — доступно админам в группе."""
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup"):
+        title = chat.title or str(chat.id)
+        rows = [[InlineKeyboardButton(f"{PRO_PLANS[k]['label']} — {PRO_PLANS[k]['stars']} ⭐",
+                                      callback_data=f"buyg:{chat.id}:{k}")] for k in _PLAN_ORDER]
+        await update.effective_message.reply_text(
+            tariff_text(chat.id, title), reply_markup=InlineKeyboardMarkup(rows))
+    else:
+        await update.effective_message.reply_text(
+            "💎 Тариф «Профессиональный».\nОткрой его в панели: /panel → 💎 Тариф (выбери группу и срок), "
+            "или напиши /pro прямо в нужной группе.")
+
+
 async def cmd_cancel(update, context):
     context.user_data.pop("sp_draft", None)
     if context.user_data.pop("await", None):
@@ -5330,16 +5462,21 @@ async def cmd_list(update, context):
 async def cmd_addword(update, context):
     if not is_manager(update.effective_user.id):
         return
-    w = _args_text(update).lower()
-    if not w:
-        await update.message.reply_text("Формат: /addword слово")
+    body = _args_text(update)
+    if not body:
+        await update.message.reply_text("Формат: /addword слово (можно несколько через запятую)")
         return
     cfg = panel_cfg(context)
-    if w not in cfg["stop_words"]:
-        cfg["stop_words"].append(w)
+    words = [w.strip().lower() for w in body.split(",") if w.strip()]
+    added = []
+    for w in words:
+        if w not in cfg["stop_words"]:
+            cfg["stop_words"].append(w)
+            added.append(w)
+    if added:
         save_config()
-    await update.message.reply_text(
-        f"✅ Стоп-слово: {w} ({panel_target_label(context)})", reply_markup=words_kb(cfg))
+    msg = (f"✅ Стоп-слова ({len(added)}): {', '.join(added)}" if added else "Эти слова уже в списке.")
+    await update.message.reply_text(f"{msg} ({panel_target_label(context)})", reply_markup=words_kb(cfg))
 
 
 async def cmd_delword(update, context):
@@ -5421,6 +5558,23 @@ async def on_private_document(update, context):
                 "Кнопки-ссылки под постом? По одной на строку: «Текст - https://ссылка». "
                 "Чтобы несколько кнопок в ОДИН ряд — раздели их «;» в одной строке. "
                 "Или /skip (либо пришли «-»), если без кнопок.")
+        return
+    if awaiting == "sp_edit_media":
+        if not is_manager(user.id):
+            context.user_data.pop("await", None)
+            return
+        p = _find_post(context.user_data.pop("sp_edit_for", None))
+        if not p:
+            await update.message.reply_text("Пост не найден. Открой его заново через /panel.")
+            return
+        content = _capture_post_content(update.message)
+        if content:
+            if not content.get("text") and p.get("text"):
+                content["text"] = p["text"]; content["html"] = p.get("html", False)
+            p.update({"type": content["type"], "file_id": content.get("file_id"),
+                      "text": content.get("text", ""), "html": content.get("html", False)})
+            save_config()
+            await update.message.reply_text("✅ Медиа поста обновлено.", reply_markup=sched_post_kb(p))
         return
     if awaiting not in ("import_config", "import_chat"):
         if is_manager(user.id) or await user_admin_groups(context, user.id):
@@ -5518,6 +5672,28 @@ async def on_private_media(update, context):
                 "Чтобы несколько кнопок в ОДИН ряд — раздели их «;» в одной строке. "
                 "Или /skip (либо пришли «-»), если без кнопок.")
         return
+    # Замена медиа у существующего поста
+    if awaiting == "sp_edit_media":
+        if not is_manager(user.id):
+            context.user_data.pop("await", None)
+            return
+        p = _find_post(context.user_data.pop("sp_edit_for", None))
+        if not p:
+            await msg.reply_text("Пост не найден. Открой его заново через /panel.")
+            return
+        content = _capture_post_content(msg)
+        if not content:
+            await msg.reply_text("Не понял медиа. Пришли фото/видео/гиф/документ или /cancel.")
+            return
+        # сохраняем кнопки и текст, если у нового медиа нет своей подписи
+        if not content.get("text") and p.get("text"):
+            content["text"] = p["text"]
+            content["html"] = p.get("html", False)
+        p.update({"type": content["type"], "file_id": content.get("file_id"),
+                  "text": content.get("text", ""), "html": content.get("html", False)})
+        save_config()
+        await msg.reply_text("✅ Медиа поста обновлено.", reply_markup=sched_post_kb(p))
+        return
     # Рассылка/пост одним фото (как было)
     if awaiting not in ("broadcast", "post", "dmcast"):
         return
@@ -5569,6 +5745,7 @@ async def on_private_text(update, context):
     # Глобальные действия — только менеджерам
     if awaiting in ("promo", "invite_text", "broadcast", "post", "dmcast",
                     "sp_name", "sp_content", "sp_buttons", "sp_time", "sp_date",
+                    "sp_edit_text", "sp_edit_btns", "sp_edit_media",
                     "gbid", "gbname", "gword") and not manager:
         context.user_data.pop("await", None)
         await update.message.reply_text("Это только для владельца/менеджеров бота.")
@@ -5607,22 +5784,32 @@ async def on_private_text(update, context):
             context.user_data["await"] = "trigger"
             await update.message.reply_text("Пусто. Формат: слово1, слово2 = ответ. Попробуй снова или /cancel.")
     elif awaiting == "word":
-        w = text.lower()
         cfg = panel_cfg(context)
-        if w and w not in cfg["stop_words"]:
-            cfg["stop_words"].append(w)
+        words = [w.strip().lower() for w in text.split(",") if w.strip()]
+        added = []
+        for w in words:
+            if w not in cfg["stop_words"]:
+                cfg["stop_words"].append(w)
+                added.append(w)
+        if added:
             save_config()
-        await update.message.reply_text(
-            f"✅ Стоп-слово: {w} ({panel_target_label(context)})", reply_markup=words_kb(cfg))
+        msg = (f"✅ Стоп-слова добавлены ({len(added)}): {', '.join(added)}" if added
+               else "Эти слова уже в списке.")
+        await update.message.reply_text(f"{msg} ({panel_target_label(context)})", reply_markup=words_kb(cfg))
     elif awaiting == "word2":
-        w = text.lower()
         cfg = panel_cfg(context)
         lst = cfg.setdefault("stop_words2", [])
-        if w and w not in lst:
-            lst.append(w)
+        words = [w.strip().lower() for w in text.split(",") if w.strip()]
+        added = []
+        for w in words:
+            if w not in lst:
+                lst.append(w)
+                added.append(w)
+        if added:
             save_config()
-        await update.message.reply_text(
-            f"✅ Во второй список добавлено: {w} ({panel_target_label(context)})", reply_markup=words2_kb(cfg))
+        msg = (f"✅ Во второй список добавлено ({len(added)}): {', '.join(added)}" if added
+               else "Эти слова уже в списке.")
+        await update.message.reply_text(f"{msg} ({panel_target_label(context)})", reply_markup=words2_kb(cfg))
     elif awaiting == "blid":
         cfg = panel_cfg(context)
         digits = "".join(ch for ch in text if ch.isdigit() or ch == "-")
@@ -5653,6 +5840,46 @@ async def on_private_text(update, context):
             save_config()
         await update.message.reply_text(
             f"✅ Домен: {d} ({panel_target_label(context)})", reply_markup=links_kb(cfg))
+    elif awaiting == "sp_edit_text":
+        p = _find_post(context.user_data.pop("sp_edit_for", None))
+        if not p:
+            await update.message.reply_text("Пост не найден. Открой его заново через /panel.")
+            return
+        if text.strip() in ("-", "—"):
+            p["text"] = ""
+        else:
+            th = getattr(update.effective_message, "text_html", None)
+            p["text"] = th if th is not None else text
+            p["html"] = True
+        save_config()
+        await update.message.reply_text("✅ Текст/подпись поста обновлены.", reply_markup=sched_post_kb(p))
+    elif awaiting == "sp_edit_btns":
+        p = _find_post(context.user_data.pop("sp_edit_for", None))
+        if not p:
+            await update.message.reply_text("Пост не найден. Открой его заново через /panel.")
+            return
+        if text.strip() in ("-", "—", "нет"):
+            p["buttons"] = []
+        else:
+            p["buttons"] = _parse_button_rows(text)
+        save_config()
+        await update.message.reply_text(
+            f"✅ Кнопки обновлены ({len(p.get('buttons') or [])} ряд(ов)).", reply_markup=sched_post_kb(p))
+    elif awaiting == "sp_edit_media":
+        # сюда попадаем, если вместо медиа прислали текст; «-» = сделать пост без медиа
+        p = _find_post(context.user_data.pop("sp_edit_for", None))
+        if not p:
+            await update.message.reply_text("Пост не найден. Открой его заново через /panel.")
+            return
+        if text.strip() in ("-", "—"):
+            p["type"] = "text"
+            p["file_id"] = None
+            save_config()
+            await update.message.reply_text("✅ Пост теперь без медиа (только текст).", reply_markup=sched_post_kb(p))
+        else:
+            context.user_data["await"] = "sp_edit_media"
+            context.user_data["sp_edit_for"] = p["id"]
+            await update.message.reply_text("Пришли фото/видео/гиф/документ, либо «-» чтобы убрать медиа, либо /cancel.")
     elif awaiting == "sp_date":
         pid = context.user_data.pop("sp_date_for", None)
         p = _find_post(pid) if pid else None
@@ -5687,11 +5914,15 @@ async def on_private_text(update, context):
             names.append(nm); save_config()
         await update.message.reply_text(f"🌍🚷 Имя «{nm}» в глобальном чёрном списке.", reply_markup=global_kb())
     elif awaiting == "gword":
-        w = text.lower().strip()
         gw = CONFIG.setdefault("global_stop_words", [])
-        if w and w not in gw:
-            gw.append(w); save_config()
-        await update.message.reply_text(f"🌍 Глобальное стоп-слово: {w}.", reply_markup=global_kb())
+        words = [w.strip().lower() for w in text.split(",") if w.strip()]
+        added = [w for w in words if w not in gw]
+        gw.extend(added)
+        if added:
+            save_config()
+        msg = (f"🌍 Глобальные стоп-слова ({len(added)}): {', '.join(added)}" if added
+               else "Эти слова уже в глобальном списке.")
+        await update.message.reply_text(msg, reply_markup=global_kb())
     elif awaiting == "welcome_btns":
         cfg = panel_cfg(context)
         if text.strip() in ("-", "—", "нет"):
@@ -5754,7 +5985,7 @@ async def on_private_text(update, context):
             await update.message.reply_text("Пустой текст. Попробуй снова через /panel.")
             return
         cfg = panel_cfg(context)
-        cfg.setdefault("recurring", []).append({"text": body, "interval": mins})
+        cfg.setdefault("recurring", []).append({"text": body, "interval": mins, "enabled": True})
         save_config()
         await update.message.reply_text(
             f"✅ Авто-сообщение добавлено: каждые {mins} мин ({panel_target_label(context)}).",
@@ -5987,6 +6218,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help", cmd_help, filters=private))
     app.add_handler(CommandHandler("about", cmd_about))
     app.add_handler(CommandHandler("grantpro", cmd_grantpro, filters=groups))
+    app.add_handler(CommandHandler("pro", cmd_pro))
     # Оплата звёздами Telegram (тариф «Профессиональный»)
     app.add_handler(PreCheckoutQueryHandler(on_pre_checkout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_successful_payment), group=1)
@@ -6042,6 +6274,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler(["group", "rules"], cmd_rules, filters=groups))
     app.add_handler(CommandHandler(["zazyvala", "invitebtn"], cmd_zazyvala, filters=groups))
     app.add_handler(CommandHandler("all", cmd_all, filters=groups))
+    app.add_handler(CommandHandler("stopall", cmd_stopall, filters=groups))
     app.add_handler(CommandHandler("anreg", cmd_anreg, filters=groups))
     app.add_handler(CommandHandler("reg", cmd_reg, filters=groups))
 
