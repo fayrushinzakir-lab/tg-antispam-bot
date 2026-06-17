@@ -150,6 +150,9 @@ DEFAULT_CONFIG = {
     "dm_subscribers": {},
     # Подписки на тариф «Профессиональный»: {chat_id: ts окончания}
     "subscriptions": {},
+    # Пробный период: дней по умолчанию и выданные триалы {chat_id: ts окончания}
+    "trial_days": 3,
+    "trials": {},
     # Статистика сообщений (в стиле Silent Stats): {chat_id: {users, names, days, total}}
     "msg_stats": {},
     # Запланированные посты (ежедневно в заданное время): список объектов
@@ -615,10 +618,13 @@ async def can_edit_target(context, user_id: int, target) -> bool:
 
 
 def chat_allowed(chat_id: int) -> bool:
-    """True, если бот допущен работать в этом чате (или допуск выключен)."""
+    """True, если бот допущен работать в этом чате.
+    Доступ: одобрение создателя (бесплатно) ИЛИ оплата звёздами ИЛИ активный пробный период."""
     if not CONFIG.get("require_approval", True):
         return True
-    return chat_id in CONFIG.get("approved_chats", [])
+    if chat_id in CONFIG.get("approved_chats", []):
+        return True
+    return is_pro(chat_id) or trial_active(chat_id)
 
 
 def chat_cfg(chat_id) -> dict:
@@ -973,8 +979,8 @@ async def _gate_unapproved(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not chat_allowed(chat.id):
             msg = update.effective_message
             txt = (msg.text or "") if msg else ""
-            if txt.startswith("/diag"):
-                return  # диагностику пропускаем даже без одобрения
+            if txt.startswith(("/diag", "/pro", "/start")):
+                return  # диагностику и оплату тарифа пропускаем даже без одобрения
             if msg and (msg.migrate_to_chat_id or msg.migrate_from_chat_id):
                 return  # миграцию группы пропускаем
             raise ApplicationHandlerStop
@@ -1721,11 +1727,11 @@ async def on_my_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if status in ("member", "administrator"):
         remember_group(cm.chat)
         log.info("Бот в группе %s, статус %s", cm.chat.id, status)
-        # Свежо добавили и чат ещё не одобрен — спрашиваем разрешение у владельца
+        # Свежо добавили и чат ещё не одобрен/не оплачен — нужна активация
         if old in ("left", "kicked") and CONFIG.get("require_approval", True) \
-                and cm.chat.id not in CONFIG.get("approved_chats", []):
+                and not chat_allowed(cm.chat.id):
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Разрешить", callback_data=f"appr:ok:{cm.chat.id}"),
+                [InlineKeyboardButton("✅ Разрешить (бесплатно)", callback_data=f"appr:ok:{cm.chat.id}"),
                  InlineKeyboardButton("🚫 Не разрешать", callback_data=f"appr:no:{cm.chat.id}")],
                 [InlineKeyboardButton("🚀 Быстрая настройка", callback_data="m:quick")],
             ])
@@ -1735,11 +1741,35 @@ async def on_my_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         oid,
                         f"🔔 Меня добавили в «{html.escape(cm.chat.title or str(cm.chat.id))}» "
                         f"(id <code>{cm.chat.id}</code>).\nКто добавил: {html.escape(mention(actor))}.\n\n"
-                        f"Пока не разрешишь — я в этом чате ничего не делаю. Нажми «✅ Разрешить», "
-                        f"затем «🚀 Быстрая настройка» — включишь защиту в пару касаний.",
+                        f"Пока не активируешь — я в этом чате ничего не делаю. «✅ Разрешить» — "
+                        f"бесплатный доступ. Либо группа сама оформит доступ за звёзды (/pro).",
                         reply_markup=kb, parse_mode="HTML")
                 except Exception as e:  # noqa: BLE001
                     log.debug("approval ask %s: %s", oid, e)
+            # Подсказка прямо в группе. Если положен пробный период — выдаём и сообщаем.
+            try:
+                prows = [[InlineKeyboardButton(f"{PRO_PLANS[k]['label']} — {PRO_PLANS[k]['stars']} ⭐",
+                                               callback_data=f"buyg:{cm.chat.id}:{k}")] for k in _PLAN_ORDER]
+                if grant_trial(cm.chat.id):
+                    days = int(CONFIG.get("trial_days", 3))
+                    await context.bot.send_message(
+                        cm.chat.id,
+                        f"👋 Я Channel Guard — антиспам и модерация.\n\n"
+                        f"🎁 Включён бесплатный доступ на {days} дн. — я уже работаю! Настройка: /panel.\n\n"
+                        f"Когда пробный период закончится, доступ можно продлить за звёзды ⭐ (кнопки ниже) "
+                        f"или его бесплатно продлит создатель бота.",
+                        reply_markup=InlineKeyboardMarkup(prows))
+                else:
+                    await context.bot.send_message(
+                        cm.chat.id,
+                        "👋 Я Channel Guard — антиспам и модерация.\n\n"
+                        "Чтобы я заработал в этом чате, нужна активация:\n"
+                        "• бесплатно — если меня одобрит создатель бота;\n"
+                        "• либо оформите доступ за звёзды Telegram ⭐ (кнопки ниже).\n\n"
+                        "Оформить может администратор группы.",
+                        reply_markup=InlineKeyboardMarkup(prows))
+            except Exception as e:  # noqa: BLE001
+                log.debug("activation notice %s: %s", cm.chat.id, e)
         elif old in ("left", "kicked"):
             # Чат уже разрешён (или допуск выключен) — сразу подсказываем быстрый старт
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Быстрая настройка", callback_data="m:quick")]])
@@ -2862,13 +2892,50 @@ def extend_pro(chat_id, days: int) -> float:
     return new
 
 
+def trial_until(chat_id) -> float:
+    return CONFIG.get("trials", {}).get(str(chat_id), 0)
+
+
+def trial_active(chat_id) -> bool:
+    return trial_until(chat_id) > time.time()
+
+
+def grant_trial(chat_id) -> bool:
+    """Выдать пробный доступ новой группе (один раз). True, если выдан."""
+    days = int(CONFIG.get("trial_days", 0) or 0)
+    if days <= 0 or str(chat_id) in CONFIG.get("trials", {}):
+        return False
+    if chat_id in CONFIG.get("approved_chats", []) or is_pro(chat_id):
+        return False
+    CONFIG.setdefault("trials", {})[str(chat_id)] = time.time() + days * 86400
+    save_config()
+    return True
+
+
+def access_status(chat_id):
+    """Возвращает (статус, ts_до): 'free' | 'paid' | 'trial' | 'none'."""
+    if chat_id in CONFIG.get("approved_chats", []):
+        return "free", 0
+    if is_pro(chat_id):
+        return "paid", pro_until(chat_id)
+    if trial_active(chat_id):
+        return "trial", trial_until(chat_id)
+    return "none", 0
+
+
 def _pro_status_line(chat_id) -> str:
-    until = pro_until(chat_id)
-    if until > time.time():
+    st, until = access_status(chat_id)
+    if st == "free":
+        return "✅ Доступ бесплатный (одобрено создателем)."
+    if st == "paid":
         d = datetime.fromtimestamp(until, _post_tz()).strftime("%d.%m.%Y")
         left = int((until - time.time()) / 86400)
-        return f"✅ «Профессиональный» активен до {d} (осталось ~{left} дн.)"
-    return "Активной подписки сейчас нет."
+        return f"💎 Оплачено — доступ активен до {d} (осталось ~{left} дн.)"
+    if st == "trial":
+        d = datetime.fromtimestamp(until, _post_tz()).strftime("%d.%m.%Y")
+        left = max(1, int((until - time.time()) / 86400 + 0.5))
+        return f"🎁 Пробный доступ до {d} (~{left} дн.). Дальше — оплата ⭐ или одобрение создателя."
+    return "🔒 Доступа нет. Оформите за ⭐ или попросите создателя одобрить."
 
 
 def tariff_text(chat_id, label: str) -> str:
@@ -2914,8 +2981,8 @@ async def on_successful_payment(update: Update, context: ContextTypes.DEFAULT_TY
             d = datetime.fromtimestamp(until, _post_tz()).strftime("%d.%m.%Y")
             title = CONFIG.get("groups", {}).get(cid, cid)
             await msg.reply_text(
-                f"✅ Оплата получена, спасибо! Тариф «Профессиональный» для «{title}» "
-                f"действует до {d}.")
+                f"✅ Оплата получена, спасибо! Доступ к боту для «{title}» активен до {d}. "
+                f"Защита и модерация включены — настройка в /panel.")
             await alert_owners(
                 context,
                 f"💎 Оплата ⭐{sp.total_amount}: «{title}» — {p['label']}. "
@@ -3885,11 +3952,20 @@ def approve_kb() -> InlineKeyboardMarkup:
     appr = set(CONFIG.get("approved_chats", []))
     for cid, title in sorted(CONFIG["groups"].items()):
         cid_i = int(cid)
-        label = title if len(title) <= 22 else title[:21] + "…"
+        label = title if len(title) <= 20 else title[:19] + "…"
         if cid_i in appr:
-            rows.append([InlineKeyboardButton(f"✅ {label}", callback_data=f"appr:no:{cid_i}")])
+            rows.append([InlineKeyboardButton(f"✅ {label} · бесплатно", callback_data=f"appr:no:{cid_i}")])
         else:
-            rows.append([InlineKeyboardButton(f"⛔ {label} — разрешить", callback_data=f"appr:ok:{cid_i}")])
+            st, until = access_status(cid_i)
+            if st == "paid":
+                d = datetime.fromtimestamp(until, _post_tz()).strftime("%d.%m")
+                tag = f"💎 оплачено до {d}"
+            elif st == "trial":
+                d = datetime.fromtimestamp(until, _post_tz()).strftime("%d.%m")
+                tag = f"🎁 пробный до {d}"
+            else:
+                tag = "⛔ нет доступа"
+            rows.append([InlineKeyboardButton(f"{label} · {tag} — разрешить", callback_data=f"appr:ok:{cid_i}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -3897,13 +3973,16 @@ def approve_kb() -> InlineKeyboardMarkup:
 def approve_menu_text() -> str:
     req = CONFIG.get("require_approval", True)
     n = len(CONFIG.get("approved_chats", []))
+    td = int(CONFIG.get("trial_days", 3))
     return (
         "🔐 Допуск чатов.\n\n"
         f"Требовать одобрение: {'включено' if req else 'выключено'}\n"
-        f"Разрешённых чатов: {n}\n\n"
-        "Когда включено, в новых группах бот молчит, пока ты не нажмёшь «разрешить». "
-        "✅ — чат разрешён (нажми, чтобы отозвать). ⛔ — нажми, чтобы разрешить.\n\n"
-        "Выключишь — бот будет работать во всех группах, куда его добавили."
+        f"Разрешённых бесплатно: {n} · пробный период новым: {td} дн.\n\n"
+        "Доступ к боту в группе даётся одним из способов:\n"
+        "✅ бесплатно — ты разрешил чат (навсегда);\n"
+        "🎁 пробный — новой группе автоматически на несколько дней;\n"
+        "💎 оплачено — группа оплатила звёздами.\n\n"
+        "Нажми на чат: ✅ — отозвать бесплатный доступ; остальные — разрешить бесплатно."
     )
 
 
@@ -5331,6 +5410,51 @@ async def weekly_digest_job(context):
             log.debug("digest %s: %s", cid, e)
 
 
+_expiry_notified = set()  # chat_id, по которым уже сообщили об окончании доступа
+
+
+async def maintenance_daily_job(context):
+    """Раз в сутки: авто-бэкап владельцу + напоминания об окончании доступа."""
+    for oid in ADMIN_IDS:
+        await send_backup(context, oid)
+    now = time.time()
+    seen = set(CONFIG.get("subscriptions", {}).keys()) | set(CONFIG.get("trials", {}).keys())
+    for cid_s in list(seen):
+        try:
+            cid = int(cid_s)
+        except ValueError:
+            continue
+        if cid in CONFIG.get("approved_chats", []):
+            continue  # бесплатный доступ — не напоминаем
+        st, until = access_status(cid)
+        title = CONFIG.get("groups", {}).get(cid_s, cid_s)
+        prows = [[InlineKeyboardButton(f"{PRO_PLANS[k]['label']} — {PRO_PLANS[k]['stars']} ⭐",
+                                       callback_data=f"buyg:{cid}:{k}")] for k in _PLAN_ORDER]
+        kb = InlineKeyboardMarkup(prows)
+        if st in ("paid", "trial") and 0 < (until - now) <= 3 * 86400:
+            left = max(1, int((until - now) / 86400 + 0.5))
+            word = "пробный доступ" if st == "trial" else "оплаченный доступ"
+            try:
+                await context.bot.send_message(
+                    cid, f"⏳ Через ~{left} дн. заканчивается {word} к боту. "
+                    "Продлите за звёзды ⭐, чтобы защита не отключилась:", reply_markup=kb)
+            except Exception:  # noqa: BLE001
+                pass
+            await alert_owners(context, f"⏳ «{title}»: {word} заканчивается через ~{left} дн.")
+            _expiry_notified.discard(cid_s)
+        elif st == "none":
+            had = CONFIG.get("subscriptions", {}).get(cid_s, 0) or CONFIG.get("trials", {}).get(cid_s, 0)
+            if had and cid_s not in _expiry_notified:
+                _expiry_notified.add(cid_s)
+                try:
+                    await context.bot.send_message(
+                        cid, "🔒 Доступ к боту закончился — работа в этом чате приостановлена. "
+                        "Продлите за звёзды ⭐ или попросите создателя одобрить:", reply_markup=kb)
+                except Exception:  # noqa: BLE001
+                    pass
+                await alert_owners(context, f"🔒 «{title}»: доступ закончился, бот приостановлен.")
+
+
 async def cmd_about(update, context):
     """Короткая визитка бота — доступно всем, в личке и в группе."""
     add_btn = await add_group_button(context)
@@ -6527,6 +6651,7 @@ def main():
         app.job_queue.run_repeating(weekly_digest_job, interval=7 * 86400, first=7 * 86400)
         app.job_queue.run_repeating(scheduled_posts_job, interval=60, first=15)  # публикация постов по расписанию
         app.job_queue.run_repeating(stats_flush_job, interval=120, first=120)  # сохранение статистики сообщений
+        app.job_queue.run_repeating(maintenance_daily_job, interval=86400, first=3600)  # бэкап + напоминания об оплате
     else:
         log.warning("JobQueue недоступен — авто-промо и запланированные посты работать не будут.")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
