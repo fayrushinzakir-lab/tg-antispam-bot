@@ -566,7 +566,20 @@ def cmd_level(chat_id, key: str) -> str:
     return chat_cfg(chat_id).get("cmd_perms", {}).get(key, CMD_DEFAULT.get(key, "admins"))
 
 
-async def can_moderate(context, chat_id: int, user_id: int, key: str = "ban") -> bool:
+def is_anon_admin(update) -> bool:
+    """True, если сообщение прислано анонимным администратором группы.
+    Так писать «от имени группы» может только админ, поэтому считаем это правом админа."""
+    msg = getattr(update, "effective_message", None)
+    chat = getattr(update, "effective_chat", None)
+    if msg is not None and chat is not None:
+        sc = getattr(msg, "sender_chat", None)
+        if sc is not None and getattr(sc, "id", None) == chat.id:
+            return True
+    u = getattr(update, "effective_user", None)
+    return bool(u is not None and getattr(u, "id", None) == 1087968824)  # GroupAnonymousBot
+
+
+async def can_moderate(context, chat_id: int, user_id: int, key: str = "ban", update=None) -> bool:
     if is_manager(user_id):
         return True
     if chat_cfg(chat_id)["moderation"].get("mod_admins_only"):
@@ -576,6 +589,8 @@ async def can_moderate(context, chat_id: int, user_id: int, key: str = "ban") ->
     level = cmd_level(chat_id, key)
     if level == "all":
         return True
+    if update is not None and is_anon_admin(update) and level == "admins":
+        return True  # анонимный админ = администратор группы
     if level == "owner":
         return user_id == await group_creator_id(context, chat_id)
     return user_id in await group_admin_ids(context, chat_id)  # admins
@@ -1628,6 +1643,9 @@ async def handle_join(context, chat, u):
     (в супергруппе вход по ссылке приходит именно как chat_member, без сервис-сообщения)."""
     if u is None or getattr(u, "is_bot", False):
         return
+    # запоминаем участника для призыва /all (даже если он ещё ничего не писал)
+    if u.id not in set(CONFIG["all_optout"].get(str(chat.id), [])):
+        members_store[chat.id][u.id] = u.first_name or u.username or str(u.id)
     if _join_seen(chat.id, u.id):
         return
     if is_blacklisted(chat.id, u):
@@ -1910,7 +1928,7 @@ async def _deny(update):
 async def _guard(update, context, key: str = "ban"):
     chat = update.effective_chat
     actor = update.effective_user
-    if not await can_moderate(context, chat.id, actor.id, key):
+    if not await can_moderate(context, chat.id, actor.id, key, update=update):
         return await _deny(update)
     tid, tname = await resolve_target(update, context)
     if not tid:
@@ -1932,7 +1950,7 @@ async def cmd_reload(update, context):
     # сбрасываем кэш ДО проверки прав, чтобы свеженазначенный админ тоже мог обновить
     _admin_cache.pop(chat.id, None)
     _creator_cache.pop(chat.id, None)
-    if not await can_moderate(context, chat.id, update.effective_user.id):
+    if not await can_moderate(context, chat.id, update.effective_user.id, update=update):
         return await _deny(update)
     await update.effective_message.reply_text("✅ Готово — список админов и права перечитаны.")
 
@@ -2301,7 +2319,7 @@ async def cmd_warns(update, context):
 async def cmd_stats(update, context):
     """Статистика по текущей группе."""
     chat = update.effective_chat
-    if not await can_moderate(context, chat.id, update.effective_user.id):
+    if not await can_moderate(context, chat.id, update.effective_user.id, update=update):
         return await _deny(update)
     s = stats_store.get(chat.id, {})
     active = len(members_store.get(chat.id, {}))
@@ -2374,7 +2392,7 @@ async def ensure_invite_link(context, chat_id, force=False):
 async def cmd_invite(update, context):
     """Выдать ссылку-приглашение в текущую группу (для админов)."""
     chat = update.effective_chat
-    if not await can_moderate(context, chat.id, update.effective_user.id):
+    if not await can_moderate(context, chat.id, update.effective_user.id, update=update):
         return await _deny(update)
     want_new = bool(context.args) and context.args[0].lower() in ("new", "новая")
     link = await ensure_invite_link(context, chat.id, force=want_new)
@@ -2388,7 +2406,7 @@ async def cmd_invite(update, context):
 async def cmd_zazyvala(update, context):
     """Опубликовать в группе сообщение с кнопкой «Пригласить друга»."""
     chat = update.effective_chat
-    if not await can_moderate(context, chat.id, update.effective_user.id):
+    if not await can_moderate(context, chat.id, update.effective_user.id, update=update):
         return await _deny(update)
     link = await ensure_invite_link(context, chat.id)
     if not link:
@@ -2428,7 +2446,7 @@ async def cmd_all(update, context):
     при этом доходят: они срабатывают в момент отправки сообщения с упоминанием.
     """
     chat = update.effective_chat
-    if not await can_moderate(context, chat.id, update.effective_user.id, "all"):
+    if not await can_moderate(context, chat.id, update.effective_user.id, "all", update=update):
         return await _deny(update)
     text = _args_text(update) or "Все сюда! 👀"
     optout = set(_optout_list(chat.id))
@@ -2490,7 +2508,7 @@ async def cmd_all(update, context):
 async def cmd_stopall(update, context):
     """Остановить идущий призыв /all."""
     chat = update.effective_chat
-    if not await can_moderate(context, chat.id, update.effective_user.id, "all"):
+    if not await can_moderate(context, chat.id, update.effective_user.id, "all", update=update):
         return await _deny(update)
     if _all_active.get(chat.id):
         _all_active[chat.id] = False
@@ -5557,7 +5575,7 @@ async def cmd_userid(update, context):
     chat = update.effective_chat
     # Ответ на сообщение — показываем автора (для админов/менеджеров)
     if msg.reply_to_message and msg.reply_to_message.from_user:
-        if not await can_moderate(context, chat.id, update.effective_user.id):
+        if not await can_moderate(context, chat.id, update.effective_user.id, update=update):
             return await msg.reply_text(
                 "Это для администрации: ответь на сообщение пользователя командой /userid.")
         u = msg.reply_to_message.from_user
@@ -5571,7 +5589,7 @@ async def cmd_userid(update, context):
             parse_mode="HTML")
     # Аргумент @user или id (для админов)
     if context.args:
-        if not await can_moderate(context, chat.id, update.effective_user.id):
+        if not await can_moderate(context, chat.id, update.effective_user.id, update=update):
             return await msg.reply_text("Это для администрации.")
         tid, tname = await resolve_target(update, context)
         if not tid:
@@ -6469,7 +6487,9 @@ async def _post_init(app: Application):
             BotCommand("me", "👤 Мои предупреждения/статус"),
             BotCommand("role", "👥 Выдать роль (ответом): /role Имя"),
             BotCommand("unrole", "Снять роли (ответом)"),
-            BotCommand("all", "📣 Позвать всех"),
+            BotCommand("all", "📣 Позвать всех: /all текст"),
+            BotCommand("stop", "⏹ Остановить призыв /all"),
+            BotCommand("top", "🏆 Топ активных участников"),
             BotCommand("say", "🗣 Сказать от имени бота"),
             BotCommand("group", "📜 Показать правила"),
             BotCommand("link", "🔗 Ссылка-приглашение"),
@@ -6586,6 +6606,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler(["zazyvala", "invitebtn"], cmd_zazyvala, filters=groups))
     app.add_handler(CommandHandler("all", cmd_all, filters=groups))
     app.add_handler(CommandHandler("stopall", cmd_stopall, filters=groups))
+    app.add_handler(CommandHandler("stop", cmd_stopall, filters=groups))
     app.add_handler(CommandHandler("anreg", cmd_anreg, filters=groups))
     app.add_handler(CommandHandler("reg", cmd_reg, filters=groups))
 
