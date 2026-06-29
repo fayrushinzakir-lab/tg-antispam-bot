@@ -5161,7 +5161,10 @@ async def _ensure_panel_target(update, context):
     if manager:
         allowed = list(CONFIG.get("groups", {}).keys())
         if not allowed:
-            return "nogroups", "", True
+            # Создателю всё равно показываем полную панель — без шага «добавить в группу».
+            # Группа не выбрана → правки идут в глобальный шаблон (его наследуют будущие группы).
+            context.user_data["cfg_target"] = "defaults"
+            return "manager", panel_target_label(context), True
     else:
         allowed = [cid for cid, _ in await user_admin_groups(context, uid)]
         if not allowed:
