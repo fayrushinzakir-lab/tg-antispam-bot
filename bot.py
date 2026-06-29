@@ -315,6 +315,19 @@ def _split_comma_triggers(d: dict) -> None:
     d["triggers"] = new
 
 
+def _force_all_admins_only(cfg: dict) -> None:
+    """Призыв /all нельзя открывать «всем» — переводим такой уровень в «админы»
+    (на верхнем уровне и в каждом чате)."""
+    def fix(d):
+        cp = d.get("cmd_perms")
+        if isinstance(cp, dict) and cp.get("all") == "all":
+            cp["all"] = "admins"
+    fix(cfg)
+    for ch in cfg.get("chats", {}).values():
+        if isinstance(ch, dict):
+            fix(ch)
+
+
 def load_config() -> dict:
     if os.path.exists(CONFIG_PATH):
         try:
@@ -331,6 +344,8 @@ def load_config() -> dict:
             for ch in cfg.get("chats", {}).values():
                 if isinstance(ch, dict):
                     _split_comma_triggers(ch)
+            # Призыв /all теперь строго для админов: если где-то стоял уровень «все» — поправим
+            _force_all_admins_only(cfg)
             return cfg
         except Exception as e:  # noqa: BLE001
             log.warning("Не прочитать %s: %s", CONFIG_PATH, e)
@@ -547,7 +562,7 @@ CMD_DEFS = [
     ("ban",  "🔨 Бан / кик / разбан",        ["admins", "owner"], "admins"),
     ("mute", "🔇 Мут / размут",              ["admins", "owner"], "admins"),
     ("warn", "⚠️ Предупреждения",            ["admins", "owner"], "admins"),
-    ("all",  "📣 Призыв /all",               ["all", "admins", "owner"], "admins"),
+    ("all",  "📣 Призыв /all",               ["admins", "owner"], "admins"),
     ("settings", "⚙️ Кто открывает настройки", ["admins", "owner"], "admins"),
 ]
 CMD_DEFAULT = {k: d for k, _, _, d in CMD_DEFS}
@@ -5162,19 +5177,12 @@ async def cmd_start(update, context):
     add_btn = await add_group_button(context)
     level, label, full = await _ensure_panel_target(update, context)
     if level == "manager":
-        kb = InlineKeyboardMarkup([
-            [add_btn],
-            [InlineKeyboardButton("🚀 Быстрая настройка", callback_data="m:quick")],
-            [InlineKeyboardButton("🛠 Открыть панель", callback_data="m:main")],
-            [InlineKeyboardButton("ℹ️ Помощь по настройкам", callback_data="m:help")],
-        ])
+        # Создателю сразу показываем полную панель — без шага «добавить в группу».
         await update.message.reply_text(
-            "👋 Привет! Я Channel Guard.\n\n"
-            "Добавь меня в группу администратором — буду чистить спам, защищать от сноса "
-            "и помогать с модерацией.\n\n"
-            "Проще всего: «➕ Добавить меня в группу», затем «🚀 Быстрая настройка» — "
-            "включишь защиту в пару касаний. Тонкие настройки — в «🛠 Открыть панель».",
-            reply_markup=kb)
+            "🛠 Панель управления Channel Guard\n\n"
+            "Ты создатель — тебе доступно всё. Выбирай раздел ниже. "
+            "Не знаешь, с чего начать — «🚀 Быстрая настройка». Бота ещё нет в группе — «➕ Добавить в группу».",
+            reply_markup=main_menu_kb(label, full=True))
     elif level == "groupadmin":
         kb = InlineKeyboardMarkup([
             [add_btn],
