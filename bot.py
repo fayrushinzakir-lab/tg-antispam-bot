@@ -27,9 +27,13 @@ Channel Guard Bot  —  версия 5
     пошутить; сам вбрасывает шутки и ставит эмодзи-реакции (панель → 🎭 Болталка).
     🧢 Гоп-режим: бот отвечает «по-пацански» и сам реагирует на слова-триггеры
     («слышь», «чё каво», «семки»…) — включается там же.
-    🎮 Игры и приколы: кубик/дартс/баскет (настоящие Dice), «пицца или суши?»,
-    «кто самый …?» (выбор из участников), шар предсказаний, поздравления с ДР,
-    юбилеи каждой 1000-й записи и память короткого диалога.
+    🎮 Игры и приколы: кубик/дартс/баскет (настоящие Dice), камень-ножницы-бумага,
+    «пицца или суши?», «кто самый …?» (из участников), число от X до Y, факты,
+    цитаты, комплименты и добрые подколы, шуточный гороскоп, шар предсказаний,
+    «доброе утро, чат» после тишины, поздравления с ДР, юбилеи каждой 1000-й
+    записи и память короткого диалога.
+    🤖 ИИ-ответы (опционально): задай AI_API_KEY (OpenAI-совместимый API) — и бот
+    будет живо болтать на любые темы в выбранном стиле; без ключа работает офлайн.
   • Мат-фильтр из коробки: нецензурные слова во «втором списке» — за каждое
     предупреждение, три предупреждения → бан (настраивается в панели).
 
@@ -48,6 +52,8 @@ import io
 import asyncio
 import random
 import logging
+
+import httpx  # идёт в комплекте с python-telegram-bot
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
@@ -90,6 +96,15 @@ ADMIN_IDS = {
 
 DATA_DIR = os.environ.get("DATA_DIR") or ("/data" if os.path.isdir("/data") else ".")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+
+# ── Необязательный ИИ для болталки (любой OpenAI-совместимый API) ──
+# Задай переменные окружения — и в панели болталки появится рабочий тумблер «🤖 ИИ-ответы»:
+#   AI_API_KEY  — ключ (OpenAI / OpenRouter / Groq / DeepSeek / локальный Ollama…)
+#   AI_BASE_URL — базовый URL API (по умолчанию https://api.openai.com/v1)
+#   AI_MODEL    — модель (по умолчанию gpt-4o-mini)
+AI_API_KEY = os.environ.get("AI_API_KEY", "").strip()
+AI_BASE_URL = (os.environ.get("AI_BASE_URL", "https://api.openai.com/v1") or "").rstrip("/")
+AI_MODEL = os.environ.get("AI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
 
 # ───────────────────────────────────────────────────────────────────────────
 #  ВСТРОЕННЫЙ МАТ-ФИЛЬТР (второй список слов: пред → 3 преда → бан)
@@ -158,7 +173,8 @@ DEFAULT_CONFIG = {
         "smart_replies": True,    # понимать настроение обращения (привет/спасибо/пошути…)
         "reactions": True,        # изредка ставить эмодзи-реакции на сообщения
         "reaction_chance": 8,     # шанс реакции, %
-        "fun": True,              # игры и приколы: кубик/дартс, «или», «кто», шар, юбилеи
+        "fun": True,              # игры и приколы: кубик/дартс, КНБ, «или», «кто», шар, юбилеи
+        "ai": False,              # 🤖 ИИ-ответы на обращения (нужен AI_API_KEY в окружении)
         # 🧢 Гоп-режим: бот отвечает «по-пацански»; на слова-триггеры реагирует сам,
         # даже без обращения к нему. Синтаксис слов — как у стоп-слов (можно со *).
         "gopnik": False,
@@ -1637,6 +1653,8 @@ async def maybe_send_trigger(update, context, text):
 # ── «мозги» болталки: банки ответов, память диалога, игры ──────────────────
 _chatter_dialog: dict = {}   # (chat_id, user_id) -> ts последнего ответа бота человеку
 _chatter_said: dict = {}     # chat_id -> последняя сказанная фраза (антиповтор)
+_chat_log: dict = defaultdict(lambda: deque(maxlen=12))  # chat_id -> (имя, текст) для ИИ
+_chat_daymark: dict = {}     # chat_id -> ts последнего сообщения (для «доброе утро, чат»)
 
 _CHATTER_BANKS = {
     "greet": [
@@ -1767,6 +1785,85 @@ _CHATTER_BANKS = {
         "{Привет|Салют|Йо}! Я на месте ✋",
         "Весь во внимании, {name} 🙂",
     ],
+    "gm": [
+        "Доброе утро, чат! ☀️ Первый на связи — держите заряд бодрости 🔋",
+        "Просыпаемся! 🌅 Кофе, улыбка — и погнали ☕",
+        "С добрым утром всех! Пусть день будет отличным 🙌",
+    ],
+    "fact": [
+        "У осьминога три сердца 💙💙💙",
+        "Мёд может храниться тысячи лет и не портиться 🍯",
+        "Сердце синего кита — размером с автомобиль 🐋",
+        "Бананы — это ягоды, а клубника — нет 🍌",
+        "Молния в несколько раз горячее поверхности Солнца ⚡",
+        "Кошки спят примерно 70% жизни 🐱",
+        "Эйфелева башня летом чуть выше — металл расширяется 🗼",
+        "Акулы появились на Земле раньше деревьев 🦈",
+        "Горячая вода может замёрзнуть быстрее холодной — эффект Мпембы ❄️",
+        "Сердце креветки находится у неё в голове 🦐",
+        "Отпечаток языка уникален, как отпечаток пальца 👅",
+        "Улитка может спать до трёх лет 🐌",
+        "Глаз страуса больше его мозга 🙈",
+        "У морской звезды нет мозга — и ничего, живёт ⭐",
+        "Ради банки мёда пчёлы облетают миллионы цветков 🐝",
+        "Венера вращается в другую сторону, чем большинство планет 🪐",
+        "Кости человека прочнее бетона той же массы 🦴",
+        "Арахис — не орех, а боб 🥜",
+        "Пингвин делает предложение, даря камушек 🐧💍",
+        "На Юпитере и Сатурне возможны дожди из алмазов 💎",
+        "За жизнь человек проходит пешком расстояние в несколько экваторов 🚶",
+        "Медузы существуют дольше динозавров 🪼",
+        "В Японии есть остров, где хозяйничают кролики 🐰",
+        "Секунда для спутников GPS идёт чуть иначе — привет, Эйнштейн 🛰",
+    ],
+    "quote": [
+        "Лучший день для старта — сегодня. Второй лучший — тоже сегодня 😄",
+        "Делай, как можешь: это всегда лучше, чем не делать вовсе 💪",
+        "Большие дела начинаются с маленького «ну ладно, попробую» 🚀",
+        "Улыбка — бесплатно, а работает лучше многих платных фич 🙂",
+        "Не сравнивай себя со вчерашними другими. Сравни со вчерашним собой 📈",
+        "Ошибся — значит попробовал. Это уже победа над диваном 🏆",
+        "Хочешь изменить мир — начни с чата: напиши что-то доброе 💬❤️",
+        "Терпение + интернет = можно научиться почти всему 🌐",
+        "Сложное — это простое, которое ещё не разложили по шагам 🧩",
+        "Отдых — тоже часть плана. Даже боты перезагружаются 😉",
+        "Мечта без дедлайна — сон. Поставь дату — станет целью 🗓",
+        "Окружай себя теми, с кем хочется быть лучше. Например, этим чатом 😄",
+        "Маленький шаг каждый день обгоняет большой рывок раз в год 🐾",
+        "Если страшно начинать — начни страшно. Потом поправим 😅",
+    ],
+    "compl": [
+        "{who}, у тебя отличное чувство юмора 😄",
+        "{who} — украшение этого чата ✨",
+        "С {who} даже баги веселее 🐞",
+        "{who}, твоя энергия заряжает чат 🔋",
+        "Будь тут топ приятных людей, {who} был(а) бы в первой строчке 🏆",
+        "{who}, ты как хороший Wi-Fi: с тобой всё ловит 📶",
+        "Улыбку {who} видно даже через текст 🙂",
+        "{who}, звёзды сегодня явно за тебя ✨",
+        "{who} умеет поднять настроение одним сообщением 💬❤️",
+        "Будь {who} функцией — её вызывали бы чаще всех 😄",
+        "{who} — редкий экземпляр в самом хорошем смысле 🦄",
+        "{who}, респект просто за то, что ты есть 🤝",
+    ],
+    "roast": [
+        "{who}, ты печатаешь быстрее, чем думаешь. И это талант 😄",
+        "{who} — единственный человек, который может лагать без интернета 😅",
+        "У {who} стиль «загадка»: сначала пишет, потом думает 🤔😄",
+        "{who}, будь лень спортом — у тебя золото 🥇 (любя!)",
+        "{who} гуглит «как гуглить» 🔍😆",
+        "Клавиатура {who} давно просит выходной 😅",
+        "{who}, твой будильник тебя побаивается ⏰",
+        "{who} читает чат мгновенно, а отвечает через полдня 😄",
+        "{who} превращает «щас приду» в квест на три часа 🕒",
+        "Даже автозамена сдаётся, когда пишет {who} 📝😆",
+        "{who} не опаздывает — просто живёт в своём часовом поясе 🌍",
+        "{who} способен уснуть, пока грузится мем 😴",
+    ],
+    "rps_draw": ["{be} {bot}! Ничья 🤝 Ещё раз?", "Оба выбрали {bot} 🤝 Это судьба."],
+    "rps_bot": ["{be} {bot}! Моя победа 😎 Реванш?", "{be} {bot} бьёт твой выбор 🏆 Я хорош!"],
+    "rps_user": ["{be} {bot}… Ты победил(а) 🏆 Уважение!", "{be} {bot} — и я проиграл 😅 Красиво!"],
+    "num": ["🎲 Выпало: {n}!", "Мой генератор говорит: {n} ✨", "{n} — запомни это число 😉"],
     "jokes": [
         "Почему программисты путают Хэллоуин и Рождество? Потому что OCT 31 == DEC 25 🎃🎄",
         "Я бы рассказал шутку про UDP, но не уверен, что она до вас дойдёт 😏",
@@ -1917,6 +2014,26 @@ _GOP_BANKS = {
         "Опа, слова с района! Уважаю 🗿",
         "Держи краба, {name} 🦀🤝",
     ],
+    "gm": [
+        "Подъём, пацаны! ☀️ Район сам себя не разбудит 😎",
+        "С добрым, братва! Семки к завтраку 🌻",
+    ],
+    "compl": [
+        "{who} — чёткий, отвечаю 💯",
+        "{who}, ты вообще топ, без базара 🤜🤛",
+        "С {who} хоть в разведку 😎",
+        "{who} держит чат ровно 🗿",
+    ],
+    "roast": [
+        "{who}, ты чё такой медленный? Черепаха с района быстрее 🐢😄",
+        "{who}, семки роняешь, братишка 🌻😅",
+        "У {who} интернет — как у бабушки на даче 📶😆",
+        "{who}, любя говорю: ты уникум 🗿",
+    ],
+    "rps_draw": ["{be} {bot}! Ничья, брат 🤝 Ещё катку?"],
+    "rps_bot": ["{be} {bot}! Забрал 😎 Реванш, если не боишься?"],
+    "rps_user": ["{be} {bot}… Твоя взяла, красавчик 🏆"],
+    "num": ["{n}, отвечаю 🎲", "Чисто {n} 💯"],
     "jokes": [
         "Так, пацаны, кто тут без меня чётко сидит? 😎",
         "Минутка с района: этот чат — сила 💪",
@@ -1940,6 +2057,56 @@ def _daypart() -> str:
     if 17 <= h <= 22:
         return "evening"
     return "night"
+
+
+_SIGNS = [(("овен", "овн"), "Овен ♈"), (("телец", "тельц"), "Телец ♉"),
+          (("близнец",), "Близнецы ♊"), (("рак",), "Рак ♋"), (("лев", "льв"), "Лев ♌"),
+          (("дев",), "Дева ♍"), (("весы", "весов", "весам"), "Весы ♎"),
+          (("скорпион",), "Скорпион ♏"), (("стрел",), "Стрелец ♐"),
+          (("козерог",), "Козерог ♑"), (("водоле",), "Водолей ♒"), (("рыб",), "Рыбы ♓")]
+
+
+def _horo(low: str) -> str:
+    """Шуточный гороскоп-генератор: миллион комбинаций из кусочков."""
+    sign = next((d for ks, d in _SIGNS if any(k in low for k in ks)), "Твой знак 🌟")
+    a1 = random.choice(["Сегодня", "Уже завтра", "На этой неделе", "В ближайшие часы"])
+    b1 = random.choice(["звёзды", "нейросети", "кофейная гуща", "семки во дворе", "спутники"])
+    c1 = random.choice(["обещают тебе", "намекают на", "сулят", "шепчут про"])
+    d1 = random.choice(["удачу 🍀", "интересную встречу ✨", "вкусный обед 🍕",
+                        "рост кармы 📈", "приятное сообщение 💌", "маленькое приключение 🎒",
+                        "лишний час сна 😴", "неожиданный комплимент 🥰"])
+    e1 = random.choice(["Совет:", "Лайфхак:", "Главное:"])
+    f1 = random.choice(["не спорь с ботом 😄", "позови друга в чат 😉", "улыбнись первым 🙂",
+                        "сделай паузу на чай ☕", "доверься интуиции 🔮", "почисти уведомления 📵"])
+    return f"🔮 {sign}. {a1} {b1} {c1} {d1} {e1} {f1}"
+
+
+_AI_PERSONA = ("Ты — весёлый и дружелюбный бот-модератор Telegram-группы. Отвечай кратко "
+               "(1–2 предложения), по-русски, живо, с лёгким юмором и уместными эмодзи. "
+               "Без мата, грубости и выдуманных фактов о людях.")
+_AI_PERSONA_GOP = ("Ты — добродушный «гопник с района» в Telegram-чате: сленг вроде «слышь», "
+                   "«чё каво», «братишка», «по фактам», любишь семки, НО без мата и без "
+                   "агрессии — всё по-доброму и смешно. Отвечай кратко, по-русски, с эмодзи.")
+
+
+async def _ai_reply(chat_id: int, user_name: str, text: str, gop: bool):
+    """Живой ответ внешнего ИИ (OpenAI-совместимый API) с контекстом последних сообщений."""
+    hist = list(_chat_log[chat_id])[:-1][-8:]
+    msgs = [{"role": "system", "content": _AI_PERSONA_GOP if gop else _AI_PERSONA}]
+    for nm, tx in hist:
+        msgs.append({"role": "user", "content": f"{nm}: {tx}"})
+    msgs.append({"role": "user", "content": f"{user_name}: {text[:400]}"})
+    payload = {"model": AI_MODEL, "messages": msgs, "max_tokens": 160, "temperature": 0.9}
+    async with httpx.AsyncClient(timeout=12) as cl:
+        r = await cl.post(AI_BASE_URL + "/chat/completions", json=payload,
+                          headers={"Authorization": f"Bearer {AI_API_KEY}"})
+        r.raise_for_status()
+        data = r.json()
+    try:
+        ans = (data["choices"][0]["message"]["content"] or "").strip()
+    except (KeyError, IndexError, TypeError):
+        return None
+    return ans[:500] or None
 
 
 def _chatter_mood(low: str):
@@ -1996,6 +2163,11 @@ async def maybe_chatter(update, context, cfg=None):
         return  # команды не комментируем
     low = _norm(text.lower())
     name = (getattr(user, "first_name", None) or "друг").strip()[:32]
+    now0 = time.time()
+    prev_msg = _chat_daymark.get(chat.id, 0.0)
+    _chat_daymark[chat.id] = now0
+    if text:
+        _chat_log[chat.id].append((name, text[:200]))
     gop = bool(ch.get("gopnik"))
     fun = ch.get("fun", True)
     smart = ch.get("smart_replies", True)
@@ -2041,6 +2213,22 @@ async def maybe_chatter(update, context, cfg=None):
         q = re.sub(r"^\s*бот\w*[\s,!?.:)]*", "", q).strip()
 
         if fun:
+            toks = set(re.findall(r"\w+", low))
+            # 🎮 камень-ножницы-бумага
+            rps = {"камень": "✊", "ножницы": "✌️", "бумага": "✋"}
+            uch = next((t for t in ("камень", "ножницы", "бумага") if t in toks), None)
+            if uch is None and "кнб" in toks:
+                uch = random.choice(list(rps))
+            if uch:
+                bch = random.choice(list(rps))
+                beats = {"камень": "ножницы", "ножницы": "бумага", "бумага": "камень"}
+                pool = (bank("rps_draw") if bch == uch
+                        else bank("rps_bot") if beats[bch] == uch else bank("rps_user"))
+                try:
+                    await _say(pool, be=rps[bch], bot=bch)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("rps: %s", e)
+                return
             # 🎮 орёл/решка
             if has("монетк", "орел или решка"):
                 try:
@@ -2059,6 +2247,15 @@ async def maybe_chatter(update, context, cfg=None):
                     except Exception as e:  # noqa: BLE001
                         log.debug("dice: %s", e)
                     return
+            # 🎮 случайное число: «бот, число от 1 до 100»
+            m_num = re.search(r"числ\w*\s+(?:от\s+)?(-?\d+)\s+(?:до\s+)?(-?\d+)", low)
+            if m_num:
+                a1, b1 = sorted((int(m_num.group(1)), int(m_num.group(2))))
+                try:
+                    await _say(bank("num"), n=random.randint(a1, b1))
+                except Exception as e:  # noqa: BLE001
+                    log.debug("num: %s", e)
+                return
             # 🎮 выбор: «пицца или суши?»
             if " или " in q:
                 parts = [p.strip(" ?!.,;—-") for p in re.split(r"\sили\s", q)]
@@ -2070,7 +2267,6 @@ async def maybe_chatter(update, context, cfg=None):
                         log.debug("choice: %s", e)
                     return
             # 🎮 «кто самый …?» — выбираем случайного участника чата
-            toks = set(re.findall(r"\w+", low))
             if ({"кто", "кого", "кому"} & toks) and not has("кто ты", "ты кто"):
                 names = list((CONFIG.get("msg_stats", {}).get(str(chat.id), {})
                               .get("names", {}) or {}).values())
@@ -2082,6 +2278,53 @@ async def maybe_chatter(update, context, cfg=None):
                 except Exception as e:  # noqa: BLE001
                     log.debug("who: %s", e)
                 return
+            # 🧠 интересный факт
+            if {"факт", "факты", "фактик"} & toks:
+                try:
+                    await _say(bank("fact"))
+                except Exception as e:  # noqa: BLE001
+                    log.debug("fact: %s", e)
+                return
+            # 📜 цитата / мудрость дня
+            if any(t.startswith("цитат") for t in toks) or "мудрост" in low:
+                try:
+                    await _say(bank("quote"))
+                except Exception as e:  # noqa: BLE001
+                    log.debug("quote: %s", e)
+                return
+            # 💐 комплимент (себе или тому, на кого реплай)
+            if "комплимент" in low:
+                tgt = None
+                r2 = getattr(msg, "reply_to_message", None)
+                if r2 is not None and getattr(r2, "from_user", None) is not None \
+                        and not getattr(r2.from_user, "is_bot", False):
+                    tgt = (getattr(r2.from_user, "first_name", "") or "").strip()[:32]
+                try:
+                    await _say(bank("compl"), who=tgt or name)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("compl: %s", e)
+                return
+            # 🌶 добрый подкол
+            if has("подколи", "поругай", "прожарь", "зажарь", "подкол про"):
+                tgt = None
+                r2 = getattr(msg, "reply_to_message", None)
+                if r2 is not None and getattr(r2, "from_user", None) is not None \
+                        and not getattr(r2.from_user, "is_bot", False):
+                    tgt = (getattr(r2.from_user, "first_name", "") or "").strip()[:32]
+                try:
+                    await _say(bank("roast"), who=tgt or name)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("roast: %s", e)
+                return
+            # 🔮 шуточный гороскоп
+            if "гороскоп" in low:
+                try:
+                    line = _horo(low)
+                    _chatter_said[chat.id] = line
+                    await msg.reply_text(line)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("horo: %s", e)
+                return
             # 🎮 шар предсказаний: «стоит ли…?», «да или нет»
             if has("стоит ли", "надо ли", "нужно ли", "можно ли", "будет ли",
                    "правда ли", "получится ли", "да или нет", "магическ", "шар предсказ"):
@@ -2089,6 +2332,21 @@ async def maybe_chatter(update, context, cfg=None):
                     await _say(bank("ball"))
                 except Exception as e:  # noqa: BLE001
                     log.debug("ball: %s", e)
+                return
+
+        # 🤖 ИИ-ответ на любое обращение (если задан ключ и включено в панели)
+        if ch.get("ai") and AI_API_KEY and _throttle(("ai", chat.id), 6.0):
+            ans = None
+            try:
+                ans = await _ai_reply(chat.id, name, text, gop)
+            except Exception as e:  # noqa: BLE001
+                log.debug("ai: %s", e)
+            if ans and not check_word_lists(ans, cfg):  # свой же мат-фильтр — и для ИИ
+                _chatter_said[chat.id] = ans
+                try:
+                    await msg.reply_text(ans[:900])
+                except Exception as e:  # noqa: BLE001
+                    log.debug("ai send: %s", e)
                 return
 
         mood = _chatter_mood(low) if smart else None
@@ -2110,7 +2368,16 @@ async def maybe_chatter(update, context, cfg=None):
             log.debug("chatter reply: %s", e)
         return
 
-    # ── 2) Без обращения: поздравление с днём рождения (не чаще раза в 6 часов) ──
+    # ── 2) Без обращения: «доброе утро, чат» после долгой тишины ──
+    if fun and prev_msg and (now0 - prev_msg) > 6 * 3600 and _daypart() == "morning" \
+            and _throttle(("gm", chat.id), 20 * 3600):
+        try:
+            await _say(bank("gm"))
+        except Exception as e:  # noqa: BLE001
+            log.debug("gm: %s", e)
+        return
+
+    # ── 3) Поздравление с днём рождения (не чаще раза в 6 часов) ──
     if smart and (has("день рождения", "днюх") or re.search(r"\bс\s+др\b", low)):
         if _throttle(("bday", chat.id), 6 * 3600):
             try:
@@ -2119,7 +2386,7 @@ async def maybe_chatter(update, context, cfg=None):
                 log.debug("bday: %s", e)
             return
 
-    # ── 3) 🧢 Гоп-режим: реагируем на слова-триггеры даже без обращения ──
+    # ── 4) 🧢 Гоп-режим: реагируем на слова-триггеры даже без обращения ──
     if gop:
         for w in (ch.get("gop_words") or []):
             rx = _word_pattern(str(w))
@@ -2132,7 +2399,7 @@ async def maybe_chatter(update, context, cfg=None):
                     return
                 break  # слово есть, но кулдаун — идём дальше (юбилей/шутка/реакция)
 
-    # ── 4) 🎉 Юбилей сообщений (каждое 1000-е) ──
+    # ── 5) 🎉 Юбилей сообщений (каждое 1000-е) ──
     if fun:
         total = int(CONFIG.get("msg_stats", {}).get(str(chat.id), {}).get("total", 0) or 0)
         if total and total % 1000 == 0 and _throttle(("mile", chat.id, total), 10 ** 9):
@@ -2142,7 +2409,7 @@ async def maybe_chatter(update, context, cfg=None):
                 log.debug("milestone: %s", e)
             return
 
-    # ── 5) Случайная шутка «по приколу» ──
+    # ── 6) Случайная шутка «по приколу» ──
     chance = int(ch.get("chance", 5) or 0)
     if chance and random.randint(1, 100) <= chance and _throttle(
             ("chatter", chat.id), max(30, int(ch.get("cooldown", 180) or 180))):
@@ -2156,7 +2423,7 @@ async def maybe_chatter(update, context, cfg=None):
                 log.debug("chatter: %s", e)
             return
 
-    # ── 6) Тихая эмодзи-реакция на сообщение ──
+    # ── 7) Тихая эмодзи-реакция на сообщение ──
     rch = int(ch.get("reaction_chance", 8) or 0)
     if ch.get("reactions", True) and rch and random.randint(1, 100) <= rch \
             and _throttle(("chreact", chat.id), 45.0):
@@ -4305,6 +4572,9 @@ def chatter_kb(cfg) -> InlineKeyboardMarkup:
          InlineKeyboardButton(f"🎯 {ch.get('reaction_chance', 8)}%", callback_data="cht:rchance")],
         [InlineKeyboardButton(f"{onoff(ch.get('fun', True))} 🎮 Игры и приколы (кубик, «или», «кто», шар)",
                               callback_data="cht:fun")],
+        [InlineKeyboardButton(
+            f"{onoff(ch.get('ai'))} 🤖 ИИ-ответы" + ("" if AI_API_KEY else " (нет ключа)"),
+            callback_data="cht:ai")],
         [InlineKeyboardButton(f"{onoff(ch.get('gopnik'))} 🧢 Гоп-режим (отвечает по-пацански)",
                               callback_data="cht:gop")],
         [InlineKeyboardButton("➕ Шутка", callback_data="add:chphrase"),
@@ -4331,9 +4601,14 @@ def chatter_menu_text(cfg, label) -> str:
             "«как дела», спасибо, просьбу пошутить и даже подколы;\n"
             "• с заданным шансом вбрасывает шутку (не чаще паузы) и изредка ставит "
             "эмодзи-реакции 🔥😁 на сообщения.\n"
-            "🎮 Игры: «бот, кинь кубик/дартс/баскет», «бот, пицца или суши?», "
-            "«бот, кто самый умный?» (выберет из участников), «бот, стоит ли…?» — шар "
-            "предсказаний; плюс поздравления с ДР и юбилеи каждой 1000-й записи.\n"
+            "🎮 Игры: кубик/дартс/баскет (Dice), камень-ножницы-бумага, «пицца или суши?», "
+            "«кто самый…?», «число от 1 до 100», факт, цитата, комплимент, «подколи» "
+            "(добрый), гороскоп, шар «стоит ли…?»; «доброе утро, чат» после тишины, "
+            "поздравления с ДР и юбилеи каждой 1000-й записи.\n"
+            "🤖 ИИ-ответы: живой разговор на любые темы через внешний API. Задай на сервере "
+            "AI_API_KEY (подойдут OpenAI/OpenRouter/Groq/DeepSeek/Ollama; опционально "
+            "AI_BASE_URL и AI_MODEL) — и включай тумблер. Стиль ИИ следует гоп-режиму, "
+            "мат-фильтр действует и на него. Без ключа всё работает офлайн.\n"
             "🧢 Гоп-режим: бот говорит «по-пацански» и сам отзывается на слова-триггеры "
             "(«слышь», «чё каво», «семки»…) — свои триггеры добавляются кнопкой ниже.\n"
             "Свои фразы — по одной на строку, работает {рандомизация|вариантов}.\n"
@@ -5083,6 +5358,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ch["gopnik"] = not ch.get("gopnik")
         elif k == "fun":
             ch["fun"] = not ch.get("fun", True)
+        elif k == "ai":
+            ch["ai"] = not ch.get("ai")
         save_config()
         return await _render_menu(query, context, "m:chatter")
     if data.startswith("dgp:"):
