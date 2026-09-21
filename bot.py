@@ -1,10 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Channel Guard Bot  —  версия 6 («всё в одном»)
+Channel Guard Bot  —  версия 6.1 («всё в одном»)
 ================================================
 Антиспам + автоответы (текст/медиа/кнопки) + панель в ЛС + модерация + капча +
 приветствие + привлечение (промо, рассылки, посты по расписанию) + роли +
 анти-снос/анти-рейд + оплата звёздами Telegram.
+
+Что нового в v6.1:
+  • Магазин 2.0: товар добавляется пошаговым мастером с кнопками (название → цена →
+    описание → фото → способ выдачи → предпросмотр), любой товар редактируется карточкой.
+  • Заказ уходит продавцу СРАЗУ, как только покупатель нажал «Купить»; после оплаты
+    карточка обновляется. Кнопки продавца: ✅ выполнен, ❌ отменить (с возвратом звёзд).
+  • Бесплатные товары = заявки: покупатель оставляет заявку с комментарием, продавец получает её.
+  • Выдача после оплаты: один текст всем, 🎲 случайный вариант, 🔑 уникальные коды со склада
+    (случайный из оставшихся, остаток виден в витрине), либо вручную продавцом.
+  • 🎲 Рандом: /random 100, /random 5 50, /random а, б, в — и 🎉 розыгрыши в группах:
+    /random Приз | победителей | 1д, кнопка «Участвовать», авто-итоги, /reroll, /gwend.
+  • Витрина Mini App: плитки с фото, карточка товара, комментарий продавцу, нативная кнопка.
+  • /orders — покупатель видит свои заказы и их статусы.
 
 Что нового в v6:
   • Панель из 6 разделов-хабов: 🛡 Защита, ⚖️ Модерация, 💬 Общение, 📮 Посты,
@@ -347,7 +360,9 @@ DEFAULT_CONFIG = {
     # Служебное состояние, переживающее перезапуск (метки рассылок, ожидания капчи, мягкие муты)
     # Магазин Mini App: свои товары (тариф PRO для группы добавляется автоматически)
     # items: [{"id","title","desc","stars","deliver","enabled"}]
-    "shop": {"enabled": False, "title": "Магазин", "items": []},
+    "shop": {"enabled": False, "title": "Магазин", "items": [], "notify": [], "seq": 0},
+    # Розыгрыши в группах: {id: {chat, mid, prize, winners, ends, parts, names, status, won}}
+    "giveaways": {},
     "shop_orders": [],
     "runtime": {},
     "pending": {},
@@ -4216,6 +4231,15 @@ async def handle_buy_group_press(update: Update, context: ContextTypes.DEFAULT_T
 
 async def on_pre_checkout(update: Update, context):
     q = update.pre_checkout_query
+    parts = (q.invoice_payload or "").split(":")
+    if len(parts) == 2 and parts[0] == "sho":
+        o = _find_order(parts[1])
+        if o and o.get("status") in ("canceled", "refunded", "done"):
+            try:
+                await q.answer(ok=False, error_message="Этот заказ уже закрыт — оформи новый в магазине.")
+            except Exception:  # noqa: BLE001
+                pass
+            return
     try:
         await q.answer(ok=True)
     except Exception as e:  # noqa: BLE001
@@ -4226,6 +4250,8 @@ async def on_successful_payment(update: Update, context):
     sp = update.effective_message.successful_payment
     payload = sp.invoice_payload or ""
     parts = payload.split(":")
+    if len(parts) == 2 and parts[0] == "sho":
+        return await _shop_paid_order(update, context, sp, parts[1])
     if len(parts) == 4 and parts[0] == "shop":
         return await _shop_paid(update, context, sp, parts)
     if len(parts) == 3 and parts[0] == "pro":
@@ -4337,6 +4363,10 @@ async def minute_tick(context):
         except Exception as e:  # noqa: BLE001
             log.warning("tick %s: %s", fn.__name__, e)
     try:
+        await _tick_giveaways(context)
+    except Exception as e:  # noqa: BLE001
+        log.warning("tick giveaways: %s", e)
+    try:
         await _tick_scheduled(context)
     except Exception as e:  # noqa: BLE001
         log.warning("tick scheduled: %s", e)
@@ -4378,6 +4408,7 @@ async def janitor_job(context):
     pf = _rt().setdefault("post_fired", {})
     for pid in [p for p in pf if p not in alive]:
         pf.pop(pid, None)
+    await _shop_janitor(context)
 
 
 async def weekly_digest_job(context):
@@ -5282,7 +5313,7 @@ PANEL_PARENT = {
     "m:mod": "m:h_mod", "m:roles": "m:h_mod", "m:gmgr": "m:h_mod", "m:cmdperms": "m:h_mod",
     "m:blacklist": "m:h_mod", "m:staff": "m:h_mod",
     "m:triggers": "m:h_talk", "m:chatter": "m:h_talk", "m:welcome": "m:h_talk",
-    "m:rules": "m:h_talk", "m:lang": "m:h_talk",
+    "m:rules": "m:h_talk", "m:lang": "m:h_talk", "m:gw": "m:h_talk",
     "m:recurring": "m:h_posts", "m:promo": "m:h_posts", "m:sched": "m:h_posts",
     "m:access": "m:h_sys", "m:backup": "m:h_sys", "m:other": "m:h_sys", "m:approve": "m:h_sys",
 }
@@ -5380,6 +5411,7 @@ def hub_talk(cfg, label, mgr):
         (f"{onoff((cfg.get('welcome') or {}).get('enabled'))} 👋 Приветствие", "m:welcome"),
         ("📜 Правила", "m:rules"),
         (f"🌐 Язык новичков: {cfg.get('lang', 'ru')}", "m:lang"),
+        ("🎉 Розыгрыши и рандом", "m:gw"),
     ]
     text = (f"💬 Общение · {label}\n\n"
             "Автоответы, болталка с играми, приветствие новичков и правила.")
@@ -5444,12 +5476,22 @@ def _shop_status() -> str:
 
 def shop_kb() -> InlineKeyboardMarkup:
     s = CONFIG.get("shop") or {}
+    open_n = sum(1 for o in CONFIG.get("shop_orders") or [] if o.get("status") in ("new", "paid"))
     rows = [[InlineKeyboardButton(f"{onoff(s.get('enabled'))} Магазин открыт", callback_data="shp:tgl")],
-            [InlineKeyboardButton("➕ Товар", callback_data="add:shopitem"),
-             InlineKeyboardButton("✏️ Название", callback_data="add:shoptitle")]]
-    for i, it in enumerate((s.get("items") or [])[:30]):
-        rows.append([InlineKeyboardButton(f"❌ {it.get('title', '?')[:28]} · {it.get('stars', 0)}⭐",
-                                          callback_data=f"dsi:{i}")])
+            [InlineKeyboardButton("➕ Добавить товар", callback_data="add:shopitem")],
+            [InlineKeyboardButton("📦 Заказы" + (f" · 🔔 {open_n}" if open_n else ""),
+                                  callback_data="m:shop_orders"),
+             InlineKeyboardButton("🔔 Куда слать заказы", callback_data="add:shopnotify")],
+            [InlineKeyboardButton("✏️ Название магазина", callback_data="add:shoptitle")]]
+    for it in (s.get("items") or [])[:30]:
+        if not isinstance(it, dict) or not it.get("id"):
+            continue
+        st = _item_stock(it)
+        tail = f" · {st} шт" if st is not None else ""
+        eye = "" if it.get("enabled", True) else "🙈 "
+        price = f"{it.get('stars', 0)}⭐" if int(it.get("stars", 0) or 0) > 0 else "заявка"
+        rows.append([InlineKeyboardButton(f"{eye}🛍 {str(it.get('title', '?'))[:24]} · {price}{tail}",
+                                          callback_data=f"shi:{it['id']}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -5457,18 +5499,60 @@ def shop_kb() -> InlineKeyboardMarkup:
 def shop_menu_text() -> str:
     s = CONFIG.get("shop") or {}
     orders = CONFIG.get("shop_orders") or []
-    earned = sum(int(o.get("stars", 0) or 0) for o in orders)
-    last = "\n".join(
-        f"• {datetime.fromtimestamp(o.get('ts', 0)).strftime('%d.%m %H:%M')} · {o.get('item')} · "
-        f"{o.get('stars')}⭐ · id {o.get('uid')}" for o in orders[-5:][::-1]) or "— пока нет —"
-    return (f"🛒 Магазин Mini App «{s.get('title', 'Магазин')}»\n\n"
+    earned = sum(int(o.get("stars", 0) or 0) for o in orders if o.get("status") in (None, "paid", "done"))
+    open_n = sum(1 for o in orders if o.get("status") in ("new", "paid"))
+    who = ", ".join(str(x) for x in _shop_targets())
+    return (f"🛒 Магазин «{s.get('title', 'Магазин')}»\n\n"
             f"Сервер: {_shop_status()}\n"
             f"Адрес: {WEBAPP_URL or '—'}\n"
-            f"Товаров: {len(s.get('items') or [])} (+ тариф PRO, если магазин открыт из группы)\n"
-            f"Заказов: {len(orders)} · получено {earned} ⭐\n\n"
-            f"Последние заказы:\n{last}\n\n"
-            "Открыть: /shop в ЛС бота или в группе. Оплата — звёздами Telegram.\n"
-            "Товар добавляется строкой: Название | звёзд | описание | что выдать после оплаты")
+            f"Товаров: {len(s.get('items') or [])} · заказов: {len(orders)} · ждут тебя: {open_n}\n"
+            f"Заработано: {earned} ⭐\n"
+            f"Заказы приходят: {who}{'' if s.get('notify') else ' (владельцы бота)'}\n\n"
+            "➕ Добавить товар — пошаговый мастер с кнопками.\n"
+            "Нажми на товар — откроется карточка: цена, фото, выдача, склад кодов.\n"
+            "Витрина для покупателей — /shop (в ЛС бота или в группе).")
+
+
+def shop_orders_view():
+    orders = [o for o in (CONFIG.get("shop_orders") or []) if o.get("id")][-15:][::-1]
+    open_n = sum(1 for o in CONFIG.get("shop_orders") or [] if o.get("status") in ("new", "paid"))
+    lines = [f"📦 Заказы · ждут тебя: {open_n}", ""]
+    rows = []
+    for o in orders:
+        icon = _ORDER_ST.get(o.get("status"), "•").split()[0]
+        rows.append([InlineKeyboardButton(
+            f"{icon} №{o['id']} · {str(o.get('title', ''))[:20]} · {o.get('stars', 0)}⭐",
+            callback_data=f"osd:view:{o['id']}:p")])
+    lines.append("Нажми на заказ, чтобы открыть карточку." if orders else "Пока заказов нет.")
+    lines.append("\n⏳ ждёт оплаты · 🆕 заявка · 💰 оплачен, выдать вручную · ✅ выполнен · "
+                 "❌ отменён · ↩️ возврат · ⌛ не оплачен")
+    rows.append([InlineKeyboardButton("⬅️ В магазин", callback_data="m:shop")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def gw_view(tgt, label):
+    if not tgt or tgt == "defaults":
+        return "🎉 Розыгрыши\n\nСначала выбери группу.", InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Назад", callback_data="m:main")]])
+    items = sorted([g for g in (CONFIG.get("giveaways") or {}).values() if str(g.get("chat")) == str(tgt)],
+                   key=lambda g: g.get("ends", 0), reverse=True)[:10]
+    lines = [f"🎉 Розыгрыши и рандом · {label}", ""]
+    rows = [[InlineKeyboardButton("➕ Новый розыгрыш", callback_data="add:gwnew")]]
+    for g in items:
+        ends = datetime.fromtimestamp(g.get("ends", 0), _post_tz()).strftime("%d.%m %H:%M")
+        prize = str(g.get("prize", ""))
+        if g.get("status") == "active":
+            lines.append(f"🟢 {prize} · участников {len(g.get('parts') or [])} · итоги {ends}")
+            rows.append([InlineKeyboardButton(f"🏁 Итоги сейчас: {prize[:22]}", callback_data=f"gwe:{g['id']}")])
+        else:
+            lines.append(f"🏁 {prize} · победителей {len(g.get('won') or [])} · {ends}")
+            rows.append([InlineKeyboardButton(f"🔁 Перевыбрать: {prize[:22]}", callback_data=f"gwr:{g['id']}")])
+    if not items:
+        lines.append("Розыгрышей ещё не было.")
+    lines.append("\nВ группе: /random Приз | победителей | время (напр. 1д)\n"
+                 "Рандом: /random 100 · /random 5 50 · /random пицца, суши, бургер")
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:main")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
 add_help_text = (
@@ -5483,7 +5567,7 @@ add_help_text = (
 
 def about_text() -> str:
     return (
-        "🤖 Channel Guard Bot v6 — защита и оживление групп.\n\n"
+        "🤖 Channel Guard Bot v6.1 — защита и оживление групп.\n\n"
         "Антиспам: стоп-слова (2 списка + глобальный), исключения, ссылки и скрытые ссылки, "
         "спам-домены, антифлуд, медиа-фильтр, проверка имён, чёрные списки, ночной режим, "
         "анти-рейд, анти-снос, капча (в чате и через заявку в ЛС).\n"
@@ -5517,7 +5601,9 @@ HELP_TEXT = (
     "/block /unblock — чёрный список группы · /diag — диагностика · /pro — тариф\n"
     "/gmanager /ungmanager /gmanagers — менеджеры группы (назначает создатель)\n"
     "/appeal текст — апелляция владельцам бота\n"
-    "/shop — магазин Mini App: тариф PRO и товары за звёзды"
+    "/shop — магазин Mini App: тариф PRO и товары за звёзды · /orders — мои заказы\n"
+    "/random — рандом: /random 100 · /random 5 50 · /random а, б, в\n"
+    "/random Приз | победителей | 1д — розыгрыш в группе · /gwend · /reroll"
 )
 
 GROUPADMIN_HELP = (
@@ -5552,7 +5638,8 @@ _MANAGER_CB = (
     "add:gword", "add:gbid", "add:gbname", "add:invitetext",
     "add:promo_content", "add:promo_btns", "add:bcast", "add:post",
     "sptgl:", "spdel:", "spg:", "tz:", "bk:",
-    "m:shop", "shp:", "dsi:", "add:shopitem", "add:shoptitle",
+    "m:shop", "shp:", "dsi:", "add:shopitem", "add:shoptitle", "add:shopnotify",
+    "sip:", "sim:", "sis:", "shi:", "sie:", "sep:", "sem:", "sit:", "sid:", "sidy:",
 )
 
 
@@ -5596,6 +5683,8 @@ async def _render_menu(query, context, view: str):
         "m:sched": (sched_menu_text(), sched_kb()),
         "m:backup": (backup_menu_text(label), backup_kb()),
         "m:shop": (shop_menu_text(), shop_kb()),
+        "m:shop_orders": shop_orders_view(),
+        "m:gw": gw_view(tgt, label),
     }
     hubs = {"m:h_protect": hub_protect, "m:h_words": hub_words, "m:h_mod": hub_mod,
             "m:h_talk": hub_talk, "m:h_posts": hub_posts, "m:h_sys": hub_sys}
@@ -5686,6 +5775,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     wcfg = panel_cfg(context)
     tgt = context.user_data.get("cfg_target")
+
+    # ── магазин 2.0 и розыгрыши ──
+    if data in ("add:shopitem", "add:shopnotify") or data.startswith(_SHOP_CB):
+        return await _shop_callback(query, context, data)
+    if data == "add:gwnew" or data.startswith(("gwe:", "gwr:")):
+        return await _gw_callback(query, context, data)
 
     # ── менеджеры группы (назначает только создатель группы или владелец бота) ──
     if data == "add:gmgr" or data.startswith("dgm:"):
@@ -6339,7 +6434,8 @@ async def cmd_about(update: Update, context):
 
 
 async def cmd_cancel(update: Update, context):
-    for k in ("awaiting", "trig_draft", "sp_draft", "role_name", "bcast_post", "pto_sel", "dmto_sel"):
+    for k in ("awaiting", "trig_draft", "sp_draft", "role_name", "bcast_post", "pto_sel", "dmto_sel",
+              "shop_draft", "shop_edit"):
         context.user_data.pop(k, None)
     await update.effective_message.reply_text("Ок, отменил. Панель — /panel.")
 
@@ -6378,6 +6474,8 @@ async def cmd_skip(update: Update, context):
     """Пропустить необязательный шаг мастера (кнопки)."""
     awaiting = context.user_data.get("awaiting")
     msg = update.effective_message
+    if awaiting in ("si_desc", "si_photo", "si_deliver"):
+        return await _si_skip(msg.reply_text, context, awaiting)
     if awaiting == "trig_btns":
         context.user_data.pop("awaiting", None)
         keys, val, wcfg = _save_trigger_draft(context)
@@ -6573,11 +6671,13 @@ cmd_addlink, cmd_dellink, cmd_links = _make_list_cmds("spam_links", "🔗 Спа
 # Состояния, требующие права на ВЫБРАННУЮ группу
 _TARGET_STATES = ("word", "word2", "wword", "link", "trigger", "trig_keys", "trig_content",
                   "trig_btns", "chphrase", "chreply", "gopword", "blid", "blname", "welcome",
-                  "welcome_btns", "rules", "recurring", "rolenew", "rolemember", "staff", "gmgr")
+                  "welcome_btns", "rules", "recurring", "rolenew", "rolemember", "staff", "gmgr",
+                  "gwnew")
 # Состояния только для владельца/менеджеров бота
 _MANAGER_STATES = ("gword", "gbid", "gbname", "invitetext", "promo_content", "promo_btns",
                    "bcast", "dmcast", "sp_time", "sp_content", "sp_btns", "mgr",
-                   "shopitem", "shoptitle")
+                   "shopitem", "shoptitle", "si_title", "si_price", "si_desc", "si_photo",
+                   "si_mode", "si_deliver", "se", "shopnotify")
 
 
 async def _state_allowed(update: Update, context) -> bool:
@@ -6616,6 +6716,12 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = panel_cfg(context)
     label = panel_target_label(context)
     done = lambda: context.user_data.pop("awaiting", None)  # noqa: E731
+
+    # ── магазин 2.0 (мастер/редактор товаров) и розыгрыши ──
+    if awaiting in _SHOP_STATES:
+        return await _shop_text(update, context, awaiting, text, msg)
+    if awaiting == "gwnew":
+        return await _gw_text_input(update, context, text, msg)
 
     # ── списки слов/доменов ──
     list_states = {"word": ("stop_words", words_kb), "word2": ("stop_words2", words2_kb),
@@ -6937,7 +7043,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # Состояния, где ждём контент (медиа тоже подходит)
-_CONTENT_STATES = ("trig_content", "promo_content", "bcast", "dmcast", "sp_content")
+_CONTENT_STATES = ("trig_content", "promo_content", "bcast", "dmcast", "sp_content", "si_photo", "se")
 
 
 async def on_private_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6996,31 +7102,60 @@ SHOP_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
 :root{--bg:var(--tg-theme-bg-color,#fff);--tx:var(--tg-theme-text-color,#111);
---hint:var(--tg-theme-hint-color,#888);--btn:var(--tg-theme-button-color,#2a8bf2);
---btx:var(--tg-theme-button-text-color,#fff);--card:var(--tg-theme-secondary-bg-color,#f2f3f5)}
-*{box-sizing:border-box}
-body{margin:0;padding:16px;background:var(--bg);color:var(--tx);
+--hint:var(--tg-theme-hint-color,#8a8a8e);--btn:var(--tg-theme-button-color,#2a8bf2);
+--btx:var(--tg-theme-button-text-color,#fff);--card:var(--tg-theme-secondary-bg-color,#f2f3f5);
+--acc:var(--tg-theme-accent-text-color,var(--tg-theme-button-color,#2a8bf2))}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;padding:16px 14px 90px;background:var(--bg);color:var(--tx);
 font:15px/1.45 -apple-system,system-ui,"Segoe UI",Roboto,sans-serif}
-h1{font-size:21px;margin:4px 0 2px}
-.sub{color:var(--hint);font-size:13px;margin-bottom:16px}
-.card{background:var(--card);border-radius:14px;padding:14px;margin-bottom:10px;
-display:flex;gap:12px;align-items:center}
-.i{flex:1;min-width:0}.t{font-weight:600}.d{color:var(--hint);font-size:13px;margin-top:2px}
-button{border:0;border-radius:10px;padding:10px 14px;background:var(--btn);color:var(--btx);
-font-weight:600;font-size:14px;white-space:nowrap;cursor:pointer}
-button:disabled{opacity:.5}
-.empty{color:var(--hint);text-align:center;padding:48px 10px}
+h1{font-size:22px;margin:2px 0}
+.sub{color:var(--hint);font-size:13px;margin-bottom:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.card{background:var(--card);border-radius:16px;overflow:hidden;cursor:pointer;display:flex;
+flex-direction:column;transition:transform .1s}
+.card:active{transform:scale(.97)}
+.ph{aspect-ratio:1/1;background:linear-gradient(135deg,var(--btn),var(--acc));display:flex;
+align-items:center;justify-content:center;font-size:44px;color:#fff;overflow:hidden}
+.ph img{width:100%;height:100%;object-fit:cover}
+.cb{padding:10px 12px 12px;display:flex;flex-direction:column;gap:4px;flex:1}
+.t{font-weight:600;line-height:1.25}
+.d{color:var(--hint);font-size:12.5px;display:-webkit-box;-webkit-line-clamp:2;
+-webkit-box-orient:vertical;overflow:hidden}
+.row{display:flex;justify-content:space-between;align-items:center;margin-top:auto;padding-top:6px;gap:6px}
+.pr{font-weight:700;color:var(--acc)}
+.st{font-size:11.5px;color:var(--hint);text-align:right}
+.out{opacity:.45}
+.empty{color:var(--hint);text-align:center;padding:60px 10px;grid-column:1/-1}
+.bgr{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:flex-end;z-index:5}
+.sheet{background:var(--bg);width:100%;max-height:92vh;overflow:auto;border-radius:20px 20px 0 0;
+padding-bottom:20px;animation:up .2s ease}
+@keyframes up{from{transform:translateY(40px);opacity:.5}to{transform:none;opacity:1}}
+.sheet .ph{aspect-ratio:16/10;font-size:64px}
+.sb{padding:16px}.sb h2{margin:0 0 6px;font-size:20px}
+.desc{opacity:.9;white-space:pre-wrap}
+textarea{width:100%;margin-top:14px;border-radius:12px;border:0;background:var(--card);color:var(--tx);
+padding:10px 12px;font:inherit;resize:none;min-height:70px}
+.btn{width:100%;margin-top:14px;border:0;border-radius:12px;padding:14px;background:var(--btn);
+color:var(--btx);font-weight:700;font-size:16px}
+.btn:disabled{opacity:.5}
 </style></head><body>
 <h1 id="title">🛒 Магазин</h1>
 <div class="sub" id="sub">Оплата звёздами Telegram ⭐</div>
-<div id="list"><div class="empty">Загрузка…</div></div>
+<div id="list" class="grid"><div class="empty">Загрузка…</div></div>
+<div class="bgr" id="bgr"><div class="sheet" id="sheet"></div></div>
 <script>
 const tg = window.Telegram && Telegram.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
 const q = new URLSearchParams(location.search);
 const chat = (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) || q.get("chat") || "";
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const hap = t => { try { tg.HapticFeedback.impactOccurred(t || "light"); } catch (e) {} };
 function say(t, cb) { if (tg && tg.showAlert) tg.showAlert(t, cb); else { alert(t); if (cb) cb(); } }
+const hasMB = !!(tg && tg.MainButton && tg.initData);
+let items = [], cur = null, busy = false;
+const price = it => it.stars > 0 ? it.stars + " ⭐" : "Бесплатно";
+const pic = it => it.photo ? `<img src="${esc(it.photo)}" alt="" loading="lazy">` : "🛍";
+const label = () => cur.stars > 0 ? `Купить за ${cur.stars} ⭐` : "Оформить заявку";
 async function load() {
   const L = document.getElementById("list");
   try {
@@ -7028,27 +7163,62 @@ async function load() {
     const j = await r.json();
     if (j.title) document.getElementById("title").textContent = "🛒 " + j.title;
     if (j.chat_title) document.getElementById("sub").textContent = "Группа: " + j.chat_title + " · оплата звёздами ⭐";
-    if (!j.items || !j.items.length) { L.innerHTML = '<div class="empty">Пока пусто 🙂</div>'; return; }
-    L.innerHTML = j.items.map(it =>
-      `<div class="card"><div class="i"><div class="t">${esc(it.title)}</div>` +
-      `<div class="d">${esc(it.desc)}</div></div>` +
-      `<button data-id="${esc(it.id)}">${Number(it.stars)} ⭐</button></div>`).join("");
-    L.querySelectorAll("button").forEach(b => b.onclick = () => buy(b));
-  } catch (e) { L.innerHTML = '<div class="empty">Не удалось загрузить каталог</div>'; }
+    items = j.items || [];
+    if (!items.length) { L.innerHTML = '<div class="empty">Витрина пока пустая 🙂</div>'; return; }
+    L.innerHTML = items.map((it, i) => {
+      const out = it.stock === 0;
+      const st = out ? "нет в наличии" : (it.stock != null ? "осталось " + it.stock : "");
+      return `<div class="card${out ? " out" : ""}" data-i="${i}"><div class="ph">${pic(it)}</div>` +
+        `<div class="cb"><div class="t">${esc(it.title)}</div><div class="d">${esc(it.desc)}</div>` +
+        `<div class="row"><span class="pr">${price(it)}</span><span class="st">${st}</span></div></div></div>`;
+    }).join("");
+    L.querySelectorAll(".card").forEach(c => c.onclick = () => openItem(+c.dataset.i));
+  } catch (e) { L.innerHTML = '<div class="empty">Не удалось загрузить витрину</div>'; }
 }
-async function buy(b) {
+function openItem(i) {
+  cur = items[i]; if (!cur) return; hap();
+  const out = cur.stock === 0;
+  document.getElementById("sheet").innerHTML =
+    `<div class="ph">${pic(cur)}</div><div class="sb"><h2>${esc(cur.title)}</h2>` +
+    `<div class="pr" style="margin-bottom:8px">${price(cur)}${cur.stock != null && !out ? " · осталось " + cur.stock : ""}${out ? " · нет в наличии" : ""}</div>` +
+    `<div class="desc">${esc(cur.desc || "")}</div>` +
+    `<textarea id="cm" maxlength="300" placeholder="Комментарий продавцу (необязательно)"></textarea>` +
+    (hasMB ? "" : `<button class="btn" id="go">${label()}</button>`) + `</div>`;
+  document.getElementById("bgr").style.display = "flex";
+  if (hasMB) {
+    if (out) tg.MainButton.hide(); else { tg.MainButton.setText(label()); tg.MainButton.show(); }
+    tg.BackButton.show();
+  }
+  const go = document.getElementById("go");
+  if (go) { go.disabled = out; go.onclick = order; }
+}
+function closeSheet() {
+  document.getElementById("bgr").style.display = "none"; cur = null;
+  if (hasMB) { tg.MainButton.hide(); tg.BackButton.hide(); }
+}
+document.getElementById("bgr").onclick = e => { if (e.target.id === "bgr") closeSheet(); };
+if (hasMB) { tg.MainButton.onClick(order); tg.BackButton.onClick(closeSheet); }
+async function order() {
+  if (!cur || busy) return;
   if (!tg || !tg.initData) { say("Открой магазин внутри Telegram"); return; }
-  b.disabled = true;
+  busy = true; if (hasMB && tg.MainButton.showProgress) tg.MainButton.showProgress();
+  const it = cur, cm = (document.getElementById("cm") || {}).value || "";
   try {
-    const r = await fetch("api/invoice", {method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({initData: tg.initData, item: b.dataset.id, chat})});
+    const r = await fetch("api/order", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({initData: tg.initData, item: it.id, chat, comment: cm})});
     const j = await r.json();
-    if (!j.link) throw new Error(j.error || "ошибка");
-    tg.openInvoice(j.link, st => {
-      b.disabled = false;
-      if (st === "paid") say("✅ Оплачено! Подробности — в чате с ботом.", () => tg.close());
-    });
-  } catch (e) { b.disabled = false; say("Не вышло создать счёт: " + e.message); }
+    if (!r.ok) throw new Error(j.error || "ошибка");
+    if (j.link) {
+      tg.openInvoice(j.link, st => {
+        if (st === "paid") { hap("heavy"); closeSheet(); say("✅ Оплачено! Заказ №" + j.order + " — детали пришли в чат с ботом.", () => load()); }
+        else if (st === "failed") say("Оплата не прошла. Попробуй ещё раз.");
+      });
+    } else {
+      hap("heavy"); closeSheet();
+      say("📝 Заявка №" + j.order + " отправлена продавцу! Он скоро с тобой свяжется.");
+    }
+  } catch (e) { say("Не получилось: " + e.message); }
+  finally { busy = false; if (hasMB && tg.MainButton.hideProgress) tg.MainButton.hideProgress(); }
 }
 load();
 </script></body></html>"""
@@ -7078,7 +7248,7 @@ def _verify_init_data(init_data: str):
 
 
 def _shop_catalog(chat: str) -> list:
-    """Каталог: тариф PRO (если открыт из известной группы) + свои товары."""
+    """Витрина: тариф PRO (если открыта из известной группы) + товары из панели."""
     s = CONFIG.get("shop") or {}
     if not s.get("enabled"):
         return []
@@ -7088,12 +7258,18 @@ def _shop_catalog(chat: str) -> list:
         for key, p in PRO_PLANS.items():
             items.append({"id": f"pro_{key}", "title": f"⭐ PRO · {p['title']}"[:32],
                           "desc": f"Полный доступ бота в «{title}» на {p['days']} дней",
-                          "stars": int(p["stars"])})
+                          "stars": int(p["stars"]), "photo": "", "stock": None})
     for it in s.get("items") or []:
         if isinstance(it, dict) and it.get("enabled", True) and it.get("id"):
-            items.append({"id": it["id"], "title": str(it.get("title", ""))[:32],
-                          "desc": str(it.get("desc", "")), "stars": int(it.get("stars", 1) or 1)})
+            items.append({
+                "id": it["id"], "title": str(it.get("title", ""))[:32], "desc": str(it.get("desc", "")),
+                "stars": int(it.get("stars", 0) or 0),
+                "photo": f"api/photo/{it['id']}?v={str(it['photo'])[-6:]}" if it.get("photo") else "",
+                "stock": _item_stock(it)})
     return items
+
+
+_photo_cache: dict = {}  # item_id -> (file_id, bytes)
 
 
 async def _shop_index(request):
@@ -7108,7 +7284,27 @@ async def _shop_api_catalog(request):
                               "items": _shop_catalog(chat)})
 
 
-async def _shop_api_invoice(request):
+async def _shop_api_photo(request):
+    """Фото товара: бот скачивает файл из Telegram и отдаёт его витрине (токен не светится)."""
+    iid = request.match_info.get("iid", "")
+    it = _item_by_id(iid)
+    if not it or not it.get("photo"):
+        return web.Response(status=404)
+    fid = it["photo"]
+    cached = _photo_cache.get(iid)
+    if not cached or cached[0] != fid:
+        try:
+            f = await request.app["bot"].get_file(fid)
+            _photo_cache[iid] = (fid, bytes(await f.download_as_bytearray()))
+        except Exception as e:  # noqa: BLE001
+            log.debug("shop photo %s: %s", iid, e)
+            return web.Response(status=404)
+    return web.Response(body=_photo_cache[iid][1], content_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=3600"})
+
+
+async def _shop_api_order(request):
+    """Оформление: заказ СРАЗУ уходит продавцу; платный — ещё и счёт на оплату звёздами."""
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
@@ -7116,24 +7312,41 @@ async def _shop_api_invoice(request):
     user = _verify_init_data(str(body.get("initData") or ""))
     if not user:
         return web.json_response({"error": "нет доступа — открой магазин из Telegram"}, status=403)
+    if not _throttle(("shopord", int(user["id"])), 4.0):
+        return web.json_response({"error": "слишком часто — подожди пару секунд"}, status=429)
     chat = str(body.get("chat") or "")
     item = next((i for i in _shop_catalog(chat) if i["id"] == str(body.get("item"))), None)
     if not item:
         return web.json_response({"error": "товар не найден"}, status=404)
-    chat_part = chat if chat.lstrip("-").isdigit() else "0"
-    try:
-        link = await request.app["bot"].create_invoice_link(
-            title=item["title"][:32],
-            description=(item["desc"] or item["title"])[:255],
-            payload=f"shop:{int(user['id'])}:{item['id']}:{chat_part}",
-            provider_token="",  # Telegram Stars
-            currency="XTR",
-            prices=[LabeledPrice(label=item["title"][:32], amount=item["stars"])],
-        )
-    except Exception as e:  # noqa: BLE001
-        log.warning("shop invoice: %s", e)
-        return web.json_response({"error": "Telegram не создал счёт"}, status=502)
-    return web.json_response({"link": link})
+    if item.get("stock") == 0:
+        return web.json_response({"error": "нет в наличии"}, status=409)
+    bot = request.app["bot"]
+    o = {"id": _new_order_id(), "ts": time.time(), "uid": int(user["id"]),
+         "name": (" ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or str(user["id"]))[:64],
+         "username": user.get("username") or "", "item": item["id"], "title": item["title"],
+         "stars": int(item["stars"]), "comment": str(body.get("comment") or "").strip()[:300],
+         "chat": chat if chat.lstrip("-").isdigit() else "0",
+         "status": "wait" if int(item["stars"]) > 0 else "new"}
+    link = None
+    if o["stars"] > 0:
+        try:
+            link = await bot.create_invoice_link(
+                title=item["title"][:32], description=(item["desc"] or item["title"])[:255],
+                payload=f"sho:{o['id']}", provider_token="", currency="XTR",
+                prices=[LabeledPrice(label=item["title"][:32], amount=o["stars"])])
+        except Exception as e:  # noqa: BLE001
+            log.warning("shop invoice: %s", e)
+            return web.json_response({"error": "Telegram не создал счёт"}, status=502)
+    orders = CONFIG.setdefault("shop_orders", [])
+    orders.append(o)
+    del orders[:-300]
+    save_config(force=True)
+    await _notify_sellers(bot, o, "🆕 Новый заказ — ждёт оплаты" if link else "🆕 Новая заявка!")
+    if not link:
+        await _tell_buyer(bot, o, f"📝 Заявка №{o['id']} «{o['title']}» принята! Продавец скоро свяжется.\n"
+                                  "Статус — /orders")
+        return web.json_response({"ok": True, "order": o["id"]})
+    return web.json_response({"link": link, "order": o["id"]})
 
 
 async def start_shop_server(app: Application):
@@ -7149,7 +7362,9 @@ async def start_shop_server(app: Application):
         wa["bot"] = app.bot
         wa.router.add_get("/", _shop_index)
         wa.router.add_get("/api/catalog", _shop_api_catalog)
-        wa.router.add_post("/api/invoice", _shop_api_invoice)
+        wa.router.add_post("/api/order", _shop_api_order)
+        wa.router.add_post("/api/invoice", _shop_api_order)  # совместимость со старой витриной
+        wa.router.add_get("/api/photo/{iid}", _shop_api_photo)
         runner = web.AppRunner(wa)
         await runner.setup()
         await web.TCPSite(runner, SHOP_HOST, SHOP_PORT).start()
@@ -7230,6 +7445,956 @@ async def _shop_paid(update, context, sp, parts):
                                 f"от {buyer} (id {uid}).")
 
 
+# ───────────────────────────────────────────────────────────────────────────
+#  МАГАЗИН 2.0: мастер товаров, заказы продавцу, выдача (в т.ч. рандом)
+# ───────────────────────────────────────────────────────────────────────────
+
+_ORDER_ST = {
+    "wait": "⏳ ждёт оплаты", "new": "🆕 новая заявка", "paid": "💰 оплачен — выдай вручную",
+    "done": "✅ выполнен", "canceled": "❌ отменён", "refunded": "↩️ отменён, звёзды возвращены",
+    "expired": "⌛ не оплачен",
+}
+_MODES = {
+    "same": "📝 Один текст всем",
+    "random": "🎲 Случайный вариант",
+    "codes": "🔑 Уникальные коды (склад)",
+    "manual": "👤 Вручную — продавец свяжется",
+}
+_MODE_HINT = {
+    "same": "Пришли текст, который получит КАЖДЫЙ покупатель сразу после оплаты: ссылку, "
+            "инструкцию, промокод. Работает {рандомизация|вариантов}.",
+    "random": "Пришли варианты — КАЖДЫЙ С НОВОЙ СТРОКИ. Покупатель получит один случайный "
+              "(лутбоксы, рандом-призы, случайные карточки).",
+    "codes": "Пришли коды/ключи — КАЖДЫЙ С НОВОЙ СТРОКИ. Каждый продаётся один раз: выдаётся "
+             "случайный из оставшихся, остаток виден в витрине, «нет в наличии» — сам.",
+}
+_PRICE_PRESETS = [0, 25, 50, 100, 250, 500, 1000]
+_SHOP_STATES = ("si_title", "si_price", "si_desc", "si_photo", "si_mode", "si_deliver", "se", "shopnotify")
+_SHOP_CB = ("sip:", "sim:", "sis:", "shi:", "sie:", "sep:", "sem:", "sit:", "sid:", "sidy:")
+
+
+def _B(text, cb):
+    return InlineKeyboardButton(text, callback_data=cb)
+
+
+def _shop() -> dict:
+    return CONFIG.setdefault("shop", {})
+
+
+def _shop_items() -> list:
+    return _shop().setdefault("items", [])
+
+
+def _item_by_id(iid):
+    return next((i for i in _shop_items() if isinstance(i, dict) and i.get("id") == iid), None)
+
+
+def _item_mode(it) -> str:
+    return it.get("mode") or ("same" if it.get("deliver") else "manual")
+
+
+def _item_stock(it):
+    return len(it.get("codes") or []) if _item_mode(it) == "codes" else None
+
+
+def _price_txt(stars) -> str:
+    return f"{int(stars or 0)} ⭐" if int(stars or 0) > 0 else "бесплатно (заявка)"
+
+
+def _parse_price(text: str):
+    t = (text or "").lower()
+    if "беспл" in t or "free" in t:
+        return 0
+    m = re.search(r"\d+", t)
+    return min(100000, int(m.group())) if m else None
+
+
+def _find_order(oid):
+    for o in reversed(CONFIG.get("shop_orders") or []):
+        if str(o.get("id")) == str(oid):
+            return o
+    return None
+
+
+def _new_order_id() -> str:
+    s = _shop()
+    s["seq"] = int(s.get("seq", 0) or 0) + 1
+    return str(s["seq"])
+
+
+def _shop_targets() -> list:
+    """Кому уходят заказы: список из панели или владельцы бота."""
+    out = []
+    for x in _shop().get("notify") or []:
+        try:
+            out.append(int(x))
+        except (TypeError, ValueError):
+            continue
+    return out or list(ADMIN_IDS)
+
+
+def _is_seller(uid: int) -> bool:
+    return is_manager(uid) or uid in [x for x in _shop_targets() if x > 0]
+
+
+# ── карточка заказа ─────────────────────────────────────────────────────────
+
+
+def _order_text(o) -> str:
+    e = html.escape
+    buyer = f'<a href="tg://user?id={o.get("uid")}">{e(str(o.get("name") or o.get("uid")))}</a>'
+    if o.get("username"):
+        buyer += f" @{e(o['username'])}"
+    lines = [f"🧾 <b>Заказ №{e(str(o.get('id')))}</b> · {_ORDER_ST.get(o.get('status'), o.get('status'))}",
+             f"🛍 {e(str(o.get('title') or o.get('item')))} — {_price_txt(o.get('stars', 0))}",
+             f"👤 {buyer} · id <code>{o.get('uid')}</code>"]
+    if o.get("comment"):
+        lines.append(f"💬 {e(o['comment'])}")
+    if str(o.get("chat") or "0") not in ("0", ""):
+        lines.append(f"🏠 Группа: {e(CONFIG.get('groups', {}).get(str(o['chat']), str(o['chat'])))}")
+    lines.append("🕒 " + datetime.fromtimestamp(o.get("ts", 0), _post_tz()).strftime("%d.%m.%Y %H:%M"))
+    if o.get("delivered"):
+        lines.append(f"📦 Выдано: <code>{e(str(o['delivered'])[:300])}</code>")
+    if o.get("note"):
+        lines.append(f"⚠️ {e(o['note'])}")
+    return "\n".join(lines)
+
+
+def _order_kb(o, panel: bool = False):
+    oid, p = o.get("id"), (":p" if panel else "")
+    rows = []
+    if o.get("status") in ("wait", "new", "paid"):
+        rows.append([_B("✅ Выполнен", f"osd:done:{oid}{p}"), _B("❌ Отменить", f"osd:cancel:{oid}{p}")])
+    elif o.get("status") == "done" and o.get("charge"):
+        rows.append([_B("↩️ Вернуть звёзды", f"osd:cancel:{oid}{p}")])
+    if o.get("username"):
+        rows.append([InlineKeyboardButton("💬 Написать покупателю", url=f"https://t.me/{o['username']}")])
+    if panel:
+        rows.append([_B("⬅️ К заказам", "m:shop_orders")])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _notify_sellers(bot, o, head: str = ""):
+    """Карточка заказа продавцам — сразу при оформлении и повторно при оплате."""
+    msgs = o.setdefault("msgs", [])
+    for cid in _shop_targets():
+        try:
+            m = await bot.send_message(cid, (f"<b>{html.escape(head)}</b>\n\n" if head else "") + _order_text(o),
+                                       parse_mode="HTML", reply_markup=_order_kb(o))
+            msgs.append([cid, m.message_id])
+        except Exception as e:  # noqa: BLE001
+            log.debug("order notify %s: %s", cid, e)
+    del msgs[:-10]
+    save_config()
+
+
+async def _refresh_seller_msgs(bot, o):
+    for cid, mid in list(o.get("msgs") or []):
+        try:
+            await bot.edit_message_text(_order_text(o), chat_id=cid, message_id=mid,
+                                        parse_mode="HTML", reply_markup=_order_kb(o))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _tell_buyer(bot, o, text: str):
+    try:
+        await bot.send_message(int(o.get("uid")), text)
+    except Exception as e:  # noqa: BLE001
+        log.debug("buyer %s: %s", o.get("uid"), e)
+
+
+def _deliver_item(it: dict, o: dict):
+    """Выдача по способу товара. Возвращает выданное или None (выдаст продавец)."""
+    mode = _item_mode(it)
+    d = None
+    if mode == "same":
+        d = _spintax(it.get("deliver") or "") or None
+    elif mode == "random":
+        v = [x for x in (it.get("variants") or []) if str(x).strip()]
+        d = _spintax(random.choice(v)) if v else None
+    elif mode == "codes":
+        codes = it.setdefault("codes", [])
+        if codes:
+            d = codes.pop(random.randrange(len(codes)))
+        else:
+            o["note"] = "коды закончились — выдай вручную"
+    if it:
+        it["sold"] = int(it.get("sold", 0) or 0) + 1
+    if d:
+        o["delivered"] = d
+        o["status"] = "done"
+    else:
+        o["status"] = "paid"
+    save_config(force=True)
+    return d
+
+
+async def _shop_paid_order(update, context, sp, oid):
+    """Оплата заказа из витрины: выдача, уведомления покупателю и продавцу."""
+    o = _find_order(oid)
+    msg = update.effective_message
+    if not o:
+        await msg.reply_text("✅ Оплата получена! Продавец скоро свяжется.")
+        return await alert_owners(context, f"💰 Оплата {sp.total_amount} ⭐ по неизвестному заказу №{oid}")
+    o["charge"] = getattr(sp, "telegram_payment_charge_id", "")
+    o["paid_ts"] = time.time()
+    o.pop("note", None)
+    iid = str(o.get("item"))
+    if iid.startswith("pro_") and str(o.get("chat") or "0") not in ("0", ""):
+        p = PRO_PLANS.get(iid[4:]) or {"days": 30}
+        cid = int(o["chat"])
+        extend_pro(cid, p["days"])
+        until = datetime.fromtimestamp(pro_until(cid)).strftime("%d.%m.%Y")
+        o["status"], o["delivered"] = "done", f"PRO до {until}"
+        save_config(force=True)
+        try:
+            await context.bot.send_message(cid, f"⭐ Тариф PRO активен до {until}. Спасибо!")
+        except Exception:  # noqa: BLE001
+            pass
+        await msg.reply_text(f"✅ Оплата получена! PRO для «{CONFIG.get('groups', {}).get(str(cid), cid)}» "
+                             f"активен до {until}.")
+    else:
+        it = _item_by_id(iid) or {}
+        d = _deliver_item(it, o)
+        title = o.get("title") or it.get("title") or iid
+        if d:
+            await msg.reply_text(f"✅ Оплата получена: {title}\n\n📦 Твой заказ №{o['id']}:\n{d}")
+        else:
+            await msg.reply_text(f"✅ Оплата получена: {title}\n"
+                                 f"Продавец скоро свяжется и выдаст заказ №{o['id']}. Статус — /orders")
+        st = _item_stock(it) if it else None
+        if st is not None and st <= 3:
+            for cid in _shop_targets():
+                try:
+                    await context.bot.send_message(cid, f"⚠️ «{title}»: на складе осталось кодов — {st}. "
+                                                        "Пополни: панель → 🛒 Магазин → товар → ➕ Коды.")
+                except Exception:  # noqa: BLE001
+                    pass
+    await _refresh_seller_msgs(context.bot, o)
+    await _notify_sellers(context.bot, o, f"💰 Оплачен заказ №{o['id']} — {sp.total_amount} ⭐")
+
+
+async def handle_order_press(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки продавца на карточке заказа: выполнен / отменить (с возвратом звёзд)."""
+    q = update.callback_query
+    parts = (q.data or "").split(":")
+    if len(parts) < 3:
+        return await q.answer()
+    act, oid = parts[1], parts[2]
+    panel = len(parts) > 3 and parts[3] == "p"
+    p = ":p" if panel else ""
+    if not _is_seller(update.effective_user.id):
+        return await q.answer("Это кнопки продавца", show_alert=True)
+    o = _find_order(oid)
+    if not o:
+        return await q.answer("Заказ не найден", show_alert=True)
+    if act == "cancel":
+        kb = InlineKeyboardMarkup([[
+            _B("Да, отменить" + (" и вернуть ⭐" if o.get("charge") else ""), f"osd:cancel2:{oid}{p}"),
+            _B("Нет", f"osd:view:{oid}{p}")]])
+        try:
+            await q.edit_message_reply_markup(kb)
+        except Exception:  # noqa: BLE001
+            pass
+        return await q.answer()
+    note = ""
+    if act == "done" and o.get("status") in ("wait", "new", "paid"):
+        o["status"], o["done_by"] = "done", update.effective_user.id
+        save_config(force=True)
+        await _tell_buyer(context.bot, o, f"✅ Заказ №{o['id']} «{o.get('title')}» выполнен. Спасибо за покупку!")
+        note = "✅ Отмечен выполненным"
+    elif act == "cancel2" and o.get("status") not in ("canceled", "refunded"):
+        if o.get("charge") and o.get("status") in ("paid", "done"):
+            try:
+                await context.bot.refund_star_payment(user_id=int(o["uid"]),
+                                                      telegram_payment_charge_id=o["charge"])
+                o["status"] = "refunded"
+            except Exception as e:  # noqa: BLE001
+                return await q.answer(f"Возврат не прошёл: {e}"[:190], show_alert=True)
+        else:
+            o["status"] = "canceled"
+        save_config(force=True)
+        await _tell_buyer(context.bot, o, f"❌ Заказ №{o['id']} «{o.get('title')}» отменён продавцом."
+                          + (" Звёзды возвращены ⭐" if o["status"] == "refunded" else ""))
+        note = "Отменено"
+    try:
+        await q.edit_message_text(_order_text(o), parse_mode="HTML", reply_markup=_order_kb(o, panel))
+    except Exception:  # noqa: BLE001
+        pass
+    if note:
+        await _refresh_seller_msgs(context.bot, o)
+    await q.answer(note)
+
+
+async def _shop_janitor(context):
+    """Неоплаченные за 2 часа заказы → «не оплачен»; старые розыгрыши — в архив."""
+    now = time.time()
+    changed = False
+    for o in CONFIG.get("shop_orders") or []:
+        if o.get("status") == "wait" and now - float(o.get("ts", 0) or 0) > 2 * 3600:
+            o["status"] = "expired"
+            changed = True
+            await _refresh_seller_msgs(context.bot, o)
+    gws = CONFIG.setdefault("giveaways", {})
+    for gid, g in list(gws.items()):
+        if g.get("status") == "ended" and now - float(g.get("ends", 0) or 0) > 30 * 86400:
+            gws.pop(gid, None)
+            changed = True
+    if changed:
+        save_config()
+
+
+async def cmd_orders(update: Update, context):
+    """Мои заказы (для покупателя) — в ЛС."""
+    u = update.effective_user
+    if update.effective_chat.type != "private":
+        return await reply_tidy(update, context, "📦 Свои заказы смотри в ЛС бота: /orders")
+    mine = [o for o in (CONFIG.get("shop_orders") or [])
+            if str(o.get("uid")) == str(u.id) and o.get("id")][-10:][::-1]
+    lines = ["📦 Твои заказы:"] if mine else ["📦 У тебя пока нет заказов. Витрина — /shop"]
+    for o in mine:
+        dt = datetime.fromtimestamp(o.get("ts", 0), _post_tz()).strftime("%d.%m %H:%M")
+        lines.append(f"\n№{o['id']} · {o.get('title')} · {_price_txt(o.get('stars', 0))}\n"
+                     f"{_ORDER_ST.get(o.get('status'), '')} · {dt}")
+        if o.get("delivered"):
+            lines.append(f"📦 {o['delivered']}")
+    if _is_seller(u.id):
+        lines.append("\n🧑‍💼 Все заказы магазина — /panel → 🛒 Магазин → 📦 Заказы")
+    await update.effective_message.reply_text("\n".join(lines)[:4000])
+
+
+# ── мастер и редактор товаров (панель) ──────────────────────────────────────
+
+
+def _cancel_kb(back: str = "sis:cancel"):
+    return InlineKeyboardMarkup([[_B("❌ Отмена" if back == "sis:cancel" else "⬅️ Назад", back)]])
+
+
+def _skip_kb():
+    return InlineKeyboardMarkup([[_B("⏭ Пропустить", "sis:skip"), _B("❌ Отмена", "sis:cancel")]])
+
+
+def _price_kb(cb, back: str = "sis:cancel"):
+    rows = [[_B("🆓 Бесплатно (заявка)", cb(0))]]
+    rest = [n for n in _PRICE_PRESETS if n > 0]
+    for i in range(0, len(rest), 3):
+        rows.append([_B(f"{n} ⭐", cb(n)) for n in rest[i:i + 3]])
+    rows.append([_B("❌ Отмена" if back == "sis:cancel" else "⬅️ Назад", back)])
+    return InlineKeyboardMarkup(rows)
+
+
+def _mode_kb(cb, back: str = "sis:cancel"):
+    rows = [[_B(t, cb(m))] for m, t in _MODES.items()]
+    rows.append([_B("❌ Отмена" if back == "sis:cancel" else "⬅️ Назад", back)])
+    return InlineKeyboardMarkup(rows)
+
+
+def _item_lines(it: dict) -> str:
+    mode = _item_mode(it)
+    lines = [f"🛍 {it.get('title') or '—'}",
+             f"💰 Цена: {_price_txt(it.get('stars', 0))}",
+             f"📝 Описание: {it.get('desc') or '—'}",
+             f"🖼 Фото: {'есть' if it.get('photo') else 'нет'}",
+             f"📦 Выдача: {_MODES.get(mode, mode)}"]
+    if mode == "same":
+        lines.append(f"      текст: {(it.get('deliver') or '—')[:200]}")
+    elif mode == "random":
+        v = it.get("variants") or []
+        lines.append(f"      вариантов: {len(v)}" + (f" (напр.: {str(v[0])[:40]})" if v else ""))
+    elif mode == "codes":
+        lines.append(f"      на складе: {len(it.get('codes') or [])} шт")
+    return "\n".join(lines)
+
+
+def _item_card(it: dict):
+    iid = it["id"]
+    mode = _item_mode(it)
+    text = (_item_lines(it) + f"\n📈 Продано: {it.get('sold', 0)} · "
+            f"{'👁 виден в витрине' if it.get('enabled', True) else '🙈 скрыт'}")
+    rows = [[_B("✏️ Название", f"sie:title:{iid}"), _B("💰 Цена", f"sie:price:{iid}")],
+            [_B("📝 Описание", f"sie:desc:{iid}"), _B("🖼 Фото", f"sie:photo:{iid}")],
+            [_B("📦 Способ выдачи", f"sie:mode:{iid}")]]
+    extra = {"same": "✏️ Текст выдачи", "random": "✏️ Варианты", "codes": "➕ Коды"}.get(mode)
+    if extra:
+        rows[-1].append(_B(extra, f"sie:deliver:{iid}"))
+    rows.append([_B("🙈 Скрыть" if it.get("enabled", True) else "👁 Показать", f"sit:{iid}"),
+                 _B("🗑 Удалить", f"sid:{iid}")])
+    rows.append([_B("⬅️ К товарам", "m:shop")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def _si_set_price(send, context, n: int):
+    d = context.user_data.setdefault("shop_draft", {})
+    d["stars"] = max(0, min(100000, int(n)))
+    context.user_data["awaiting"] = "si_desc"
+    return await send(f"🛍 {d.get('title')} · {_price_txt(d['stars'])}\n\n"
+                      "Шаг 3/5 · Описание\nЧто получит покупатель, сроки, условия.",
+                      reply_markup=_skip_kb())
+
+
+async def _si_to_photo(send, context):
+    context.user_data["awaiting"] = "si_photo"
+    return await send("Шаг 4/5 · Фото\nПришли картинку товара — она будет в витрине.",
+                      reply_markup=_skip_kb())
+
+
+async def _si_to_mode(send, context):
+    d = context.user_data.setdefault("shop_draft", {})
+    if int(d.get("stars", 0) or 0) == 0:
+        d["mode"] = "manual"  # бесплатно = заявка: продавец получает её и связывается сам
+        return await _si_preview(send, context)
+    context.user_data["awaiting"] = "si_mode"
+    return await send(f"🛍 {d.get('title')} · {_price_txt(d.get('stars', 0))}\n\n"
+                      "Шаг 5/5 · Как выдавать товар после оплаты?\n\n"
+                      "📝 — всем одинаковый текст/ссылка\n"
+                      "🎲 — случайный вариант из списка\n"
+                      "🔑 — уникальные коды со склада (по одному на покупку)\n"
+                      "👤 — выдаёшь сам: заказ придёт тебе, ты свяжешься с покупателем",
+                      reply_markup=_mode_kb(lambda m: f"sim:{m}"))
+
+
+async def _si_preview(send, context):
+    context.user_data.pop("awaiting", None)
+    d = context.user_data.setdefault("shop_draft", {})
+    free = int(d.get("stars", 0) or 0) == 0
+    return await send("👀 Проверь товар перед сохранением:\n\n" + _item_lines(d) +
+                      ("\n\n🆓 Бесплатный товар: покупатель оставляет заявку с комментарием, "
+                       "а ты сразу получаешь её." if free else ""),
+                      reply_markup=InlineKeyboardMarkup([[_B("✅ Сохранить", "sis:save")],
+                                                         [_B("❌ Отмена", "sis:cancel")]]))
+
+
+async def _si_skip(send, context, awaiting):
+    d = context.user_data.setdefault("shop_draft", {})
+    if awaiting == "si_desc":
+        d["desc"] = ""
+        return await _si_to_photo(send, context)
+    if awaiting == "si_photo":
+        return await _si_to_mode(send, context)
+    if awaiting == "si_deliver":
+        d["mode"] = "manual"
+        return await _si_preview(send, context)
+    return await send("Сейчас нечего пропускать.")
+
+
+_EDIT_PROMPTS = {
+    "title": "✏️ Пришли новое название (до 32 символов).",
+    "desc": "📝 Пришли новое описание. «-» — убрать описание.",
+    "photo": "🖼 Пришли новую картинку. «-» — убрать фото.",
+}
+
+
+async def _shop_callback(query, context, data):
+    ud = context.user_data
+
+    async def edit(t, reply_markup=None):
+        await safe_edit(query, t, reply_markup)
+
+    async def ans(t=None, alert=False):
+        try:
+            await query.answer(t, show_alert=alert)
+        except Exception:  # noqa: BLE001
+            pass
+
+    if data == "add:shopitem":
+        ud["shop_draft"] = {}
+        ud.pop("shop_edit", None)
+        ud["awaiting"] = "si_title"
+        await edit("🛍 Новый товар · шаг 1/5\n\nКак называется товар? (до 32 символов)\n"
+                   "Например: «Реклама в чате на сутки»", _cancel_kb())
+        return await ans()
+    if data == "add:shopnotify":
+        ud["awaiting"] = "shopnotify"
+        cur = ", ".join(str(x) for x in _shop_targets())
+        await edit("🔔 Куда присылать заказы?\n\nПришли ID через запятую: свой ID (узнать — /userid), "
+                   "ID помощников-продавцов или ID чата продавцов (отрицательное число, бот должен "
+                   "быть в нём). Каждый продавец должен хоть раз нажать /start у бота.\n"
+                   f"«-» — только владельцам бота.\n\nСейчас: {cur}", _cancel_kb("m:shop"))
+        return await ans()
+    if data.startswith("sip:"):
+        if "shop_draft" not in ud:
+            return await ans("Мастер устарел — начни заново", True)
+        await _si_set_price(edit, context, int(data[4:]))
+        return await ans()
+    if data.startswith("sim:"):
+        d = ud.get("shop_draft")
+        if d is None:
+            return await ans("Мастер устарел — начни заново", True)
+        mode = data[4:]
+        d["mode"] = mode
+        if mode == "manual":
+            await _si_preview(edit, context)
+        else:
+            ud["awaiting"] = "si_deliver"
+            await edit(f"{_MODES[mode]}\n\n{_MODE_HINT[mode]}", _skip_kb())
+        return await ans()
+    if data == "sis:skip":
+        await _si_skip(edit, context, ud.get("awaiting"))
+        return await ans()
+    if data == "sis:save":
+        d = ud.pop("shop_draft", None)
+        ud.pop("awaiting", None)
+        if not d or not d.get("title"):
+            return await ans("Нечего сохранять — начни заново", True)
+        it = {"id": f"i{int(time.time() * 1000) % 10 ** 9}", "title": d["title"],
+              "stars": int(d.get("stars", 0) or 0), "desc": d.get("desc", ""), "photo": d.get("photo", ""),
+              "mode": d.get("mode", "manual"), "deliver": d.get("deliver", ""),
+              "variants": d.get("variants", []), "codes": d.get("codes", []), "enabled": True, "sold": 0}
+        _shop_items().append(it)
+        save_config(force=True)
+        t, kb = _item_card(it)
+        warn = "" if (CONFIG.get("shop") or {}).get("enabled") else "\n⚠️ Магазин сейчас закрыт — открой его в разделе 🛒."
+        await edit("✅ Товар добавлен в витрину!" + warn + "\n\n" + t, kb)
+        return await ans("Сохранено")
+    if data == "sis:cancel":
+        for k in ("shop_draft", "awaiting", "shop_edit"):
+            ud.pop(k, None)
+        return await _render_menu(query, context, "m:shop")
+
+    pref, _, rest = data.partition(":")
+    if pref == "sie":
+        field, _, iid = rest.partition(":")
+    elif pref in ("sep", "sem"):
+        iid, _, val = rest.rpartition(":")
+    else:
+        iid = rest
+    it = _item_by_id(iid)
+    if not it:
+        await ans("Товар не найден", True)
+        return await _render_menu(query, context, "m:shop")
+
+    if pref == "shi":
+        ud.pop("awaiting", None)
+        ud.pop("shop_edit", None)
+    elif pref == "sit":
+        it["enabled"] = not it.get("enabled", True)
+        save_config(force=True)
+    elif pref == "sid":
+        await edit(f"🗑 Удалить «{it.get('title')}» из магазина?",
+                   InlineKeyboardMarkup([[_B("Да, удалить", f"sidy:{iid}"), _B("Нет", f"shi:{iid}")]]))
+        return await ans()
+    elif pref == "sidy":
+        _shop().setdefault("items", []).remove(it)
+        save_config(force=True)
+        await ans("Удалено")
+        return await _render_menu(query, context, "m:shop")
+    elif pref == "sep":
+        it["stars"] = max(0, int(val))
+        save_config(force=True)
+        ud.pop("awaiting", None)
+        ud.pop("shop_edit", None)
+    elif pref == "sem":
+        it["mode"] = val
+        save_config(force=True)
+        has = {"same": it.get("deliver"), "random": it.get("variants"), "codes": it.get("codes")}.get(val, True)
+        if not has:
+            ud["awaiting"] = "se"
+            ud["shop_edit"] = {"iid": iid, "field": "deliver"}
+            await edit(f"{_MODES[val]}\n\n{_MODE_HINT[val]}", _cancel_kb(f"shi:{iid}"))
+            return await ans()
+    elif pref == "sie":
+        if field == "price":
+            ud["awaiting"] = "se"
+            ud["shop_edit"] = {"iid": iid, "field": "price"}
+            await edit(f"💰 Новая цена для «{it.get('title')}».\nВыбери кнопкой или пришли число звёзд.",
+                       _price_kb(lambda n: f"sep:{iid}:{n}", back=f"shi:{iid}"))
+            return await ans()
+        if field == "mode":
+            await edit("📦 Как выдавать товар после оплаты?",
+                       _mode_kb(lambda m: f"sem:{iid}:{m}", back=f"shi:{iid}"))
+            return await ans()
+        if field == "deliver":
+            mode = _item_mode(it)
+            prompt = {
+                "same": "✏️ Пришли новый текст выдачи (заменит старый).",
+                "random": f"🎲 Пришли варианты — каждый с новой строки (заменят старые, сейчас "
+                          f"{len(it.get('variants') or [])}).",
+                "codes": f"🔑 Пришли новые коды — каждый с новой строки. Они ДОБАВЯТСЯ к складу "
+                         f"(сейчас {len(it.get('codes') or [])}). «-» — очистить склад.",
+            }.get(mode, "Для этого способа выдачи текст не нужен.")
+        else:
+            prompt = _EDIT_PROMPTS.get(field, "Пришли новое значение.")
+        ud["awaiting"] = "se"
+        ud["shop_edit"] = {"iid": iid, "field": field}
+        await edit(prompt, _cancel_kb(f"shi:{iid}"))
+        return await ans()
+    t, kb = _item_card(it)
+    await edit(t, kb)
+    return await ans()
+
+
+async def _shop_text(update, context, awaiting, text, msg):
+    """Текст/фото в мастере и редакторе товаров."""
+    ud = context.user_data
+    send = msg.reply_text
+    if awaiting == "shopnotify":
+        s = _shop()
+        if text.strip() in ("-", "—"):
+            s["notify"] = []
+        else:
+            ids = [int(x) for x in re.findall(r"-?\d{5,}", text)]
+            if not ids:
+                return await send("Не вижу ID. Пришли числа через запятую или «-» (или /cancel)")
+            s["notify"] = ids
+        save_config(force=True)
+        ud.pop("awaiting", None)
+        return await send("🔔 Сохранено. Заказы будут приходить: " +
+                          ", ".join(str(x) for x in _shop_targets()), reply_markup=shop_kb())
+    if awaiting == "si_mode":
+        return await send("Выбери способ выдачи кнопкой выше 👆 (или /cancel)")
+    d = ud.setdefault("shop_draft", {})
+    if awaiting == "si_title":
+        if not text:
+            return await send("Пришли название текстом (или /cancel)")
+        d.clear()
+        d["title"] = text[:32]
+        ud["awaiting"] = "si_price"
+        return await send(f"🛍 {d['title']}\n\nШаг 2/5 · Цена\nВыбери кнопкой или пришли число звёзд.\n"
+                          "«Бесплатно» — покупатель оставляет заявку, а ты сразу получаешь её.",
+                          reply_markup=_price_kb(lambda n: f"sip:{n}"))
+    if awaiting == "si_price":
+        n = _parse_price(text)
+        if n is None:
+            return await send("Пришли число звёзд, например 150 (0 — бесплатно)")
+        return await _si_set_price(send, context, n)
+    if awaiting == "si_desc":
+        d["desc"] = text[:500]
+        return await _si_to_photo(send, context)
+    if awaiting == "si_photo":
+        if msg.photo:
+            d["photo"] = msg.photo[-1].file_id
+        elif text.lower() not in ("-", "—", "нет"):
+            return await send("Пришли картинку или нажми «Пропустить»", reply_markup=_skip_kb())
+        return await _si_to_mode(send, context)
+    if awaiting == "si_deliver":
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return await send("Пришли текст (или «Пропустить» — тогда выдаёшь вручную)",
+                              reply_markup=_skip_kb())
+        mode = d.get("mode")
+        if mode == "same":
+            d["deliver"] = text
+        elif mode == "random":
+            d["variants"] = lines
+        elif mode == "codes":
+            d["codes"] = lines
+        return await _si_preview(send, context)
+    if awaiting == "se":
+        se = ud.get("shop_edit") or {}
+        it = _item_by_id(se.get("iid"))
+        if not it:
+            ud.pop("awaiting", None)
+            ud.pop("shop_edit", None)
+            return await send("Товар не найден. Панель — /panel")
+        f = se.get("field")
+        low = text.strip().lower()
+        if f == "title":
+            if not text:
+                return await send("Пришли название текстом")
+            it["title"] = text[:32]
+        elif f == "desc":
+            it["desc"] = "" if low in ("-", "—") else text[:500]
+        elif f == "photo":
+            if msg.photo:
+                it["photo"] = msg.photo[-1].file_id
+            elif low in ("-", "—", "нет"):
+                it["photo"] = ""
+            else:
+                return await send("Пришли картинку (или «-», чтобы убрать фото)")
+        elif f == "price":
+            n = _parse_price(text)
+            if n is None:
+                return await send("Пришли число звёзд (0 — бесплатно)")
+            it["stars"] = n
+        elif f == "deliver":
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            mode = _item_mode(it)
+            if mode == "codes" and low in ("-", "—"):
+                it["codes"] = []
+            elif not lines:
+                return await send("Пришли текст")
+            elif mode == "same":
+                it["deliver"], it["mode"] = text, "same"
+            elif mode == "random":
+                it["variants"] = lines
+            elif mode == "codes":
+                it.setdefault("codes", []).extend(lines)
+        save_config(force=True)
+        ud.pop("awaiting", None)
+        ud.pop("shop_edit", None)
+        t, kb = _item_card(it)
+        return await send("✅ Сохранено\n\n" + t, reply_markup=kb)
+    ud.pop("awaiting", None)
+    return await send("Не разобрал. Панель — /panel")
+
+
+# ───────────────────────────────────────────────────────────────────────────
+#  🎲 РАНДОМ И 🎉 РОЗЫГРЫШИ
+# ───────────────────────────────────────────────────────────────────────────
+
+RANDOM_HELP = (
+    "🎲 Рандом\n"
+    "/random 100 — число от 1 до 100\n"
+    "/random 5 50 — число от 5 до 50\n"
+    "/random пицца, суши, бургер — случайный выбор\n\n"
+    "🎉 Розыгрыш (в группе, для админов):\n"
+    "/random Приз | победителей | время\n"
+    "Например: /random Подписка на месяц | 2 | 1д\n"
+    "Время: 30m, 2ч, 1д (по умолчанию 1 ч). Участники жмут кнопку, итоги — сами.\n"
+    "/gwend — подвести итоги сейчас · /reroll — перевыбрать победителей "
+    "(реплаем на розыгрыш или последний)"
+)
+
+
+def _gw_all() -> dict:
+    return CONFIG.setdefault("giveaways", {})
+
+
+def _gw_text(g, final: bool = False) -> str:
+    e = html.escape
+    k = len(g.get("parts") or [])
+    if not final:
+        ends = datetime.fromtimestamp(g["ends"], _post_tz()).strftime("%d.%m %H:%M")
+        left = max(60, int(g["ends"] - time.time()))
+        return (f"🎉 <b>РОЗЫГРЫШ</b>\n\n🎁 Приз: <b>{e(g['prize'])}</b>\n"
+                f"🏆 Победителей: {g['winners']}\n⏰ Итоги: {ends} (через ~{human_duration(left // 60 * 60)})\n"
+                f"👥 Участников: {k}\n\nЖми кнопку ниже, чтобы участвовать 👇")
+    names = g.get("names") or {}
+    wl = "\n".join(f"{i + 1}. <a href=\"tg://user?id={u}\">{e(names.get(str(u), str(u)))}</a>"
+                   for i, u in enumerate(g.get("won") or [])) or "— участников не нашлось —"
+    return (f"🏁 <b>РОЗЫГРЫШ ЗАВЕРШЁН</b>\n\n🎁 Приз: <b>{e(g['prize'])}</b>\n"
+            f"👥 Участников: {k}\n\n🏆 Победители:\n{wl}")
+
+
+def _gw_kb(g):
+    return InlineKeyboardMarkup([[_B(f"🎉 Участвовать · {len(g.get('parts') or [])}", f"gwj:{g['id']}")]])
+
+
+def _gw_parse(text: str):
+    parts = [p.strip() for p in text.split("|")]
+    prize = parts[0]
+    winners, secs = 1, 3600
+    if len(parts) > 1 and parts[1]:
+        m = re.search(r"\d+", parts[1])
+        winners = int(m.group()) if m else 1
+    if len(parts) > 2 and parts[2]:
+        secs = parse_duration(parts[2].replace(" ", "").lower()) or 3600
+    return prize, max(1, min(50, winners)), max(60, min(30 * 86400, secs))
+
+
+async def gw_start(bot, chat_id: int, prize: str, winners: int, secs: int, by: int):
+    gid = f"g{int(time.time() * 1000) % 10 ** 9}"
+    g = {"id": gid, "chat": int(chat_id), "prize": prize[:200], "winners": winners,
+         "ends": time.time() + secs, "parts": [], "names": {}, "status": "active", "won": [], "by": by}
+    m = await bot.send_message(chat_id, _gw_text(g), parse_mode="HTML", reply_markup=_gw_kb(g))
+    g["mid"] = m.message_id
+    _gw_all()[gid] = g
+    save_config(force=True)
+    return g
+
+
+async def gw_finish(bot, g, reroll: bool = False):
+    """Итоги: случайные победители среди тех, кто всё ещё в группе."""
+    prev = set(g.get("won") or []) if reroll else set()
+    pool = [u for u in (g.get("parts") or []) if u not in prev]
+    random.shuffle(pool)
+    won, checked = [], 0
+    for uid in pool:
+        if len(won) >= int(g.get("winners", 1)):
+            break
+        ok = True
+        if checked < 200:
+            checked += 1
+            try:
+                m = await bot.get_chat_member(g["chat"], uid)
+                ok = m.status in ("member", "administrator", "creator", "restricted")
+            except Exception:  # noqa: BLE001
+                ok = True
+        if ok:
+            won.append(uid)
+    g["won"], g["status"], g["ended_ts"] = won, "ended", time.time()
+    save_config(force=True)
+    try:
+        await bot.edit_message_text(_gw_text(g, final=True), chat_id=g["chat"], message_id=g.get("mid"),
+                                    parse_mode="HTML")
+    except Exception:  # noqa: BLE001
+        pass
+    names = g.get("names") or {}
+    if won:
+        ment = ", ".join(f'<a href="tg://user?id={u}">{html.escape(names.get(str(u), str(u)))}</a>' for u in won)
+        txt = (f"🎉 {'Перевыбор! ' if reroll else ''}Победители розыгрыша "
+               f"«{html.escape(g['prize'])}»: {ment}\nПоздравляем! 🥳")
+    else:
+        txt = f"😔 В розыгрыше «{html.escape(g['prize'])}» не нашлось участников."
+    try:
+        await bot.send_message(g["chat"], txt, parse_mode="HTML", reply_to_message_id=g.get("mid"),
+                               allow_sending_without_reply=True)
+    except Exception as e:  # noqa: BLE001
+        log.debug("gw announce: %s", e)
+    title = CONFIG.get("groups", {}).get(str(g["chat"]), "чат")
+    for u in won:
+        try:
+            await bot.send_message(u, f"🎉 Ты выиграл(а) «{g['prize']}» в «{title}»! Свяжись с организатором.")
+        except Exception:  # noqa: BLE001
+            pass
+    return won
+
+
+async def _tick_giveaways(context):
+    now = time.time()
+    for g in list(_gw_all().values()):
+        if g.get("status") != "active":
+            continue
+        if float(g.get("ends", 0)) <= now:
+            await gw_finish(context.bot, g)
+        elif _throttle(("gwtick", g["id"]), 600):  # раз в 10 минут обновляем обратный отсчёт
+            try:
+                await context.bot.edit_message_text(_gw_text(g), chat_id=g["chat"], message_id=g.get("mid"),
+                                                    parse_mode="HTML", reply_markup=_gw_kb(g))
+            except Exception:  # noqa: BLE001
+                pass
+
+
+async def handle_gw_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    u = update.effective_user
+    g = _gw_all().get((q.data or "gwj:").split(":", 1)[1])
+    if not g or g.get("status") != "active":
+        return await q.answer("Розыгрыш уже завершён", show_alert=True)
+    if u is None or u.is_bot:
+        return await q.answer()
+    if u.id in g["parts"]:
+        return await q.answer("Ты уже участвуешь ✅ Удачи!")
+    if is_blacklisted(g["chat"], u):
+        return await q.answer("Участие недоступно", show_alert=True)
+    g["parts"].append(u.id)
+    g.setdefault("names", {})[str(u.id)] = _display_name(u)
+    save_config()
+    ends = datetime.fromtimestamp(g["ends"], _post_tz()).strftime("%d.%m %H:%M")
+    await q.answer(f"🎉 Ты в игре! Итоги — {ends}")
+    if _throttle(("gwedit", g["id"]), 3.0):
+        try:
+            await q.edit_message_text(_gw_text(g), parse_mode="HTML", reply_markup=_gw_kb(g))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _gw_pick(chat_id: int, reply_mid, status: str):
+    items = [g for g in _gw_all().values() if g.get("chat") == chat_id]
+    if reply_mid:
+        g = next((g for g in items if g.get("mid") == reply_mid), None)
+        if g:
+            return g
+    items = [g for g in items if g.get("status") == status]
+    return max(items, key=lambda g: g.get("ends", 0)) if items else None
+
+
+async def _gw_allowed(update, context) -> bool:
+    chat, user = update.effective_chat, update.effective_user
+    return is_anon_admin(update) or await can_open_settings(context, chat.id, user.id)
+
+
+async def cmd_random(update: Update, context):
+    chat, user = update.effective_chat, update.effective_user
+    raw = _args_text(update)
+    if "|" in raw:
+        if chat.type not in ("group", "supergroup"):
+            return await update.effective_message.reply_text(
+                "🎉 Розыгрыш запускается в группе: /random Приз | победителей | время")
+        if not await _gw_allowed(update, context):
+            return await _deny(update)
+        prize, n, secs = _gw_parse(raw)
+        if not prize:
+            return await update.effective_message.reply_text(RANDOM_HELP)
+        try:
+            await update.effective_message.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        await gw_start(context.bot, chat.id, prize, n, secs, user.id)
+        return await log_action(context, chat.id, f"🎉 розыгрыш «{prize}» (by {_actor_name(update)})")
+    if "," in raw:
+        opts = [o.strip() for o in raw.split(",") if o.strip()]
+        if len(opts) >= 2:
+            return await reply_tidy(update, context,
+                                    f"🎲 Выбираю из {len(opts)}… <b>{html.escape(random.choice(opts))}</b>!",
+                                    seconds=60, parse_mode="HTML")
+    m2 = re.fullmatch(r"\s*(-?\d+)\s+(-?\d+)\s*", raw)
+    if m2:
+        a, b = sorted((int(m2.group(1)), int(m2.group(2))))
+        return await reply_tidy(update, context, f"🎲 Число от {a} до {b}: <b>{random.randint(a, b)}</b>",
+                                seconds=60, parse_mode="HTML")
+    m1 = re.fullmatch(r"\s*(\d+)\s*", raw)
+    if m1:
+        n = max(1, int(m1.group(1)))
+        return await reply_tidy(update, context, f"🎲 Число от 1 до {n}: <b>{random.randint(1, n)}</b>",
+                                seconds=60, parse_mode="HTML")
+    await reply_tidy(update, context, RANDOM_HELP, seconds=60)
+
+
+async def cmd_gwend(update: Update, context):
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return
+    if not await _gw_allowed(update, context):
+        return await _deny(update)
+    rt = update.effective_message.reply_to_message
+    g = _gw_pick(chat.id, rt.message_id if rt else None, "active")
+    if not g or g.get("status") != "active":
+        return await reply_tidy(update, context, "Активного розыгрыша нет.")
+    await gw_finish(context.bot, g)
+
+
+async def cmd_reroll(update: Update, context):
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return
+    if not await _gw_allowed(update, context):
+        return await _deny(update)
+    rt = update.effective_message.reply_to_message
+    g = _gw_pick(chat.id, rt.message_id if rt else None, "ended")
+    if not g or g.get("status") != "ended":
+        return await reply_tidy(update, context, "Нет завершённого розыгрыша для перевыбора.")
+    await gw_finish(context.bot, g, reroll=True)
+
+
+async def _gw_callback(query, context, data):
+    tgt = context.user_data.get("cfg_target")
+    if data == "add:gwnew":
+        if not tgt or tgt == "defaults":
+            return await query.answer("Сначала выбери группу", show_alert=True)
+        return await _ask(query, context, "gwnew",
+                          "🎉 Новый розыгрыш в выбранной группе.\nФормат: Приз | победителей | время\n"
+                          "Например: Подписка на месяц | 2 | 1д\nВремя: 30m, 2ч, 1д. (или /cancel)")
+    g = _gw_all().get(data.split(":", 1)[1])
+    if not g:
+        return await query.answer("Розыгрыш не найден", show_alert=True)
+    if not is_manager(query.from_user.id) and str(g.get("chat")) != str(tgt):
+        return await query.answer("Это розыгрыш другой группы", show_alert=True)
+    if data.startswith("gwe:") and g.get("status") == "active":
+        await gw_finish(context.bot, g)
+        await query.answer("🏁 Итоги подведены")
+    elif data.startswith("gwr:") and g.get("status") == "ended":
+        await gw_finish(context.bot, g, reroll=True)
+        await query.answer("🔁 Победители перевыбраны")
+    return await _render_menu(query, context, "m:gw")
+
+
+async def _gw_text_input(update, context, text, msg):
+    tgt = context.user_data.get("cfg_target")
+    prize, n, secs = _gw_parse(text)
+    if not prize or not tgt or tgt == "defaults":
+        return await msg.reply_text("Формат: Приз | победителей | время (или /cancel)")
+    context.user_data.pop("awaiting", None)
+    try:
+        await gw_start(context.bot, int(tgt), prize, n, secs, update.effective_user.id)
+    except Exception as e:  # noqa: BLE001
+        return await msg.reply_text(f"Не смог отправить в группу: {e}")
+    title = CONFIG.get("groups", {}).get(str(tgt), str(tgt))
+    return await msg.reply_text(f"🎉 Розыгрыш «{prize}» запущен в «{title}»: {n} победител(ей), "
+                                f"итоги через {human_duration(secs)}.")
+
+
 async def on_error(update, context):
     err = context.error
     if isinstance(err, (NetworkError, TimedOut)):
@@ -7255,6 +8420,8 @@ async def _post_init(app: Application):
             BotCommand("list", "список автоответов"),
             BotCommand("pro", "тариф и оплата"),
             BotCommand("shop", "магазин"),
+            BotCommand("orders", "мои заказы"),
+            BotCommand("random", "рандом: число, выбор"),
             BotCommand("userid", "мой ID"),
             BotCommand("skip", "пропустить шаг"),
             BotCommand("cancel", "отменить ввод"),
@@ -7270,6 +8437,8 @@ async def _post_init(app: Application):
             BotCommand("top", "топ актива"),
             BotCommand("pro", "тариф для группы"),
             BotCommand("shop", "магазин"),
+            BotCommand("orders", "мои заказы"),
+            BotCommand("random", "рандом: число, выбор"),
         ], scope=BotCommandScopeAllGroupChats())
         await app.bot.set_my_commands([
             BotCommand("ban", "бан (реплаем/ID, можно срок)"),
@@ -7296,6 +8465,9 @@ async def _post_init(app: Application):
             BotCommand("gmanager", "назначить менеджера группы"),
             BotCommand("ungmanager", "снять менеджера группы"),
             BotCommand("gmanagers", "менеджеры группы"),
+            BotCommand("random", "рандом и розыгрыш: приз | победителей | время"),
+            BotCommand("gwend", "подвести итоги розыгрыша"),
+            BotCommand("reroll", "перевыбрать победителей"),
             BotCommand("setrules", "изменить правила"),
             BotCommand("setwelcome", "текст приветствия"),
             BotCommand("add", "автоответ: ключ - ответ"),
@@ -7381,7 +8553,9 @@ def build_app() -> Application:
         ("say", cmd_say), ("diag", cmd_diag), ("reload", cmd_reload),
         ("pro", cmd_pro), ("grantpro", cmd_grantpro), ("broadcast", cmd_broadcast),
         ("grant", cmd_grant), ("revoke", cmd_revoke), ("managers", cmd_managers),
-        ("gmanager", cmd_gmanager), ("shop", cmd_shop), ("ungmanager", cmd_ungmanager), ("gmanagers", cmd_gmanagers),
+        ("gmanager", cmd_gmanager), ("shop", cmd_shop),
+        ("random", cmd_random), ("rand", cmd_random), ("giveaway", cmd_random),
+        ("reroll", cmd_reroll), ("gwend", cmd_gwend), ("orders", cmd_orders), ("ungmanager", cmd_ungmanager), ("gmanagers", cmd_gmanagers),
     ):
         app.add_handler(CommandHandler(name, fn))
 
@@ -7392,6 +8566,8 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(handle_action_press, pattern=r"^(act|arole):"))
     app.add_handler(CallbackQueryHandler(handle_buy_group_press, pattern=r"^buyg:"))
     app.add_handler(CallbackQueryHandler(handle_allstop_press, pattern=r"^allstop$"))
+    app.add_handler(CallbackQueryHandler(handle_order_press, pattern=r"^osd:"))
+    app.add_handler(CallbackQueryHandler(handle_gw_join, pattern=r"^gwj:"))
     app.add_handler(CallbackQueryHandler(on_callback))
 
     # Платежи, входы, членство
@@ -7445,7 +8621,7 @@ def main():
         jq.run_repeating(janitor_job, interval=3600, first=600)
         jq.run_repeating(maintenance_daily_job, interval=86400, first=120)
         jq.run_repeating(weekly_digest_job, interval=3600, first=900)
-    log.info("Channel Guard v6 запускается…")
+    log.info("Channel Guard v6.1 запускается…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
