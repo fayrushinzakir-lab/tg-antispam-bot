@@ -1,10 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-Channel Guard Bot  —  версия 5
+Channel Guard Bot  —  версия 6 («всё в одном»)
 ================================================
 Антиспам + автоответы (текст/медиа/кнопки) + панель в ЛС + модерация + капча +
 приветствие + привлечение (промо, рассылки, посты по расписанию) + роли +
 анти-снос/анти-рейд + оплата звёздами Telegram.
+
+Что нового в v6:
+  • Панель из 6 разделов-хабов: 🛡 Защита, ⚖️ Модерация, 💬 Общение, 📮 Посты,
+    📊 Статистика, ⚙️ Система. Все стоп-списки — в одном месте «🚫 Фильтры слов».
+    Кнопка «Назад» возвращает в свой раздел, а не в корень. Старые настройки не менялись.
+  • 🛒 Магазин Mini App: тариф PRO для группы и свои товары за звёзды Telegram.
+    Встроенный веб-сервер (aiohttp) отдаёт страницу магазина и выставляет счета.
+    Настройка: WEBAPP_URL (публичный https-адрес), SHOP_PORT, SHOP_APP_NAME.
+
+Что нового в v5.1:
+  • Параллельная обработка апдейтов: ИИ, /all и рассылки больше не «замораживают» бота.
+  • Кэш скомпилированных стоп-слов (в десятки раз меньше работы на сообщение).
+  • Капча, заявки и мягкие муты переживают перезапуск (нет «вечного мута»).
+  • Промо, авто-сообщения, посты и недельная сводка не шлются залпом после рестарта.
+  • Длинные кулдауны болталки больше не сбрасываются уборщиком.
+  • Отдельный срок «мута за спам»; экранирование имён в HTML.
+  • 👤 Менеджеры группы: полный доступ к настройкам и модерации своей группы
+    без админки Telegram (назначает создатель группы или владелец бота).
 
 Что нового в v5 (относительно v4):
   • Стоп-слова: точное совпадение по умолчанию; «слово*» — начало слова,
@@ -38,7 +56,8 @@ Channel Guard Bot  —  версия 5
     предупреждение, три предупреждения → бан (настраивается в панели).
 
 Запуск: переменная окружения BOT_TOKEN. Главный владелец: ADMIN_IDS.
-Зависимости: pip install "python-telegram-bot[job-queue,rate-limiter]"
+Зависимости: pip install "python-telegram-bot[job-queue,rate-limiter]" aiohttp
+(aiohttp нужен только для магазина Mini App; без него бот работает как обычно)
 """
 
 import os
@@ -52,11 +71,19 @@ import io
 import asyncio
 import random
 import logging
+import functools
+import hmac
+import hashlib
 
 import httpx  # идёт в комплекте с python-telegram-bot
+
+try:  # веб-сервер магазина Mini App (необязательно)
+    from aiohttp import web
+except ImportError:  # noqa: SIM105
+    web = None
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
+from urllib.parse import quote, parse_qsl
 
 from telegram import (
     Update,
@@ -64,6 +91,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
+    WebAppInfo,
     BotCommand,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllChatAdministrators,
@@ -105,6 +133,15 @@ CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 AI_API_KEY = os.environ.get("AI_API_KEY", "").strip()
 AI_BASE_URL = (os.environ.get("AI_BASE_URL", "https://api.openai.com/v1") or "").rstrip("/")
 AI_MODEL = os.environ.get("AI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+
+# ── Магазин Mini App (необязательно) ──
+#   WEBAPP_URL    — публичный HTTPS-адрес, который проксируется на SHOP_PORT (напр. https://shop.site.ru)
+#   SHOP_PORT     — порт встроенного веб-сервера (по умолчанию 8080), SHOP_HOST — интерфейс (0.0.0.0)
+#   SHOP_APP_NAME — короткое имя Mini App из BotFather (/newapp) — для кнопки прямо в группе
+WEBAPP_URL = (os.environ.get("WEBAPP_URL", "") or "").strip().rstrip("/")
+SHOP_PORT = int(os.environ.get("SHOP_PORT", "8080") or 8080)
+SHOP_HOST = os.environ.get("SHOP_HOST", "0.0.0.0") or "0.0.0.0"
+SHOP_APP_NAME = (os.environ.get("SHOP_APP_NAME", "") or "").strip()
 
 # ───────────────────────────────────────────────────────────────────────────
 #  ВСТРОЕННЫЙ МАТ-ФИЛЬТР (второй список слов: пред → 3 преда → бан)
@@ -227,7 +264,7 @@ DEFAULT_CONFIG = {
             "Здесь! Спам не пройдёт, шутка — всегда 🤝",
         ],
     },
-    "moderation": {"warn_limit": 3, "warn_action": "ban", "warn_mute": 3600, "mod_admins_only": False, "log_actions": False, "warn_expire_days": 0, "notify_delete": False},
+    "moderation": {"warn_limit": 3, "warn_action": "ban", "warn_mute": 3600, "mod_admins_only": False, "log_actions": False, "warn_expire_days": 0, "notify_delete": False, "spam_mute": 0},
     # Анти-рейд: при всплеске входов включается строгий режим на время
     "antiraid": {"enabled": False, "joins": 8, "window": 60, "lock_min": 10},
     # Кто может выполнять команды (по группам). Уровни: all|admins|owner (создатель). Владелец/менеджеры бота — всегда.
@@ -245,6 +282,8 @@ DEFAULT_CONFIG = {
     "roles": {},
     # Staff-группа (служебный чат для уведомлений по этой группе); 0 — не задана
     "staff_group": 0,
+    # Менеджеры ЭТОЙ группы: полный доступ к её настройкам и модерации без админки Telegram
+    "group_managers": [],
     # Чёрный список пользователей этой группы: по ID и по подстрокам имени/юзернейма
     "blacklist": {"ids": [], "names": []},
     "welcome": {"enabled": False, "text": "Добро пожаловать, {name}! Рады видеть тебя в «{chat}».", "buttons": [], "delete_after": 0},
@@ -305,6 +344,14 @@ DEFAULT_CONFIG = {
     # Индивидуальные настройки по чатам: {chat_id: {...только per-chat ключи...}}
     # Если для чата записи нет — используются глобальные настройки выше (как шаблон).
     "chats": {},
+    # Служебное состояние, переживающее перезапуск (метки рассылок, ожидания капчи, мягкие муты)
+    # Магазин Mini App: свои товары (тариф PRO для группы добавляется автоматически)
+    # items: [{"id","title","desc","stars","deliver","enabled"}]
+    "shop": {"enabled": False, "title": "Магазин", "items": []},
+    "shop_orders": [],
+    "runtime": {},
+    "pending": {},
+    "soft_mutes": {},
 }
 
 SHORTENERS = {
@@ -402,7 +449,8 @@ PER_CHAT_KEYS = ("enabled", "flood", "stop_words", "white_words", "spam_action",
                  "stop_words2_profile", "spam_links", "triggers",
                  "trigger_match", "moderation", "welcome", "captcha", "show_join_id",
                  "rules", "antinuke", "cmd_perms", "media_block", "media_action", "night", "recurring",
-                 "roles", "staff_group", "lang", "blacklist", "antiraid", "chatter")
+                 "roles", "staff_group", "lang", "blacklist", "antiraid", "chatter",
+                 "group_managers")
 PER_CHAT_DICTS = ("enabled", "flood", "moderation", "welcome", "captcha", "antinuke",
                   "cmd_perms", "media_block", "night", "roles", "blacklist", "antiraid",
                   "chatter")
@@ -428,7 +476,7 @@ def _merge_defaults(data: dict) -> dict:
     if not isinstance(data, dict):
         return cfg
     for k, v in data.items():
-        if k in ("enabled", "flood", "moderation", "welcome", "promo", "antinuke", "captcha", "cmd_perms", "media_block", "night", "roles", "blacklist", "antiraid", "chatter") and isinstance(v, dict):
+        if k in ("enabled", "flood", "moderation", "welcome", "promo", "antinuke", "captcha", "cmd_perms", "media_block", "night", "roles", "blacklist", "antiraid", "chatter", "shop") and isinstance(v, dict):
             cfg[k].update(v)
         else:
             cfg[k] = v
@@ -603,13 +651,29 @@ ADMIN_CACHE_TTL = 300
 _state = {"last_promo": 0.0}
 
 
+def _pair_key(chat_id, user_id) -> str:
+    return f"{chat_id}:{user_id}"
+
+
+def _split_pair(key: str):
+    c, u = key.rsplit(":", 1)
+    return int(c), int(u)
+
+
 def soft_mute_add(chat_id: int, user_id: int, seconds: int = 0):
-    """Мягкий мут: сообщения этого пользователя удаляются (для обычных групп и для админов)."""
-    soft_mutes[(chat_id, user_id)] = (time.time() + seconds) if seconds else 0.0
+    """Мягкий мут: сообщения этого пользователя удаляются (для обычных групп и для админов).
+    Хранится в конфиге — переживает перезапуск."""
+    until = (time.time() + seconds) if seconds else 0.0
+    soft_mutes[(chat_id, user_id)] = until
+    CONFIG.setdefault("soft_mutes", {})[_pair_key(chat_id, user_id)] = until
+    save_config()
 
 
 def soft_mute_remove(chat_id: int, user_id: int):
-    soft_mutes.pop((chat_id, user_id), None)
+    had = soft_mutes.pop((chat_id, user_id), None) is not None
+    had_cfg = CONFIG.setdefault("soft_mutes", {}).pop(_pair_key(chat_id, user_id), None) is not None
+    if had or had_cfg:
+        save_config()
 
 
 def is_soft_muted(chat_id: int, user_id: int) -> bool:
@@ -617,18 +681,69 @@ def is_soft_muted(chat_id: int, user_id: int) -> bool:
     if until is None:
         return False
     if until and until <= time.time():
-        soft_mutes.pop((chat_id, user_id), None)
+        soft_mute_remove(chat_id, user_id)
         return False
     return True
+
+
+def _load_soft_mutes():
+    """Поднять мягкие муты из конфига в память (при старте, /reload, восстановлении бэкапа)."""
+    soft_mutes.clear()
+    now = time.time()
+    store = CONFIG.setdefault("soft_mutes", {})
+    for k, v in list(store.items()):
+        try:
+            c, u = _split_pair(k)
+            v = float(v or 0)
+        except Exception:  # noqa: BLE001
+            store.pop(k, None)
+            continue
+        if v and v <= now:
+            store.pop(k, None)
+            continue
+        soft_mutes[(c, u)] = v
 
 
 def _throttle(key, seconds: float) -> bool:
-    """Анти-флуд действий: True, если по ключу прошло >= seconds с прошлого раза."""
+    """Анти-флуд действий: True, если по ключу прошло >= seconds с прошлого раза.
+    Храним момент ИСТЕЧЕНИЯ — уборщик удаляет только истёкшие ключи,
+    поэтому кулдауны в 6 и 20 часов больше не сбрасываются раньше времени."""
     now = time.time()
-    if now - _throttle_store.get(key, 0.0) < seconds:
+    if now < _throttle_store.get(key, 0.0):
         return False
-    _throttle_store[key] = now
+    _throttle_store[key] = now + seconds
     return True
+
+
+def _rt() -> dict:
+    """Служебное состояние в конфиге (переживает перезапуск)."""
+    return CONFIG.setdefault("runtime", {})
+
+
+def _pend_set(kind: str, chat_id: int, uid: int, deadline: float, mid=None):
+    """Запомнить ожидание капчи/заявки, чтобы после рестарта довести его до конца."""
+    CONFIG.setdefault("pending", {}).setdefault(kind, {})[_pair_key(chat_id, uid)] = {
+        "deadline": deadline, "mid": mid}
+    save_config()
+
+
+def _pend_pop(kind: str, chat_id: int, uid: int):
+    if CONFIG.setdefault("pending", {}).setdefault(kind, {}).pop(_pair_key(chat_id, uid), None):
+        save_config()
+
+
+def _expiry_mark(chat_id) -> None:
+    lst = _rt().setdefault("expiry_notified", [])
+    if str(chat_id) not in lst:
+        lst.append(str(chat_id))
+        save_config()
+
+
+def _expiry_clear(chat_id) -> None:
+    lst = _rt().setdefault("expiry_notified", [])
+    if str(chat_id) in lst:
+        lst.remove(str(chat_id))
+        save_config()
 
 # ───────────────────────────────────────────────────────────────────────────
 #  СТАТИСТИКА (единая, персистентная): msg_stats[chat] = users/names/days/total/mod
@@ -733,6 +848,22 @@ def is_manager(user_id: int) -> bool:
     return is_owner(user_id) or user_id in CONFIG.get("managers", [])
 
 
+def is_group_manager(chat_id, user_id) -> bool:
+    """Менеджер конкретной группы: полный доступ к её настройкам и модерации
+    (глобальные разделы бота ему недоступны)."""
+    try:
+        return int(user_id) in (chat_cfg(chat_id).get("group_managers") or [])
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def can_assign_group_managers(context, chat_id: int, user_id: int) -> bool:
+    """Назначать менеджеров группы: владелец/менеджеры бота или создатель группы."""
+    if is_manager(user_id):
+        return True
+    return user_id == await group_creator_id(context, int(chat_id))
+
+
 async def group_admin_ids(context, chat_id: int) -> set:
     now = time.time()
     cached = _admin_cache.get(chat_id)
@@ -759,7 +890,7 @@ async def group_creator_id(context, chat_id: int):
 
 
 async def is_exempt(context, chat_id: int, user_id: int) -> bool:
-    if is_manager(user_id):
+    if is_manager(user_id) or is_group_manager(chat_id, user_id):
         return True
     if user_id in await group_admin_ids(context, chat_id):
         return True
@@ -831,7 +962,7 @@ def is_anon_admin(update) -> bool:
 
 
 async def can_moderate(context, chat_id: int, user_id: int, key: str = "ban", update=None) -> bool:
-    if is_manager(user_id):
+    if is_manager(user_id) or is_group_manager(chat_id, user_id):
         return True
     if chat_cfg(chat_id)["moderation"].get("mod_admins_only"):
         return False  # «Модерация только для владельца» — строгий режим (роли тоже не действуют)
@@ -849,7 +980,7 @@ async def can_moderate(context, chat_id: int, user_id: int, key: str = "ban", up
 
 async def can_open_settings(context, chat_id: int, user_id: int) -> bool:
     """Может ли человек открывать настройки этой группы (не зависит от mod_admins_only)."""
-    if is_manager(user_id):
+    if is_manager(user_id) or is_group_manager(chat_id, user_id):
         return True
     level = cmd_level(chat_id, "settings")
     if level == "owner":
@@ -1026,6 +1157,7 @@ def _norm(s: str) -> str:
     return _ZW_RE.sub("", s).translate(_L2C).replace("ё", "е").replace("Ё", "Е")
 
 
+@functools.lru_cache(maxsize=4096)
 def _word_pattern(w: str):
     """Скомпилированный шаблон стоп-слова:
        слово   — только целое слово («бан» НЕ сработает на «банан»)
@@ -1452,9 +1584,11 @@ async def punish_spam(update, context, reason: str, action=None):
             bump(chat.id, "banned")
             await ephemeral(context, chat.id, f"🚫 {mention(user)} забанен — {reason}.")
         elif act == "mute":
-            await mute_user(context, chat.id, user.id, cfg["flood"]["mute"])
+            secs = int(cfg["moderation"].get("spam_mute") or cfg["flood"]["mute"])
+            await mute_user(context, chat.id, user.id, secs)
             bump(chat.id, "muted")
-            await ephemeral(context, chat.id, f"🔇 {mention(user)} в муте — {reason}.")
+            await ephemeral(context, chat.id,
+                            f"🔇 {mention(user)} в муте на {human_duration(secs)} — {reason}.")
         await log_action(context, chat.id, f"авто-{act}: {mention(user)} — {reason}")
     except Exception as e:  # noqa: BLE001
         log.debug("punish_spam %s: %s", act, e)
@@ -1494,7 +1628,7 @@ async def _gate_unapproved(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if msg.migrate_to_chat_id or msg.migrate_from_chat_id:
             return
         txt = msg.text or ""
-        if txt.startswith(("/diag", "/pro", "/start")):
+        if txt.startswith(("/diag", "/pro", "/start", "/shop")):
             return
     raise ApplicationHandlerStop
 
@@ -1648,6 +1782,7 @@ async def maybe_send_trigger(update, context, text):
                     log.debug("trigger: %s", e)
             return  # ключ совпал — случайную шутку поверх не кидаем
     await maybe_chatter(update, context, cfg)
+
 
 
 # ── «мозги» болталки: банки ответов, память диалога, игры ──────────────────
@@ -2461,7 +2596,7 @@ async def announce_join_id(context, chat, user):
     mode = chat_cfg(chat.id).get("show_join_id", "off")
     if mode == "off":
         return
-    line = f"🆔 Новый участник: {mention(user)} — <code>{user.id}</code>"
+    line = f"🆔 Новый участник: {html.escape(mention(user))} — <code>{user.id}</code>"
     if mode == "all":
         await ephemeral(context, chat.id, line, 30, parse_mode="HTML")
     elif mode == "admins":
@@ -2475,8 +2610,11 @@ async def start_captcha(context, chat, user):
     key = (chat.id, user.id)
     if key in captcha_pending:
         return
-    await mute_user(context, chat.id, user.id, 0)  # до нажатия
     mode = cfg.get("action", "kick")
+    timeout = int(cfg.get("timeout", 120))
+    # «кик»: мут с запасом — даже если бот упадёт, Telegram снимет ограничение сам.
+    # «мут»: бессрочно до нажатия (так задумано), но ожидание сохраняется в конфиг.
+    await mute_user(context, chat.id, user.id, timeout + 120 if mode == "kick" else 0)
     txt = tr(chat.id, "cap_kick" if mode == "kick" else "cap_muted",
              name=mention(user), time=human_duration(cfg.get("timeout", 120)))
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(tr(chat.id, "cap_btn"),
@@ -2484,8 +2622,9 @@ async def start_captcha(context, chat, user):
     try:
         m = await context.bot.send_message(chat.id, txt, reply_markup=kb)
         captcha_pending[key] = m.message_id
+        _pend_set("captcha", chat.id, user.id, time.time() + timeout, m.message_id)
         if context.job_queue:
-            context.job_queue.run_once(captcha_timeout, cfg.get("timeout", 120),
+            context.job_queue.run_once(captcha_timeout, timeout,
                                        data={"chat_id": chat.id, "uid": user.id})
     except Exception as e:  # noqa: BLE001
         log.debug("captcha: %s", e)
@@ -2496,6 +2635,7 @@ async def captcha_timeout(context):
     d = context.job.data
     chat_id, uid = d["chat_id"], d["uid"]
     mid = captcha_pending.pop((chat_id, uid), None)
+    _pend_pop("captcha", chat_id, uid)
     if mid is None:
         return  # уже нажал
     try:
@@ -2523,6 +2663,7 @@ async def handle_captcha_press(update: Update, context: ContextTypes.DEFAULT_TYP
     if update.effective_user.id != uid:
         return await query.answer("Эта кнопка не для тебя 🙂", show_alert=True)
     captcha_pending.pop((chat.id, uid), None)
+    _pend_pop("captcha", chat.id, uid)
     soft_mute_remove(chat.id, uid)
     try:
         await context.bot.restrict_chat_member(chat.id, uid, permissions=FULL_PERMS)
@@ -2656,6 +2797,7 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.debug("approve: %s", e)
         return
     join_requests[(chat.id, user.id)] = True
+    _pend_set("jr", chat.id, user.id, time.time() + int(cfg["captcha"].get("timeout", 120)))
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(tr(chat.id, "cap_btn"),
                                                      callback_data=f"jrok:{chat.id}:{user.id}")]])
     try:
@@ -2668,6 +2810,7 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ЛС закрыт — впускаем без капчи, иначе человек застрянет навсегда
         log.debug("join dm: %s", e)
         join_requests.pop((chat.id, user.id), None)
+        _pend_pop("jr", chat.id, user.id)
         try:
             await context.bot.approve_chat_join_request(chat.id, user.id)
             remember_member(chat.id, user)
@@ -2677,6 +2820,7 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def join_request_timeout(context):
     d = context.job.data
+    _pend_pop("jr", d["chat_id"], d["uid"])
     if join_requests.pop((d["chat_id"], d["uid"]), None):
         try:
             await context.bot.decline_chat_join_request(d["chat_id"], d["uid"])
@@ -2694,6 +2838,7 @@ async def handle_join_request_press(update: Update, context: ContextTypes.DEFAUL
     if update.effective_user.id != uid:
         return await query.answer("Эта кнопка не для тебя 🙂", show_alert=True)
     join_requests.pop((cid, uid), None)
+    _pend_pop("jr", cid, uid)
     title = CONFIG.get("groups", {}).get(str(cid), "чат")
     try:
         await context.bot.approve_chat_join_request(cid, uid)
@@ -2882,6 +3027,10 @@ async def _guard(update: Update, context, key: str = "ban"):
     if is_manager(tid):
         await update.effective_message.reply_text("Это владелец/менеджер бота — действие не применяю.")
         return None
+    if not is_manager(actor.id) and is_group_manager(chat.id, tid):
+        await update.effective_message.reply_text(
+            "Это менеджер группы — через бота его наказывает только владелец бота.")
+        return None
     if not is_manager(actor.id) and tid in await group_admin_ids(context, chat.id):
         await update.effective_message.reply_text(
             "Это администратор группы — через бота его наказывает только владелец бота.")
@@ -2895,6 +3044,7 @@ async def cmd_reload(update: Update, context):
     global CONFIG
     _flush_config()
     CONFIG = load_config()
+    _load_soft_mutes()
     await update.effective_message.reply_text("♻️ Настройки перечитаны с диска.")
 
 
@@ -3120,6 +3270,60 @@ async def cmd_unrole(update: Update, context):
     await update.effective_message.reply_text("Он и так не в этой роли.")
 
 
+async def cmd_gmanager(update: Update, context):
+    """Назначить менеджера группы (реплаем или с ID)."""
+    chat, user = update.effective_chat, update.effective_user
+    if chat.type not in ("group", "supergroup"):
+        return await update.effective_message.reply_text(
+            "Выполни в группе или назначь в панели: /panel → 👤 Менеджеры группы.")
+    if not await can_assign_group_managers(context, chat.id, user.id):
+        return await update.effective_message.reply_text(
+            "Назначать менеджеров может создатель группы или владелец бота.")
+    tid, tname = await resolve_target(update, context)
+    if not tid:
+        return await update.effective_message.reply_text("Кого назначить? Ответь на сообщение или укажи ID.")
+    lst = chat_cfg_writable(chat.id).setdefault("group_managers", [])
+    if tid not in lst:
+        lst.append(tid)
+        save_config(force=True)
+    try:
+        await context.bot.send_message(
+            tid, f"👤 Тебя назначили менеджером группы «{chat.title}». Настройки — /panel.")
+    except Exception:  # noqa: BLE001
+        pass
+    await reply_tidy(update, context, f"👤 {tname} — менеджер группы: полный доступ к настройкам в /panel.")
+    await log_action(context, chat.id, f"👤 менеджер группы: {tname} (by {_actor_name(update)})")
+
+
+async def cmd_ungmanager(update: Update, context):
+    chat, user = update.effective_chat, update.effective_user
+    if chat.type not in ("group", "supergroup"):
+        return await update.effective_message.reply_text("Выполни в группе или в панели.")
+    if not await can_assign_group_managers(context, chat.id, user.id):
+        return await update.effective_message.reply_text(
+            "Снимать менеджеров может создатель группы или владелец бота.")
+    tid, tname = await resolve_target(update, context)
+    lst = chat_cfg_writable(chat.id).setdefault("group_managers", [])
+    if tid and tid in lst:
+        lst.remove(tid)
+        save_config(force=True)
+        await log_action(context, chat.id, f"👤 снят менеджер: {tname} (by {_actor_name(update)})")
+        return await reply_tidy(update, context, f"👤 {tname} больше не менеджер группы.")
+    await update.effective_message.reply_text("Он и так не менеджер этой группы.")
+
+
+async def cmd_gmanagers(update: Update, context):
+    chat, user = update.effective_chat, update.effective_user
+    if chat.type not in ("group", "supergroup"):
+        return await update.effective_message.reply_text("Выполни в группе.")
+    if not await can_open_settings(context, chat.id, user.id):
+        return await _deny(update)
+    names = CONFIG.get("msg_stats", {}).get(str(chat.id), {}).get("names", {})
+    lst = chat_cfg(chat.id).get("group_managers") or []
+    body = "\n".join(f"• {names.get(str(u), u)} ({u})" for u in lst) or "— нет —"
+    await reply_tidy(update, context, f"👤 Менеджеры группы:\n{body}", seconds=20)
+
+
 async def cmd_setstaff(update: Update, context):
     """Выполняется В БУДУЩЕЙ staff-группе: привязывает её к одной из твоих групп."""
     chat = update.effective_chat
@@ -3264,6 +3468,8 @@ async def handle_action_press(update: Update, context: ContextTypes.DEFAULT_TYPE
         return await query.answer("Нет прав", show_alert=True)
     if is_manager(tid):
         return await query.answer("Это владелец/менеджер бота — не трогаю", show_alert=True)
+    if not is_manager(presser.id) and is_group_manager(chat.id, tid):
+        return await query.answer("Это менеджер группы — трогает только владелец бота", show_alert=True)
     if action in ("ban", "mute") and not is_manager(presser.id) \
             and tid in await group_admin_ids(context, chat.id):
         return await query.answer("Админов через бота трогает только владелец бота", show_alert=True)
@@ -3918,7 +4124,7 @@ def is_pro(chat_id) -> bool:
 def extend_pro(chat_id, days: int):
     base = max(time.time(), pro_until(chat_id))
     CONFIG.setdefault("subscriptions", {})[str(chat_id)] = base + days * 86400
-    _expiry_notified.discard(str(chat_id))
+    _expiry_clear(chat_id)
     save_config(force=True)
 
 
@@ -3933,7 +4139,7 @@ def trial_active(chat_id) -> bool:
 def grant_trial(chat_id, days=None):
     days = days or CONFIG.get("trial_days", 3)
     CONFIG.setdefault("trials", {})[str(chat_id)] = time.time() + days * 86400
-    _expiry_notified.discard(str(chat_id))
+    _expiry_clear(chat_id)
     save_config(force=True)
 
 
@@ -3989,7 +4195,8 @@ async def handle_buy_group_press(update: Update, context: ContextTypes.DEFAULT_T
     p = PRO_PLANS.get(plan)
     if not p:
         return await query.answer("Неизвестный тариф", show_alert=True)
-    if not (is_manager(user.id) or user.id in await group_admin_ids(context, cid)):
+    if not (is_manager(user.id) or is_group_manager(cid, user.id)
+            or user.id in await group_admin_ids(context, cid)):
         return await query.answer("Тариф оформляют администраторы группы", show_alert=True)
     title = CONFIG.get("groups", {}).get(str(cid), "группа")
     try:
@@ -4019,6 +4226,8 @@ async def on_successful_payment(update: Update, context):
     sp = update.effective_message.successful_payment
     payload = sp.invoice_payload or ""
     parts = payload.split(":")
+    if len(parts) == 4 and parts[0] == "shop":
+        return await _shop_paid(update, context, sp, parts)
     if len(parts) == 3 and parts[0] == "pro":
         cid, plan = int(parts[1]), parts[2]
         p = PRO_PLANS.get(plan, {"days": 30, "stars": sp.total_amount})
@@ -4063,9 +4272,16 @@ async def _tick_promo(context, now: float):
     p = CONFIG["promo"]
     if not p.get("enabled") or not (p.get("text") or p.get("file_id")):
         return
-    if now - _state["last_promo"] < int(p.get("interval", 3600)):
+    rt = _rt()
+    last = float(rt.get("last_promo", 0) or 0)
+    if not last:  # первый запуск после обновления: начинаем отсчёт, а не шлём сразу
+        rt["last_promo"] = now
+        save_config()
         return
-    _state["last_promo"] = now
+    if now - last < int(p.get("interval", 3600)):
+        return
+    rt["last_promo"] = now
+    save_config(force=True)
     post = {"type": p.get("type", "text"), "text": p.get("text", ""), "file_id": p.get("file_id"),
             "buttons": p.get("buttons", []), "pin": p.get("pin", False), "html": p.get("html", False)}
     ok = 0
@@ -4084,10 +4300,17 @@ async def _tick_recurring(context, now: float):
             if not (isinstance(r, dict) and r.get("enabled") and r.get("text")):
                 continue
             interval = max(5, int(r.get("interval", 60))) * 60
-            key = (str(cid), idx)
-            if now - _recurring_last.get(key, 0) < interval:
+            key = f"{cid}:{idx}"
+            rl = _rt().setdefault("recurring_last", {})
+            last = float(rl.get(key, 0) or 0)
+            if not last:  # новое сообщение или первый запуск: отсчёт с этого момента
+                rl[key] = now
+                save_config()
                 continue
-            _recurring_last[key] = now
+            if now - last < interval:
+                continue
+            rl[key] = now
+            save_config()
             await deliver(context, cid, {"type": "text", "text": r["text"]})
 
 
@@ -4096,10 +4319,12 @@ async def _tick_scheduled(context):
     stamp = now.strftime("%Y-%m-%d %H:%M")
     for post in list(CONFIG.get("scheduled_posts", [])):
         pid = post.get("id")
-        if not pid or _post_last_fired.get(pid) == stamp:
+        pf = _rt().setdefault("post_fired", {})
+        if not pid or pf.get(pid) == stamp:
             continue
         if _post_due(post, now):
-            _post_last_fired[pid] = stamp
+            pf[pid] = stamp
+            save_config(force=True)
             await _send_scheduled_post(context, post)
 
 
@@ -4122,12 +4347,23 @@ async def janitor_job(context):
     now = time.time()
     day = 86400
     for d, ttl in ((_join_handled, 600), (_report_cd, 2 * 3600), (_appeal_cd, 2 * 3600),
-                   (join_dates, 30 * day), (_throttle_store, 3600), (_recurring_last, 7 * day)):
+                   (join_dates, 30 * day), (_chatter_dialog, day)):
         for k in [k for k, v in list(d.items()) if now - v > ttl]:
             d.pop(k, None)
+    # троттлы хранят момент истечения — удаляем только истёкшие
+    for k in [k for k, v in list(_throttle_store.items()) if v <= now]:
+        _throttle_store.pop(k, None)
+    rl = _rt().get("recurring_last", {})
+    for k in [k for k, v in list(rl.items()) if now - float(v or 0) > 30 * day]:
+        rl.pop(k, None)
+    for kind in ("captcha", "jr"):
+        pend = CONFIG.setdefault("pending", {}).setdefault(kind, {})
+        for k in [k for k, v in list(pend.items())
+                  if now - float((v or {}).get("deadline", 0) or 0) > day]:
+            pend.pop(k, None)
     for k, v in list(soft_mutes.items()):
         if v and v <= now:
-            soft_mutes.pop(k, None)
+            soft_mute_remove(*k)
     for store in (flood_store, nuke_store):
         for k, dq in list(store.items()):
             if not dq or now - dq[-1] > 3600:
@@ -4139,12 +4375,24 @@ async def janitor_job(context):
         if v <= now:
             _raid_until.pop(k, None)
     alive = {p.get("id") for p in CONFIG.get("scheduled_posts", [])}
-    for pid in [p for p in _post_last_fired if p not in alive]:
-        _post_last_fired.pop(pid, None)
+    pf = _rt().setdefault("post_fired", {})
+    for pid in [p for p in pf if p not in alive]:
+        pf.pop(pid, None)
 
 
 async def weekly_digest_job(context):
-    """Раз в неделю — сводка по каждой группе в её staff-чат (или владельцам)."""
+    """Проверяется раз в час; сводка уходит раз в 7 дней (метка переживает рестарты)."""
+    rt = _rt()
+    now = time.time()
+    last = float(rt.get("last_digest", 0) or 0)
+    if not last:
+        rt["last_digest"] = now
+        save_config()
+        return
+    if now - last < 7 * 86400:
+        return
+    rt["last_digest"] = now
+    save_config(force=True)
     for cid in list(CONFIG.get("groups", {}).keys()):
         try:
             if not chat_allowed(int(cid)):
@@ -4168,9 +4416,9 @@ async def maintenance_daily_job(context):
     """Раз в сутки: напоминание об окончании тарифа/триала."""
     for cid in list(CONFIG.get("groups", {}).keys()):
         had_paid = str(cid) in CONFIG.get("subscriptions", {}) or str(cid) in CONFIG.get("trials", {})
-        if not had_paid or chat_allowed(int(cid)) or str(cid) in _expiry_notified:
+        if not had_paid or chat_allowed(int(cid)) or str(cid) in _rt().get("expiry_notified", []):
             continue
-        _expiry_notified.add(str(cid))
+        _expiry_mark(cid)
         title = CONFIG["groups"].get(str(cid), cid)
         try:
             await context.bot.send_message(int(cid),
@@ -4218,13 +4466,17 @@ def extract_chat_settings(chat_id) -> dict:
     cfg = chat_cfg(chat_id)
     out = {k: copy.deepcopy(cfg.get(k)) for k in PER_CHAT_KEYS}
     out["_chat_backup"] = True
+    out["_chat_id"] = str(chat_id)
     out["_title"] = CONFIG.get("groups", {}).get(str(chat_id), str(chat_id))
     return out
 
 
 def apply_chat_settings(chat_id, data: dict):
     dst = chat_cfg_writable(chat_id)
+    same = str(data.get("_chat_id", "")) == str(chat_id)
     for k in PER_CHAT_KEYS:
+        if k == "group_managers" and not same:
+            continue  # доступ людей не переезжает вместе с настройками в другую группу
         if k in data:
             dst[k] = copy.deepcopy(data[k])
     save_config(force=True)
@@ -4290,39 +4542,19 @@ def status_text(cfg, label) -> str:
 
 
 def main_menu_kb(cfg, is_mgr: bool = False) -> InlineKeyboardMarkup:
+    """Главное меню: 6 разделов-хабов вместо длинной простыни кнопок."""
     rows = [
-        [InlineKeyboardButton("⚡ Быстрые настройки", callback_data="m:quick"),
-         InlineKeyboardButton("🔧 Все фильтры", callback_data="m:toggles")],
-        [InlineKeyboardButton("🚫 Стоп-слова", callback_data="m:words"),
-         InlineKeyboardButton("⚪ Исключения", callback_data="m:whitewords")],
-        [InlineKeyboardButton("🛑 Второй список слов", callback_data="m:words2"),
-         InlineKeyboardButton("🔗 Ссылки", callback_data="m:links")],
-        [InlineKeyboardButton("🌊 Антифлуд", callback_data="m:flood"),
-         InlineKeyboardButton("🛡 Модерация", callback_data="m:mod")],
-        [InlineKeyboardButton("📎 Медиа-фильтр", callback_data="m:media"),
-         InlineKeyboardButton("💬 Автоответы", callback_data="m:triggers")],
-        [InlineKeyboardButton("🌙 Ночной режим", callback_data="m:night"),
-         InlineKeyboardButton("🔁 Авто-сообщения", callback_data="m:recurring")],
-        [InlineKeyboardButton("🎭 Болталка (шутки бота)", callback_data="m:chatter")],
-        [InlineKeyboardButton("👋 Приветствие", callback_data="m:welcome"),
-         InlineKeyboardButton("🧩 Капча", callback_data="m:captcha")],
-        [InlineKeyboardButton("📜 Правила", callback_data="m:rules"),
-         InlineKeyboardButton("⛔ Чёрный список", callback_data="m:blacklist")],
-        [InlineKeyboardButton("🚨 Анти-рейд", callback_data="m:antiraid"),
-         InlineKeyboardButton("🧱 Анти-снос", callback_data="m:antinuke")],
-        [InlineKeyboardButton("🎖 Роли", callback_data="m:roles"),
-         InlineKeyboardButton("👔 Служебный чат", callback_data="m:staff")],
-        [InlineKeyboardButton("🔐 Права команд", callback_data="m:cmdperms"),
-         InlineKeyboardButton("🌐 Язык новичков", callback_data="m:lang")],
-        [InlineKeyboardButton("⭐ Доступ и тариф", callback_data="m:access"),
-         InlineKeyboardButton("📣 Промо и рассылки", callback_data="m:promo")],
-        [InlineKeyboardButton("🗓 Посты по расписанию", callback_data="m:sched")],
-        [InlineKeyboardButton("🗄 Бэкапы", callback_data="m:backup"),
-         InlineKeyboardButton("⚙️ Прочее", callback_data="m:other")],
+        [InlineKeyboardButton("⚡ Быстрые настройки", callback_data="m:quick")],
+        [InlineKeyboardButton("🛡 Защита", callback_data="m:h_protect"),
+         InlineKeyboardButton("⚖️ Модерация", callback_data="m:h_mod")],
+        [InlineKeyboardButton("💬 Общение", callback_data="m:h_talk"),
+         InlineKeyboardButton("📮 Посты", callback_data="m:h_posts")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="m:h_stats"),
+         InlineKeyboardButton("⚙️ Система", callback_data="m:h_sys")],
     ]
     if is_mgr:
-        rows.append([InlineKeyboardButton("🌍 Глобальные списки", callback_data="m:global"),
-                     InlineKeyboardButton("✅ Одобрение групп", callback_data="m:approve")])
+        rows.append([InlineKeyboardButton("🛒 Магазин", callback_data="m:shop"),
+                     InlineKeyboardButton("🌍 Глобальные списки", callback_data="m:global")])
     rows.append([InlineKeyboardButton("🔁 Сменить группу", callback_data="m:pick")])
     return InlineKeyboardMarkup(rows)
 
@@ -4469,7 +4701,10 @@ def mod_kb(cfg) -> InlineKeyboardMarkup:
                               callback_data="md:mute"),
          InlineKeyboardButton(f"⌛ Сгорание: {str(exp) + ' дн' if exp else 'выкл'}",
                               callback_data="md:exp")],
-        [InlineKeyboardButton(f"{onoff(m.get('mod_admins_only'))} Модерация только владельцу бота",
+        [InlineKeyboardButton(
+            "🔇 Мут за спам: " + (human_duration(m["spam_mute"]) if m.get("spam_mute") else "как антифлуд"),
+            callback_data="md:smute")],
+        [InlineKeyboardButton(f"{onoff(m.get('mod_admins_only'))} Модерация только владельцам и менеджерам",
                               callback_data="md:only")],
         [InlineKeyboardButton(f"{onoff(m.get('log_actions'))} Журнал действий",
                               callback_data="md:log"),
@@ -4486,7 +4721,8 @@ def mod_menu_text(cfg, label) -> str:
             f"{'бан' if m.get('warn_action') == 'ban' else 'мут ' + human_duration(m.get('warn_mute', 3600))}.\n"
             "«Журнал действий» шлёт события модерации в служебный чат (или владельцам).\n"
             "«Только владельцу бота» — строгий режим: команды наказания не работают даже "
-            "у админов группы и ролей.")
+            "у админов группы и ролей (владельцы и менеджеры — работают).\n"
+            "«Мут за спам» — срок, когда фильтр наказывает мутом.")
 
 
 def media_kb(cfg) -> InlineKeyboardMarkup:
@@ -4780,6 +5016,28 @@ def staff_kb(cfg) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def gmgr_kb(cfg, tgt=None) -> InlineKeyboardMarkup:
+    names = CONFIG.get("msg_stats", {}).get(str(tgt or ""), {}).get("names", {})
+    rows = [[InlineKeyboardButton("➕ Добавить менеджера (по ID)", callback_data="add:gmgr")]]
+    for i, uid in enumerate((cfg.get("group_managers") or [])[:30]):
+        rows.append([InlineKeyboardButton(f"❌ {names.get(str(uid), uid)}", callback_data=f"dgm:{i}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def gmgr_menu_text(cfg, label) -> str:
+    return (f"👤 Менеджеры группы · {label}\n\n"
+            f"Сейчас: {len(cfg.get('group_managers') or [])}\n\n"
+            "Менеджер получает ПОЛНЫЙ доступ к настройкам и модерации этой группы "
+            "через /panel — без админки Telegram. Фильтры его не трогают, а наказать его "
+            "через бота может только владелец бота. Глобальные разделы (рассылки по всем "
+            "группам, одобрение, бэкапы) ему недоступны.\n\n"
+            "Назначает создатель группы или владелец бота: здесь или в группе "
+            "командой /gmanager (реплаем или с ID). Узнать ID человек может командой /userid.\n"
+            "⚠️ Банить и мутить от имени бота менеджер сможет, только если у самого "
+            "бота есть эти права в группе.")
+
+
 def cmd_level_from(cfg, key: str) -> str:
     return (cfg.get("cmd_perms") or {}).get(key, CMD_DEFAULT.get(key, "admins"))
 
@@ -5011,6 +5269,208 @@ def backup_menu_text(label) -> str:
             "файл группы применится к выбранной в панели группе.")
 
 
+# ── разделы-хабы ─────────────────────────────────────────────────────────────
+
+# Куда ведёт «⬅️ Назад» с каждого экрана (без записи — в главное меню)
+PANEL_PARENT = {
+    "m:h_words": "m:h_protect",
+    "m:words": "m:h_words", "m:words2": "m:h_words", "m:whitewords": "m:h_words",
+    "m:global": "m:h_words",
+    "m:links": "m:h_protect", "m:flood": "m:h_protect", "m:media": "m:h_protect",
+    "m:night": "m:h_protect", "m:captcha": "m:h_protect", "m:antiraid": "m:h_protect",
+    "m:antinuke": "m:h_protect", "m:toggles": "m:h_protect",
+    "m:mod": "m:h_mod", "m:roles": "m:h_mod", "m:gmgr": "m:h_mod", "m:cmdperms": "m:h_mod",
+    "m:blacklist": "m:h_mod", "m:staff": "m:h_mod",
+    "m:triggers": "m:h_talk", "m:chatter": "m:h_talk", "m:welcome": "m:h_talk",
+    "m:rules": "m:h_talk", "m:lang": "m:h_talk",
+    "m:recurring": "m:h_posts", "m:promo": "m:h_posts", "m:sched": "m:h_posts",
+    "m:access": "m:h_sys", "m:backup": "m:h_sys", "m:other": "m:h_sys", "m:approve": "m:h_sys",
+}
+
+
+def _with_back(kb: InlineKeyboardMarkup, parent: str) -> InlineKeyboardMarkup:
+    """Перенаправить кнопку «⬅️ Назад» (m:main) на родительский раздел."""
+    rows = []
+    for row in kb.inline_keyboard:
+        rows.append([InlineKeyboardButton(b.text, callback_data=parent)
+                     if getattr(b, "callback_data", None) == "m:main" else b for b in row])
+    return InlineKeyboardMarkup(rows)
+
+
+def _hub_kb(items, back: str = "m:main") -> InlineKeyboardMarkup:
+    rows, buf = [], []
+    for text, cb in items:
+        buf.append(InlineKeyboardButton(text, callback_data=cb))
+        if len(buf) == 2:
+            rows.append(buf)
+            buf = []
+    if buf:
+        rows.append(buf)
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=back)])
+    return InlineKeyboardMarkup(rows)
+
+
+def hub_protect(cfg, label, mgr):
+    en = cfg["enabled"]
+    links_on = any(en.get(k) for k in ("invites", "shorteners", "spam_domains", "all_links"))
+    media_on = any((cfg.get("media_block") or {}).values())
+    items = [
+        ("🚫 Фильтры слов", "m:h_words"),
+        (f"{onoff(links_on)} 🔗 Ссылки", "m:links"),
+        (f"{onoff(en.get('flood'))} 🌊 Антифлуд", "m:flood"),
+        (f"{onoff(media_on)} 📎 Медиа-фильтр", "m:media"),
+        (f"{onoff(cfg['night'].get('enabled'))} 🌙 Ночной режим", "m:night"),
+        (f"{onoff(cfg['captcha'].get('enabled'))} 🧩 Капча", "m:captcha"),
+        (f"{onoff((cfg.get('antiraid') or {}).get('enabled'))} 🚨 Анти-рейд", "m:antiraid"),
+        (f"{onoff((cfg.get('antinuke') or {}).get('enabled'))} 🧱 Анти-снос", "m:antinuke"),
+        ("🔧 Все тумблеры", "m:toggles"),
+    ]
+    text = (f"🛡 Защита · {label}\n\n"
+            f"За спам: {_ACT_RU.get(cfg.get('spam_action', 'delete'))} · "
+            f"за мат: {_ACT_RU.get(cfg.get('stop_words2_action', 'warn'))} · "
+            f"за медиа: {_ACT_RU.get(cfg.get('media_action', 'delete'))}\n\n"
+            "Всё, что отсеивает спам и рейды. ✅ — включено.")
+    return text, _hub_kb(items)
+
+
+def hub_words(cfg, label, mgr):
+    en = cfg["enabled"]
+    items = [
+        (f"{onoff(en.get('words'))} 🚫 Спам-слова · {len(cfg.get('stop_words', []))}", "m:words"),
+        (f"{onoff(en.get('words2'))} 🛑 Мат-фильтр · {len(cfg.get('stop_words2', []))}", "m:words2"),
+        (f"⚪ Исключения · {len(cfg.get('white_words', []))}", "m:whitewords"),
+    ]
+    if mgr:
+        items.append((f"🌍 Глобальные · {len(CONFIG.get('global_stop_words', []))}", "m:global"))
+    text = (f"🚫 Фильтры слов · {label}\n\n"
+            f"• Спам-слова — наказание: {_ACT_RU.get(cfg.get('spam_action', 'delete'))} "
+            "(общее со ссылками)\n"
+            f"• Мат-фильтр — наказание: {_ACT_RU.get(cfg.get('stop_words2_action', 'warn'))}, "
+            f"лимит предов {cfg['moderation'].get('warn_limit', 3)}\n"
+            "• Исключения — никогда не считаются нарушением\n"
+            "• Глобальные — действуют во всех группах\n\n"
+            "Синтаксис везде один: слово · слово* · *слово · *слово*")
+    return text, _hub_kb(items, back="m:h_protect")
+
+
+def hub_mod(cfg, label, mgr):
+    items = [
+        ("🛡 Наказания и преды", "m:mod"),
+        (f"🎖 Роли · {len(cfg.get('roles') or {})}", "m:roles"),
+        (f"👤 Менеджеры группы · {len(cfg.get('group_managers') or [])}", "m:gmgr"),
+        ("🔐 Права команд", "m:cmdperms"),
+        ("⛔ Чёрный список", "m:blacklist"),
+        ("👔 Служебный чат", "m:staff"),
+    ]
+    m = cfg["moderation"]
+    text = (f"⚖️ Модерация · {label}\n\n"
+            f"Предупреждения: лимит {m.get('warn_limit', 3)} → "
+            f"{'бан' if m.get('warn_action') == 'ban' else 'мут'}\n"
+            f"Журнал действий: {'вкл' if m.get('log_actions') else 'выкл'}\n\n"
+            "Кто и как наказывает, роли, менеджеры и чёрный список.")
+    return text, _hub_kb(items)
+
+
+def hub_talk(cfg, label, mgr):
+    ch = cfg.get("chatter") or {}
+    items = [
+        (f"{onoff(cfg['enabled'].get('triggers'))} 💬 Автоответы · {len(cfg.get('triggers', {}))}",
+         "m:triggers"),
+        (f"{onoff(ch.get('enabled'))} 🎭 Болталка", "m:chatter"),
+        (f"{onoff((cfg.get('welcome') or {}).get('enabled'))} 👋 Приветствие", "m:welcome"),
+        ("📜 Правила", "m:rules"),
+        (f"🌐 Язык новичков: {cfg.get('lang', 'ru')}", "m:lang"),
+    ]
+    text = (f"💬 Общение · {label}\n\n"
+            "Автоответы, болталка с играми, приветствие новичков и правила.")
+    return text, _hub_kb(items)
+
+
+def hub_posts(cfg, label, mgr):
+    items = [(f"🔁 Авто-сообщения группы · {len(cfg.get('recurring') or [])}", "m:recurring")]
+    if mgr:
+        p = CONFIG["promo"]
+        items += [(f"{onoff(p.get('enabled'))} 📣 Промо и рассылки", "m:promo"),
+                  (f"🗓 Посты по расписанию · {len(CONFIG.get('scheduled_posts', []))}", "m:sched")]
+    text = (f"📮 Посты · {label}\n\n"
+            "• Авто-сообщения — повторяются в этой группе каждые N минут\n"
+            + ("• Промо — авто-реклама и рассылки по всем группам и в ЛС\n"
+               "• Расписание — посты в заданное время по дням недели\n" if mgr else "")
+            + "\nВезде работают медиа, кнопки, HTML и {рандомизация|вариантов}.")
+    return text, _hub_kb(items)
+
+
+def hub_stats(cfg, label, mgr, tgt):
+    if not tgt or tgt == "defaults":
+        return f"📊 Статистика · {label}\n\nСначала выбери группу.", _hub_kb([])
+    total, today, week, top = _msg_stats_summary(tgt)
+    s = (CONFIG.get("msg_stats", {}).get(str(tgt), {}) or {}).get("mod", {})
+    medals = ["🥇", "🥈", "🥉"]
+    top_lines = "\n".join(f"{medals[i] if i < 3 else f'{i + 1}.'} {n} — {c}"
+                          for i, (n, c) in enumerate(top[:5])) or "— пока пусто —"
+    text = (f"📊 Статистика · {label}\n\n"
+            f"Сообщений: всего {total} · сегодня {today} · за неделю {week}\n\n"
+            f"🛡 Модерация: удалено {s.get('deleted', 0)}, предов {s.get('warns', 0)}, "
+            f"мутов {s.get('muted', 0) + s.get('flood_muted', 0)}, банов {s.get('banned', 0)}, "
+            f"киков {s.get('kicked', 0)}\n\n"
+            f"🏆 Топ:\n{top_lines}\n\n"
+            f"Доступ: {access_status(int(tgt))}")
+    return text, _hub_kb([("🔄 Обновить", "m:h_stats"), ("🧹 Очистить", "st:clear")])
+
+
+def hub_sys(cfg, label, mgr):
+    items = [("⭐ Доступ и тариф", "m:access"), ("⚙️ Прочее", "m:other")]
+    if mgr:
+        items += [("🗄 Бэкапы", "m:backup"), ("✅ Одобрение групп", "m:approve"),
+                  ("🛒 Магазин", "m:shop")]
+    text = (f"⚙️ Система · {label}\n\n"
+            "Доступ и оплата, ID новичков, «зазывала», сброс настроек"
+            + (", бэкапы, одобрение групп и магазин." if mgr else "."))
+    return text, _hub_kb(items)
+
+
+# ── магазин в панели ────────────────────────────────────────────────────────
+
+
+def _shop_status() -> str:
+    if _shop_runner is not None:
+        return "🟢 работает"
+    if not WEBAPP_URL:
+        return "⚪ выключен — задай WEBAPP_URL на сервере"
+    if web is None:
+        return "⚪ не запущен — выполни pip install aiohttp"
+    return "🔴 не запустился — смотри лог"
+
+
+def shop_kb() -> InlineKeyboardMarkup:
+    s = CONFIG.get("shop") or {}
+    rows = [[InlineKeyboardButton(f"{onoff(s.get('enabled'))} Магазин открыт", callback_data="shp:tgl")],
+            [InlineKeyboardButton("➕ Товар", callback_data="add:shopitem"),
+             InlineKeyboardButton("✏️ Название", callback_data="add:shoptitle")]]
+    for i, it in enumerate((s.get("items") or [])[:30]):
+        rows.append([InlineKeyboardButton(f"❌ {it.get('title', '?')[:28]} · {it.get('stars', 0)}⭐",
+                                          callback_data=f"dsi:{i}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def shop_menu_text() -> str:
+    s = CONFIG.get("shop") or {}
+    orders = CONFIG.get("shop_orders") or []
+    earned = sum(int(o.get("stars", 0) or 0) for o in orders)
+    last = "\n".join(
+        f"• {datetime.fromtimestamp(o.get('ts', 0)).strftime('%d.%m %H:%M')} · {o.get('item')} · "
+        f"{o.get('stars')}⭐ · id {o.get('uid')}" for o in orders[-5:][::-1]) or "— пока нет —"
+    return (f"🛒 Магазин Mini App «{s.get('title', 'Магазин')}»\n\n"
+            f"Сервер: {_shop_status()}\n"
+            f"Адрес: {WEBAPP_URL or '—'}\n"
+            f"Товаров: {len(s.get('items') or [])} (+ тариф PRO, если магазин открыт из группы)\n"
+            f"Заказов: {len(orders)} · получено {earned} ⭐\n\n"
+            f"Последние заказы:\n{last}\n\n"
+            "Открыть: /shop в ЛС бота или в группе. Оплата — звёздами Telegram.\n"
+            "Товар добавляется строкой: Название | звёзд | описание | что выдать после оплаты")
+
+
 add_help_text = (
     "➕ Быстрое добавление в ЛС и в группе:\n"
     "/add ключ - ответ — автоответ (несколько ключей: цена,прайс - смотри закреп)\n"
@@ -5023,7 +5483,7 @@ add_help_text = (
 
 def about_text() -> str:
     return (
-        "🤖 Channel Guard Bot v5 — защита и оживление групп.\n\n"
+        "🤖 Channel Guard Bot v6 — защита и оживление групп.\n\n"
         "Антиспам: стоп-слова (2 списка + глобальный), исключения, ссылки и скрытые ссылки, "
         "спам-домены, антифлуд, медиа-фильтр, проверка имён, чёрные списки, ночной режим, "
         "анти-рейд, анти-снос, капча (в чате и через заявку в ЛС).\n"
@@ -5055,7 +5515,9 @@ HELP_TEXT = (
     "/stats /top — статистика и топ · /invite — ссылка · /zazyvala — зазывала\n"
     "/all /stopall — призыв участников · /reg /anreg — подписка на призыв\n"
     "/block /unblock — чёрный список группы · /diag — диагностика · /pro — тариф\n"
-    "/appeal текст — апелляция владельцам бота"
+    "/gmanager /ungmanager /gmanagers — менеджеры группы (назначает создатель)\n"
+    "/appeal текст — апелляция владельцам бота\n"
+    "/shop — магазин Mini App: тариф PRO и товары за звёзды"
 )
 
 GROUPADMIN_HELP = (
@@ -5090,6 +5552,7 @@ _MANAGER_CB = (
     "add:gword", "add:gbid", "add:gbname", "add:invitetext",
     "add:promo_content", "add:promo_btns", "add:bcast", "add:post",
     "sptgl:", "spdel:", "spg:", "tz:", "bk:",
+    "m:shop", "shp:", "dsi:", "add:shopitem", "add:shoptitle",
 )
 
 
@@ -5121,6 +5584,7 @@ async def _render_menu(query, context, view: str):
         "m:antinuke": (antinuke_menu_text(cfg, label), antinuke_kb(cfg)),
         "m:roles": (roles_menu_text(cfg, label), roles_kb(cfg)),
         "m:staff": (staff_menu_text(cfg, label), staff_kb(cfg)),
+        "m:gmgr": (gmgr_menu_text(cfg, label), gmgr_kb(cfg, tgt)),
         "m:cmdperms": (cmdperms_menu_text(cfg, label), cmdperms_kb(cfg)),
         "m:lang": (f"🌐 Язык сообщений для новичков · {label}", lang_kb(cfg)),
         "m:recurring": (recurring_menu_text(cfg, label), recurring_kb(cfg)),
@@ -5131,13 +5595,22 @@ async def _render_menu(query, context, view: str):
         "m:promo": (promo_menu_text(label), promo_kb()),
         "m:sched": (sched_menu_text(), sched_kb()),
         "m:backup": (backup_menu_text(label), backup_kb()),
+        "m:shop": (shop_menu_text(), shop_kb()),
     }
+    hubs = {"m:h_protect": hub_protect, "m:h_words": hub_words, "m:h_mod": hub_mod,
+            "m:h_talk": hub_talk, "m:h_posts": hub_posts, "m:h_sys": hub_sys}
+    if view in hubs:
+        views[view] = hubs[view](cfg, label, mgr)
+    elif view == "m:h_stats":
+        views[view] = hub_stats(cfg, label, mgr, tgt)
     if view == "m:pick":
         groups = (list(CONFIG.get("groups", {}).items()) if mgr
                   else await user_admin_groups(context, query.from_user.id))
         await safe_edit(query, "📂 Выбери группу для настройки:", pick_kb(groups))
         return await query.answer()
     text, kb = views.get(view, views["m:main"])
+    if view in PANEL_PARENT and kb is not None:
+        kb = _with_back(kb, PANEL_PARENT[view])
     await safe_edit(query, text, kb)
     try:
         await query.answer()
@@ -5214,6 +5687,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wcfg = panel_cfg(context)
     tgt = context.user_data.get("cfg_target")
 
+    # ── менеджеры группы (назначает только создатель группы или владелец бота) ──
+    if data == "add:gmgr" or data.startswith("dgm:"):
+        if (not tgt or tgt == "defaults"
+                or not await can_assign_group_managers(context, int(tgt), user.id)):
+            return await query.answer("Назначать менеджеров может создатель группы или владелец бота",
+                                      show_alert=True)
+        if data.startswith("dgm:"):
+            lst = wcfg.setdefault("group_managers", [])
+            i = int(data.split(":", 1)[1])
+            if 0 <= i < len(lst):
+                lst.pop(i)
+                save_config(force=True)
+            return await _render_menu(query, context, "m:gmgr")
+        return await _ask(query, context, "gmgr",
+                          "Пришли ID будущих менеджеров через запятую (свой ID человек узнаёт "
+                          "командой /userid в ЛС бота). (или /cancel)")
+
     # ── запросы текста от пользователя ──
     prompts = {
         "add:word": ("word", "Пришли стоп-слова через запятую.\n"
@@ -5254,6 +5744,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                          "«-» — убрать. (или /cancel)"),
         "add:bcast": ("bcast", "Пришли пост для рассылки в группы: текст или медиа с подписью, "
                                "потом выберешь группы. (или /cancel)"),
+        "add:shopitem": ("shopitem", "Новый товар одной строкой:\n"
+                                     "Название | цена в звёздах | описание | что выдать после оплаты\n"
+                                     "Например: Реклама в чате | 300 | Пост с закрепом на сутки | "
+                                     "Напиши @manager — разместим\n(или /cancel)"),
+        "add:shoptitle": ("shoptitle", "Название магазина (видно в шапке Mini App). (или /cancel)"),
         "add:post": ("sp_time", "Шаг 1/3. Время поста: ЧЧ:ММ [дни через запятую]\n"
                                 "Например: 09:30 пн,ср,пт — без дней = ежедневно. (или /cancel)"),
     }
@@ -5419,6 +5914,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             m["warn_mute"] = _cycle([600, 1800, 3600, 10800, 86400], int(m.get("warn_mute", 3600)))
         elif k == "exp":
             m["warn_expire_days"] = _cycle([0, 7, 14, 30], int(m.get("warn_expire_days", 0)))
+        elif k == "smute":
+            m["spam_mute"] = _cycle([0, 300, 900, 3600, 86400], int(m.get("spam_mute", 0) or 0))
         elif k == "only":
             m["mod_admins_only"] = not m.get("mod_admins_only")
         elif k == "log":
@@ -5664,6 +6161,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(query, f"👥 Группы для поста {p.get('time', '')}:", sched_groups_kb(p))
         return await query.answer()
 
+    # ── магазин ──
+    if data == "shp:tgl":
+        s = CONFIG.setdefault("shop", {})
+        s["enabled"] = not s.get("enabled")
+        save_config(force=True)
+        return await _render_menu(query, context, "m:shop")
+    if data.startswith("dsi:"):
+        items = CONFIG.setdefault("shop", {}).setdefault("items", [])
+        i = int(data.split(":", 1)[1])
+        if 0 <= i < len(items):
+            items.pop(i)
+            save_config(force=True)
+        return await _render_menu(query, context, "m:shop")
+
     # ── бэкапы ──
     if data == "bk:full":
         await send_backup(context, user.id)
@@ -5781,6 +6292,8 @@ async def cmd_start(update: Update, context):
         return await reply_tidy(update, context,
                                 "👋 Я на месте. Настройки — в ЛС: открой меня и набери /panel.")
     context.user_data.pop("awaiting", None)
+    if context.args and context.args[0].startswith("shop"):
+        return await _send_shop_button(update.effective_message, context.args[0][4:])
     text = ("👋 Привет! Я — Channel Guard: антиспам, модерация, капча, автоответы, болталка, "
             "посты и рассылки для твоих групп.\n\n"
             "1) Добавь меня в группу и дай права администратора (удаление, бан, приглашения).\n"
@@ -6060,10 +6573,11 @@ cmd_addlink, cmd_dellink, cmd_links = _make_list_cmds("spam_links", "🔗 Спа
 # Состояния, требующие права на ВЫБРАННУЮ группу
 _TARGET_STATES = ("word", "word2", "wword", "link", "trigger", "trig_keys", "trig_content",
                   "trig_btns", "chphrase", "chreply", "gopword", "blid", "blname", "welcome",
-                  "welcome_btns", "rules", "recurring", "rolenew", "rolemember", "staff")
+                  "welcome_btns", "rules", "recurring", "rolenew", "rolemember", "staff", "gmgr")
 # Состояния только для владельца/менеджеров бота
 _MANAGER_STATES = ("gword", "gbid", "gbname", "invitetext", "promo_content", "promo_btns",
-                   "bcast", "dmcast", "sp_time", "sp_content", "sp_btns", "mgr")
+                   "bcast", "dmcast", "sp_time", "sp_content", "sp_btns", "mgr",
+                   "shopitem", "shoptitle")
 
 
 async def _state_allowed(update: Update, context) -> bool:
@@ -6077,6 +6591,12 @@ async def _state_allowed(update: Update, context) -> bool:
             context, user.id, context.user_data.get("cfg_target")):
         context.user_data.pop("awaiting", None)
         await update.effective_message.reply_text("Сначала выбери свою группу: /panel")
+        return False
+    if awaiting == "gmgr" and not await can_assign_group_managers(
+            context, int(context.user_data.get("cfg_target")), user.id):
+        context.user_data.pop("awaiting", None)
+        await update.effective_message.reply_text(
+            "Назначать менеджеров может создатель группы или владелец бота.")
         return False
     return True
 
@@ -6255,6 +6775,25 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ В роль «{name}» добавлено: {len(added)}",
             reply_markup=role_detail_kb(cfg, name, context.user_data.get("cfg_target")))
 
+    if awaiting == "gmgr":
+        ids = [i for i in _int_ids(text) if i > 0]
+        if not ids:
+            return await msg.reply_text("Не вижу ID. Пришли числа через запятую (или /cancel)")
+        added = _add_unique(cfg.setdefault("group_managers", []), ids)
+        if added:
+            save_config(force=True)
+        done()
+        tgt = context.user_data.get("cfg_target")
+        title = CONFIG.get("groups", {}).get(str(tgt), str(tgt))
+        for uid in added:
+            try:
+                await context.bot.send_message(
+                    uid, f"👤 Тебя назначили менеджером группы «{title}». Настройки — /panel.")
+            except Exception:  # noqa: BLE001
+                pass
+        return await msg.reply_text(f"👤 Менеджеров добавлено: {len(added)} ({label})",
+                                    reply_markup=gmgr_kb(cfg, tgt))
+
     if awaiting == "staff":
         ids = _int_ids(text)
         if not ids:
@@ -6263,6 +6802,24 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_config()
         done()
         return await msg.reply_text("👔 Служебный чат сохранён.", reply_markup=staff_kb(cfg))
+
+    if awaiting == "shopitem":
+        parts = [p.strip() for p in text.split("|")]
+        if len(parts) < 2 or not parts[1].isdigit() or not parts[0]:
+            return await msg.reply_text("Формат: Название | звёзд | описание | выдача (или /cancel)")
+        it = {"id": f"i{int(time.time() * 1000) % 10 ** 9}", "title": parts[0][:32],
+              "stars": max(1, int(parts[1])), "desc": parts[2] if len(parts) > 2 else "",
+              "deliver": parts[3] if len(parts) > 3 else "", "enabled": True}
+        CONFIG.setdefault("shop", {}).setdefault("items", []).append(it)
+        save_config(force=True)
+        done()
+        return await msg.reply_text(f"🛒 Товар «{it['title']}» за {it['stars']} ⭐ добавлен.",
+                                    reply_markup=shop_kb())
+    if awaiting == "shoptitle":
+        CONFIG.setdefault("shop", {})["title"] = text[:40] or "Магазин"
+        save_config(force=True)
+        done()
+        return await msg.reply_text("🛒 Название магазина сохранено.", reply_markup=shop_kb())
 
     if awaiting == "invitetext":
         CONFIG["invite_text"] = text
@@ -6418,12 +6975,259 @@ async def on_private_document(update: Update, context: ContextTypes.DEFAULT_TYPE
     merged = _merge_defaults(data if isinstance(data, dict) else {})
     CONFIG.clear()
     CONFIG.update(merged)
+    _load_soft_mutes()
     save_config(force=True)
     await msg.reply_text("🗄 Полный бэкап восстановлен. Перезапуск не требуется.")
 
 # ───────────────────────────────────────────────────────────────────────────
 #  ОШИБКИ, СТАРТ, РЕГИСТРАЦИЯ
 # ───────────────────────────────────────────────────────────────────────────
+
+
+# ───────────────────────────────────────────────────────────────────────────
+#  МАГАЗИН MINI APP: веб-сервер, каталог, счета, выдача заказов
+# ───────────────────────────────────────────────────────────────────────────
+
+_shop_runner = None
+
+SHOP_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Магазин</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:var(--tg-theme-bg-color,#fff);--tx:var(--tg-theme-text-color,#111);
+--hint:var(--tg-theme-hint-color,#888);--btn:var(--tg-theme-button-color,#2a8bf2);
+--btx:var(--tg-theme-button-text-color,#fff);--card:var(--tg-theme-secondary-bg-color,#f2f3f5)}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--bg);color:var(--tx);
+font:15px/1.45 -apple-system,system-ui,"Segoe UI",Roboto,sans-serif}
+h1{font-size:21px;margin:4px 0 2px}
+.sub{color:var(--hint);font-size:13px;margin-bottom:16px}
+.card{background:var(--card);border-radius:14px;padding:14px;margin-bottom:10px;
+display:flex;gap:12px;align-items:center}
+.i{flex:1;min-width:0}.t{font-weight:600}.d{color:var(--hint);font-size:13px;margin-top:2px}
+button{border:0;border-radius:10px;padding:10px 14px;background:var(--btn);color:var(--btx);
+font-weight:600;font-size:14px;white-space:nowrap;cursor:pointer}
+button:disabled{opacity:.5}
+.empty{color:var(--hint);text-align:center;padding:48px 10px}
+</style></head><body>
+<h1 id="title">🛒 Магазин</h1>
+<div class="sub" id="sub">Оплата звёздами Telegram ⭐</div>
+<div id="list"><div class="empty">Загрузка…</div></div>
+<script>
+const tg = window.Telegram && Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+const q = new URLSearchParams(location.search);
+const chat = (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) || q.get("chat") || "";
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+function say(t, cb) { if (tg && tg.showAlert) tg.showAlert(t, cb); else { alert(t); if (cb) cb(); } }
+async function load() {
+  const L = document.getElementById("list");
+  try {
+    const r = await fetch("api/catalog?chat=" + encodeURIComponent(chat));
+    const j = await r.json();
+    if (j.title) document.getElementById("title").textContent = "🛒 " + j.title;
+    if (j.chat_title) document.getElementById("sub").textContent = "Группа: " + j.chat_title + " · оплата звёздами ⭐";
+    if (!j.items || !j.items.length) { L.innerHTML = '<div class="empty">Пока пусто 🙂</div>'; return; }
+    L.innerHTML = j.items.map(it =>
+      `<div class="card"><div class="i"><div class="t">${esc(it.title)}</div>` +
+      `<div class="d">${esc(it.desc)}</div></div>` +
+      `<button data-id="${esc(it.id)}">${Number(it.stars)} ⭐</button></div>`).join("");
+    L.querySelectorAll("button").forEach(b => b.onclick = () => buy(b));
+  } catch (e) { L.innerHTML = '<div class="empty">Не удалось загрузить каталог</div>'; }
+}
+async function buy(b) {
+  if (!tg || !tg.initData) { say("Открой магазин внутри Telegram"); return; }
+  b.disabled = true;
+  try {
+    const r = await fetch("api/invoice", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({initData: tg.initData, item: b.dataset.id, chat})});
+    const j = await r.json();
+    if (!j.link) throw new Error(j.error || "ошибка");
+    tg.openInvoice(j.link, st => {
+      b.disabled = false;
+      if (st === "paid") say("✅ Оплачено! Подробности — в чате с ботом.", () => tg.close());
+    });
+  } catch (e) { b.disabled = false; say("Не вышло создать счёт: " + e.message); }
+}
+load();
+</script></body></html>"""
+
+
+def _verify_init_data(init_data: str):
+    """Проверка подписи Telegram.WebApp.initData. Возвращает dict пользователя или None."""
+    try:
+        d = dict(parse_qsl(init_data or "", keep_blank_values=True))
+    except Exception:  # noqa: BLE001
+        return None
+    h = d.pop("hash", "")
+    if not h or not BOT_TOKEN:
+        return None
+    check = "\n".join(f"{k}={v}" for k, v in sorted(d.items()))
+    secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc, h):
+        return None
+    try:
+        if time.time() - int(d.get("auth_date", 0)) > 86400:
+            return None
+        user = json.loads(d.get("user") or "{}")
+    except Exception:  # noqa: BLE001
+        return None
+    return user if isinstance(user, dict) and user.get("id") else None
+
+
+def _shop_catalog(chat: str) -> list:
+    """Каталог: тариф PRO (если открыт из известной группы) + свои товары."""
+    s = CONFIG.get("shop") or {}
+    if not s.get("enabled"):
+        return []
+    items = []
+    if chat and str(chat) in CONFIG.get("groups", {}):
+        title = CONFIG["groups"][str(chat)]
+        for key, p in PRO_PLANS.items():
+            items.append({"id": f"pro_{key}", "title": f"⭐ PRO · {p['title']}"[:32],
+                          "desc": f"Полный доступ бота в «{title}» на {p['days']} дней",
+                          "stars": int(p["stars"])})
+    for it in s.get("items") or []:
+        if isinstance(it, dict) and it.get("enabled", True) and it.get("id"):
+            items.append({"id": it["id"], "title": str(it.get("title", ""))[:32],
+                          "desc": str(it.get("desc", "")), "stars": int(it.get("stars", 1) or 1)})
+    return items
+
+
+async def _shop_index(request):
+    return web.Response(text=SHOP_HTML, content_type="text/html")
+
+
+async def _shop_api_catalog(request):
+    chat = request.query.get("chat", "")
+    s = CONFIG.get("shop") or {}
+    return web.json_response({"title": s.get("title", "Магазин"),
+                              "chat_title": CONFIG.get("groups", {}).get(str(chat), ""),
+                              "items": _shop_catalog(chat)})
+
+
+async def _shop_api_invoice(request):
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return web.json_response({"error": "плохой запрос"}, status=400)
+    user = _verify_init_data(str(body.get("initData") or ""))
+    if not user:
+        return web.json_response({"error": "нет доступа — открой магазин из Telegram"}, status=403)
+    chat = str(body.get("chat") or "")
+    item = next((i for i in _shop_catalog(chat) if i["id"] == str(body.get("item"))), None)
+    if not item:
+        return web.json_response({"error": "товар не найден"}, status=404)
+    chat_part = chat if chat.lstrip("-").isdigit() else "0"
+    try:
+        link = await request.app["bot"].create_invoice_link(
+            title=item["title"][:32],
+            description=(item["desc"] or item["title"])[:255],
+            payload=f"shop:{int(user['id'])}:{item['id']}:{chat_part}",
+            provider_token="",  # Telegram Stars
+            currency="XTR",
+            prices=[LabeledPrice(label=item["title"][:32], amount=item["stars"])],
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("shop invoice: %s", e)
+        return web.json_response({"error": "Telegram не создал счёт"}, status=502)
+    return web.json_response({"link": link})
+
+
+async def start_shop_server(app: Application):
+    """Поднять веб-сервер магазина в том же event loop, что и бот."""
+    global _shop_runner
+    if not WEBAPP_URL:
+        return
+    if web is None:
+        log.warning("Магазин: задан WEBAPP_URL, но нет aiohttp — pip install aiohttp")
+        return
+    try:
+        wa = web.Application()
+        wa["bot"] = app.bot
+        wa.router.add_get("/", _shop_index)
+        wa.router.add_get("/api/catalog", _shop_api_catalog)
+        wa.router.add_post("/api/invoice", _shop_api_invoice)
+        runner = web.AppRunner(wa)
+        await runner.setup()
+        await web.TCPSite(runner, SHOP_HOST, SHOP_PORT).start()
+        _shop_runner = runner
+        log.info("Магазин Mini App: http://%s:%s → %s", SHOP_HOST, SHOP_PORT, WEBAPP_URL)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Магазин не запустился: %s", e)
+
+
+async def stop_shop_server():
+    global _shop_runner
+    if _shop_runner is not None:
+        try:
+            await _shop_runner.cleanup()
+        except Exception:  # noqa: BLE001
+            pass
+        _shop_runner = None
+
+
+async def _send_shop_button(msg, chat_id=""):
+    """Кнопка Mini App в ЛС (web_app-кнопки Telegram разрешает только в личке)."""
+    if not WEBAPP_URL or not (CONFIG.get("shop") or {}).get("enabled"):
+        return await msg.reply_text("🛒 Магазин пока закрыт.")
+    url = WEBAPP_URL + "/" + (f"?chat={quote(str(chat_id))}" if chat_id else "")
+    title = CONFIG.get("groups", {}).get(str(chat_id), "")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Открыть магазин", web_app=WebAppInfo(url=url))]])
+    await msg.reply_text("🛒 Магазин" + (f" для «{title}»" if title else "") +
+                         ": оплата звёздами Telegram прямо внутри 👇", reply_markup=kb)
+
+
+async def cmd_shop(update: Update, context):
+    chat = update.effective_chat
+    if not WEBAPP_URL or not (CONFIG.get("shop") or {}).get("enabled"):
+        return await reply_tidy(update, context, "🛒 Магазин пока закрыт.")
+    if chat.type in ("group", "supergroup"):
+        uname = _state.get("bot_username") or ""
+        if SHOP_APP_NAME and uname:
+            url = f"https://t.me/{uname}/{SHOP_APP_NAME}?startapp={chat.id}"
+        else:
+            url = f"https://t.me/{uname}?start=shop{chat.id}"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Открыть магазин", url=url)]])
+        return await reply_tidy(update, context,
+                                "🛒 Магазин: тариф PRO для этой группы и товары за звёзды 👇",
+                                seconds=60, reply_markup=kb)
+    await _send_shop_button(update.effective_message, "")
+
+
+async def _shop_paid(update, context, sp, parts):
+    """Успешная оплата из магазина: запись заказа и выдача."""
+    _, uid, item_id, chat = parts
+    order = {"ts": time.time(), "uid": int(uid) if uid.isdigit() else uid, "item": item_id,
+             "chat": chat, "stars": sp.total_amount,
+             "charge": getattr(sp, "telegram_payment_charge_id", "")}
+    orders = CONFIG.setdefault("shop_orders", [])
+    orders.append(order)
+    del orders[:-300]
+    save_config(force=True)
+    msg = update.effective_message
+    buyer = mention(update.effective_user) if update.effective_user else uid
+    if item_id.startswith("pro_") and chat.lstrip("-").isdigit() and chat != "0":
+        p = PRO_PLANS.get(item_id[4:])
+        if p:
+            cid = int(chat)
+            extend_pro(cid, p["days"])
+            until = datetime.fromtimestamp(pro_until(cid)).strftime("%d.%m.%Y")
+            title = CONFIG.get("groups", {}).get(chat, chat)
+            try:
+                await context.bot.send_message(cid, f"⭐ Тариф PRO активен до {until}. Спасибо, {buyer}!")
+            except Exception:  # noqa: BLE001
+                pass
+            await msg.reply_text(f"✅ Оплата получена! PRO для «{title}» активен до {until}.")
+            return await alert_owners(context, f"💰 Магазин: PRO {p['title']} для «{title}» — "
+                                               f"{sp.total_amount} ⭐ от {buyer}.")
+    it = next((i for i in (CONFIG.get("shop") or {}).get("items", []) if i.get("id") == item_id), {})
+    deliver_text = it.get("deliver") or "С тобой скоро свяжутся. Спасибо!"
+    await msg.reply_text(f"✅ Оплата получена: {it.get('title', item_id)}\n\n{deliver_text}")
+    await alert_owners(context, f"💰 Магазин: «{it.get('title', item_id)}» — {sp.total_amount} ⭐ "
+                                f"от {buyer} (id {uid}).")
 
 
 async def on_error(update, context):
@@ -6439,6 +7243,9 @@ async def on_error(update, context):
 async def _post_init(app: Application):
     me = await app.bot.get_me()
     _state["bot_username"] = me.username
+    _load_soft_mutes()
+    _restore_pending(app)
+    await start_shop_server(app)
     log.info("Запущен как @%s (id=%s)", me.username, me.id)
     try:
         await app.bot.set_my_commands([
@@ -6447,6 +7254,7 @@ async def _post_init(app: Application):
             BotCommand("add", "автоответ: ключ - ответ"),
             BotCommand("list", "список автоответов"),
             BotCommand("pro", "тариф и оплата"),
+            BotCommand("shop", "магазин"),
             BotCommand("userid", "мой ID"),
             BotCommand("skip", "пропустить шаг"),
             BotCommand("cancel", "отменить ввод"),
@@ -6461,6 +7269,7 @@ async def _post_init(app: Application):
             BotCommand("anreg", "не упоминать меня в /all"),
             BotCommand("top", "топ актива"),
             BotCommand("pro", "тариф для группы"),
+            BotCommand("shop", "магазин"),
         ], scope=BotCommandScopeAllGroupChats())
         await app.bot.set_my_commands([
             BotCommand("ban", "бан (реплаем/ID, можно срок)"),
@@ -6484,6 +7293,9 @@ async def _post_init(app: Application):
             BotCommand("role", "выдать роль (реплаем)"),
             BotCommand("unrole", "снять роль"),
             BotCommand("setstaff", "назначить служебный чат"),
+            BotCommand("gmanager", "назначить менеджера группы"),
+            BotCommand("ungmanager", "снять менеджера группы"),
+            BotCommand("gmanagers", "менеджеры группы"),
             BotCommand("setrules", "изменить правила"),
             BotCommand("setwelcome", "текст приветствия"),
             BotCommand("add", "автоответ: ключ - ответ"),
@@ -6503,7 +7315,34 @@ async def _post_init(app: Application):
         log.debug("set_my_commands: %s", e)
 
 
+def _restore_pending(app: Application):
+    """После рестарта: вернуть ожидающие капчи/заявки и перевзвести их таймеры."""
+    jq = app.job_queue
+    now = time.time()
+    pend = CONFIG.setdefault("pending", {})
+    n = 0
+    for kind, fn in (("captcha", captcha_timeout), ("jr", join_request_timeout)):
+        store = pend.setdefault(kind, {})
+        for k, v in list(store.items()):
+            try:
+                c, u = _split_pair(k)
+                dl = float((v or {}).get("deadline", 0) or 0)
+            except Exception:  # noqa: BLE001
+                store.pop(k, None)
+                continue
+            if kind == "captcha":
+                captcha_pending[(c, u)] = (v or {}).get("mid") or 0
+            else:
+                join_requests[(c, u)] = True
+            if jq:
+                jq.run_once(fn, max(1.0, dl - now), data={"chat_id": c, "uid": u})
+            n += 1
+    if n:
+        log.info("Восстановлено ожиданий капчи/заявок: %s", n)
+
+
 async def _post_shutdown(app: Application):
+    await stop_shop_server()
     _flush_config()
 
 
@@ -6512,6 +7351,7 @@ def build_app() -> Application:
            .token(BOT_TOKEN)
            .post_init(_post_init)
            .post_shutdown(_post_shutdown)
+           .concurrent_updates(True)
            .build())
 
     # Группа -1: миграции и замок допуска — раньше всего остального
@@ -6541,6 +7381,7 @@ def build_app() -> Application:
         ("say", cmd_say), ("diag", cmd_diag), ("reload", cmd_reload),
         ("pro", cmd_pro), ("grantpro", cmd_grantpro), ("broadcast", cmd_broadcast),
         ("grant", cmd_grant), ("revoke", cmd_revoke), ("managers", cmd_managers),
+        ("gmanager", cmd_gmanager), ("shop", cmd_shop), ("ungmanager", cmd_ungmanager), ("gmanagers", cmd_gmanagers),
     ):
         app.add_handler(CommandHandler(name, fn))
 
@@ -6603,8 +7444,8 @@ def main():
         jq.run_repeating(flush_config_job, interval=90, first=30)
         jq.run_repeating(janitor_job, interval=3600, first=600)
         jq.run_repeating(maintenance_daily_job, interval=86400, first=120)
-        jq.run_repeating(weekly_digest_job, interval=7 * 86400, first=3600)
-    log.info("Channel Guard v5 запускается…")
+        jq.run_repeating(weekly_digest_job, interval=3600, first=900)
+    log.info("Channel Guard v6 запускается…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
