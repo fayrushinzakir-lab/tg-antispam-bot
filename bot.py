@@ -1,10 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Channel Guard Bot  —  версия 6.1 («всё в одном»)
+Channel Guard Bot  —  версия 6.2 («всё в одном»)
 ================================================
 Антиспам + автоответы (текст/медиа/кнопки) + панель в ЛС + модерация + капча +
 приветствие + привлечение (промо, рассылки, посты по расписанию) + роли +
 анти-снос/анти-рейд + оплата звёздами Telegram.
+
+Что нового в v6.2:
+  • 🛒 Маркет прямо в боте — без ссылок и сайтов: /shop открывает витрину в чате с ботом.
+    Разделы, страницы, карточки товаров с фото, «В корзину» с количеством, «Купить сейчас»,
+    корзина с ➖/➕, комментарий продавцу, оплата звёздами счётом прямо в чате.
+  • В группе /shop отправляет витрину покупателю в личку (там же — тариф PRO для этой группы).
+  • Заказ из корзины может состоять из нескольких товаров; выдача по каждому (коды, рандом, текст).
+  • В панели: 📝 приветствие витрины, 📂 разделы товаров, «открыть витрину как покупатель».
 
 Что нового в v6.1:
   • Магазин 2.0: товар добавляется пошаговым мастером с кнопками (название → цена →
@@ -105,6 +113,7 @@ from telegram import (
     InlineKeyboardMarkup,
     LabeledPrice,
     WebAppInfo,
+    InputMediaPhoto,
     BotCommand,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllChatAdministrators,
@@ -363,6 +372,8 @@ DEFAULT_CONFIG = {
     "shop": {"enabled": False, "title": "Магазин", "items": [], "notify": [], "seq": 0},
     # Розыгрыши в группах: {id: {chat, mid, prize, winners, ends, parts, names, status, won}}
     "giveaways": {},
+    # Корзины покупателей маркета: {user_id: {"items": {item_id: qty}, "chat": "", "co": {...}, "ts": ...}}
+    "carts": {},
     "shop_orders": [],
     "runtime": {},
     "pending": {},
@@ -5482,7 +5493,9 @@ def shop_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("📦 Заказы" + (f" · 🔔 {open_n}" if open_n else ""),
                                   callback_data="m:shop_orders"),
              InlineKeyboardButton("🔔 Куда слать заказы", callback_data="add:shopnotify")],
-            [InlineKeyboardButton("✏️ Название магазина", callback_data="add:shoptitle")]]
+            [InlineKeyboardButton("✏️ Название", callback_data="add:shoptitle"),
+             InlineKeyboardButton("📝 Приветствие витрины", callback_data="add:shopabout")],
+            [InlineKeyboardButton("🛍 Открыть витрину как покупатель", callback_data="mk:home")]]
     for it in (s.get("items") or [])[:30]:
         if not isinstance(it, dict) or not it.get("id"):
             continue
@@ -5503,8 +5516,7 @@ def shop_menu_text() -> str:
     open_n = sum(1 for o in orders if o.get("status") in ("new", "paid"))
     who = ", ".join(str(x) for x in _shop_targets())
     return (f"🛒 Магазин «{s.get('title', 'Магазин')}»\n\n"
-            f"Сервер: {_shop_status()}\n"
-            f"Адрес: {WEBAPP_URL or '—'}\n"
+            "Витрина: прямо в боте — /shop (без ссылок и сайтов)\n"
             f"Товаров: {len(s.get('items') or [])} · заказов: {len(orders)} · ждут тебя: {open_n}\n"
             f"Заработано: {earned} ⭐\n"
             f"Заказы приходят: {who}{'' if s.get('notify') else ' (владельцы бота)'}\n\n"
@@ -5567,7 +5579,7 @@ add_help_text = (
 
 def about_text() -> str:
     return (
-        "🤖 Channel Guard Bot v6.1 — защита и оживление групп.\n\n"
+        "🤖 Channel Guard Bot v6.2 — защита и оживление групп.\n\n"
         "Антиспам: стоп-слова (2 списка + глобальный), исключения, ссылки и скрытые ссылки, "
         "спам-домены, антифлуд, медиа-фильтр, проверка имён, чёрные списки, ночной режим, "
         "анти-рейд, анти-снос, капча (в чате и через заявку в ЛС).\n"
@@ -5601,7 +5613,7 @@ HELP_TEXT = (
     "/block /unblock — чёрный список группы · /diag — диагностика · /pro — тариф\n"
     "/gmanager /ungmanager /gmanagers — менеджеры группы (назначает создатель)\n"
     "/appeal текст — апелляция владельцам бота\n"
-    "/shop — магазин Mini App: тариф PRO и товары за звёзды · /orders — мои заказы\n"
+    "/shop — магазин прямо в боте: витрина, корзина, оплата звёздами · /orders — мои заказы\n"
     "/random — рандом: /random 100 · /random 5 50 · /random а, б, в\n"
     "/random Приз | победителей | 1д — розыгрыш в группе · /gwend · /reroll"
 )
@@ -5638,7 +5650,7 @@ _MANAGER_CB = (
     "add:gword", "add:gbid", "add:gbname", "add:invitetext",
     "add:promo_content", "add:promo_btns", "add:bcast", "add:post",
     "sptgl:", "spdel:", "spg:", "tz:", "bk:",
-    "m:shop", "shp:", "dsi:", "add:shopitem", "add:shoptitle", "add:shopnotify",
+    "m:shop", "shp:", "dsi:", "add:shopitem", "add:shoptitle", "add:shopnotify", "add:shopabout",
     "sip:", "sim:", "sis:", "shi:", "sie:", "sep:", "sem:", "sit:", "sid:", "sidy:",
 )
 
@@ -5777,7 +5789,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tgt = context.user_data.get("cfg_target")
 
     # ── магазин 2.0 и розыгрыши ──
-    if data in ("add:shopitem", "add:shopnotify") or data.startswith(_SHOP_CB):
+    if data in ("add:shopitem", "add:shopnotify", "add:shopabout") or data.startswith(_SHOP_CB):
         return await _shop_callback(query, context, data)
     if data == "add:gwnew" or data.startswith(("gwe:", "gwr:")):
         return await _gw_callback(query, context, data)
@@ -6388,7 +6400,11 @@ async def cmd_start(update: Update, context):
                                 "👋 Я на месте. Настройки — в ЛС: открой меня и набери /panel.")
     context.user_data.pop("awaiting", None)
     if context.args and context.args[0].startswith("shop"):
-        return await _send_shop_button(update.effective_message, context.args[0][4:])
+        cid = context.args[0][4:]
+        if cid.lstrip("-").isdigit():
+            _cart(user.id)["chat"] = cid
+            save_config()
+        return await _mk_send_home(context.bot, chat.id, user.id)
     text = ("👋 Привет! Я — Channel Guard: антиспам, модерация, капча, автоответы, болталка, "
             "посты и рассылки для твоих групп.\n\n"
             "1) Добавь меня в группу и дай права администратора (удаление, бан, приглашения).\n"
@@ -6677,7 +6693,7 @@ _TARGET_STATES = ("word", "word2", "wword", "link", "trigger", "trig_keys", "tri
 _MANAGER_STATES = ("gword", "gbid", "gbname", "invitetext", "promo_content", "promo_btns",
                    "bcast", "dmcast", "sp_time", "sp_content", "sp_btns", "mgr",
                    "shopitem", "shoptitle", "si_title", "si_price", "si_desc", "si_photo",
-                   "si_mode", "si_deliver", "se", "shopnotify")
+                   "si_mode", "si_deliver", "se", "shopnotify", "shopabout")
 
 
 async def _state_allowed(update: Update, context) -> bool:
@@ -6722,6 +6738,8 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await _shop_text(update, context, awaiting, text, msg)
     if awaiting == "gwnew":
         return await _gw_text_input(update, context, text, msg)
+    if awaiting == "mk_comment":
+        return await _mk_comment_input(update, context, text, msg)
 
     # ── списки слов/доменов ──
     list_states = {"word": ("stop_words", words_kb), "word2": ("stop_words2", words2_kb),
@@ -7396,20 +7414,25 @@ async def _send_shop_button(msg, chat_id=""):
 
 
 async def cmd_shop(update: Update, context):
-    chat = update.effective_chat
-    if not WEBAPP_URL or not (CONFIG.get("shop") or {}).get("enabled"):
+    """Маркет прямо в боте. В группе — отправляет витрину покупателю в личку."""
+    chat, user = update.effective_chat, update.effective_user
+    if not (CONFIG.get("shop") or {}).get("enabled") and not is_manager(user.id):
         return await reply_tidy(update, context, "🛒 Магазин пока закрыт.")
     if chat.type in ("group", "supergroup"):
-        uname = _state.get("bot_username") or ""
-        if SHOP_APP_NAME and uname:
-            url = f"https://t.me/{uname}/{SHOP_APP_NAME}?startapp={chat.id}"
-        else:
-            url = f"https://t.me/{uname}?start=shop{chat.id}"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Открыть магазин", url=url)]])
-        return await reply_tidy(update, context,
-                                "🛒 Магазин: тариф PRO для этой группы и товары за звёзды 👇",
-                                seconds=60, reply_markup=kb)
-    await _send_shop_button(update.effective_message, "")
+        _cart(user.id)["chat"] = str(chat.id)
+        save_config()
+        try:
+            await _mk_send_home(context.bot, user.id, user.id)
+            return await reply_tidy(update, context, f"📬 {mention(user)}, открыл магазин тебе в личке.",
+                                    seconds=15)
+        except Exception:  # noqa: BLE001
+            uname = _state.get("bot_username") or ""
+            kb = (InlineKeyboardMarkup([[InlineKeyboardButton(
+                "💬 Открыть чат с ботом", url=f"https://t.me/{uname}?start=shop{chat.id}")]]) if uname else None)
+            return await reply_tidy(update, context,
+                                    "🛒 Магазин работает в личке бота. Нажми кнопку — витрина откроется сразу.",
+                                    seconds=60, reply_markup=kb)
+    await _mk_send_home(context.bot, chat.id, user.id)
 
 
 async def _shop_paid(update, context, sp, parts):
@@ -7469,7 +7492,8 @@ _MODE_HINT = {
              "случайный из оставшихся, остаток виден в витрине, «нет в наличии» — сам.",
 }
 _PRICE_PRESETS = [0, 25, 50, 100, 250, 500, 1000]
-_SHOP_STATES = ("si_title", "si_price", "si_desc", "si_photo", "si_mode", "si_deliver", "se", "shopnotify")
+_SHOP_STATES = ("si_title", "si_price", "si_desc", "si_photo", "si_mode", "si_deliver", "se", "shopnotify",
+                "shopabout")
 _SHOP_CB = ("sip:", "sim:", "sis:", "shi:", "sie:", "sep:", "sem:", "sit:", "sid:", "sidy:")
 
 
@@ -7540,13 +7564,25 @@ def _is_seller(uid: int) -> bool:
 # ── карточка заказа ─────────────────────────────────────────────────────────
 
 
+def _order_items_html(o) -> str:
+    e = html.escape
+    lines = o.get("lines")
+    if not lines:
+        return f"🛍 {e(str(o.get('title') or o.get('item')))} — {_price_txt(o.get('stars', 0))}"
+    out = ["🛍 Состав:"] + [
+        f"• {e(str(ln.get('title')))} × {ln.get('qty', 1)} — "
+        f"{_price_txt(int(ln.get('stars', 0) or 0) * int(ln.get('qty', 1) or 1))}" for ln in lines]
+    out.append(f"💰 Итого: {_price_txt(o.get('stars', 0))}")
+    return "\n".join(out)
+
+
 def _order_text(o) -> str:
     e = html.escape
     buyer = f'<a href="tg://user?id={o.get("uid")}">{e(str(o.get("name") or o.get("uid")))}</a>'
     if o.get("username"):
         buyer += f" @{e(o['username'])}"
     lines = [f"🧾 <b>Заказ №{e(str(o.get('id')))}</b> · {_ORDER_ST.get(o.get('status'), o.get('status'))}",
-             f"🛍 {e(str(o.get('title') or o.get('item')))} — {_price_txt(o.get('stars', 0))}",
+             _order_items_html(o),
              f"👤 {buyer} · id <code>{o.get('uid')}</code>"]
     if o.get("comment"):
         lines.append(f"💬 {e(o['comment'])}")
@@ -7604,10 +7640,10 @@ async def _tell_buyer(bot, o, text: str):
         log.debug("buyer %s: %s", o.get("uid"), e)
 
 
-def _deliver_item(it: dict, o: dict):
-    """Выдача по способу товара. Возвращает выданное или None (выдаст продавец)."""
+def _deliver_one(it: dict):
+    """Одна единица товара по его способу выдачи. Возвращает (выдано|None, кончились_коды)."""
     mode = _item_mode(it)
-    d = None
+    d, empty = None, False
     if mode == "same":
         d = _spintax(it.get("deliver") or "") or None
     elif mode == "random":
@@ -7618,20 +7654,14 @@ def _deliver_item(it: dict, o: dict):
         if codes:
             d = codes.pop(random.randrange(len(codes)))
         else:
-            o["note"] = "коды закончились — выдай вручную"
+            empty = True
     if it:
         it["sold"] = int(it.get("sold", 0) or 0) + 1
-    if d:
-        o["delivered"] = d
-        o["status"] = "done"
-    else:
-        o["status"] = "paid"
-    save_config(force=True)
-    return d
+    return d, empty
 
 
 async def _shop_paid_order(update, context, sp, oid):
-    """Оплата заказа из витрины: выдача, уведомления покупателю и продавцу."""
+    """Оплата заказа: выдача по каждой строке, уведомления покупателю и продавцу."""
     o = _find_order(oid)
     msg = update.effective_message
     if not o:
@@ -7640,37 +7670,64 @@ async def _shop_paid_order(update, context, sp, oid):
     o["charge"] = getattr(sp, "telegram_payment_charge_id", "")
     o["paid_ts"] = time.time()
     o.pop("note", None)
-    iid = str(o.get("item"))
-    if iid.startswith("pro_") and str(o.get("chat") or "0") not in ("0", ""):
-        p = PRO_PLANS.get(iid[4:]) or {"days": 30}
-        cid = int(o["chat"])
-        extend_pro(cid, p["days"])
-        until = datetime.fromtimestamp(pro_until(cid)).strftime("%d.%m.%Y")
-        o["status"], o["delivered"] = "done", f"PRO до {until}"
-        save_config(force=True)
-        try:
-            await context.bot.send_message(cid, f"⭐ Тариф PRO активен до {until}. Спасибо!")
-        except Exception:  # noqa: BLE001
-            pass
-        await msg.reply_text(f"✅ Оплата получена! PRO для «{CONFIG.get('groups', {}).get(str(cid), cid)}» "
-                             f"активен до {until}.")
-    else:
+    lines = o.get("lines") or [{"item": o.get("item"), "title": o.get("title"), "qty": 1,
+                                "stars": o.get("stars", 0)}]
+    got, manual, empty, low = [], [], [], []
+    for ln in lines:
+        iid = str(ln.get("item"))
+        qty = max(1, int(ln.get("qty", 1) or 1))
+        t = ln.get("title") or iid
+        if iid.startswith("pro_"):
+            chat = str(o.get("chat") or "0")
+            if chat in ("0", ""):
+                manual.append(t)
+                continue
+            p = PRO_PLANS.get(iid[4:]) or {"days": 30}
+            cid = int(chat)
+            extend_pro(cid, int(p["days"]) * qty)
+            until = datetime.fromtimestamp(pro_until(cid)).strftime("%d.%m.%Y")
+            got.append(f"{t}: PRO для «{CONFIG.get('groups', {}).get(chat, chat)}» до {until}")
+            try:
+                await context.bot.send_message(cid, f"⭐ Тариф PRO активен до {until}. Спасибо!")
+            except Exception:  # noqa: BLE001
+                pass
+            continue
         it = _item_by_id(iid) or {}
-        d = _deliver_item(it, o)
-        title = o.get("title") or it.get("title") or iid
-        if d:
-            await msg.reply_text(f"✅ Оплата получена: {title}\n\n📦 Твой заказ №{o['id']}:\n{d}")
-        else:
-            await msg.reply_text(f"✅ Оплата получена: {title}\n"
-                                 f"Продавец скоро свяжется и выдаст заказ №{o['id']}. Статус — /orders")
+        for _ in range(qty):
+            d, emp = _deliver_one(it) if it else (None, False)
+            if d:
+                got.append(f"{t}: {d}" if (len(lines) > 1 or qty > 1) else d)
+            else:
+                manual.append(t)
+                if emp and t not in empty:
+                    empty.append(t)
         st = _item_stock(it) if it else None
         if st is not None and st <= 3:
-            for cid in _shop_targets():
-                try:
-                    await context.bot.send_message(cid, f"⚠️ «{title}»: на складе осталось кодов — {st}. "
-                                                        "Пополни: панель → 🛒 Магазин → товар → ➕ Коды.")
-                except Exception:  # noqa: BLE001
-                    pass
+            low.append((t, st))
+    o["delivered"] = "\n".join(got)
+    o["status"] = "paid" if manual else "done"
+    if empty:
+        o["note"] = "кончились коды: " + ", ".join(empty) + " — выдай вручную"
+    if o.get("from_cart"):
+        cart = _cart(o.get("uid"))
+        for ln in lines:
+            cart["items"].pop(str(ln.get("item")), None)
+    save_config(force=True)
+    body = []
+    if got:
+        body.append("📦 Твой заказ:\n" + "\n".join(got))
+    if manual:
+        body.append("⏳ Остальное выдаст продавец: " + ", ".join(dict.fromkeys(manual)) +
+                    ". Он скоро свяжется.")
+    await msg.reply_text((f"✅ Оплата получена! Заказ №{o['id']}\n\n" + "\n\n".join(body) +
+                          "\n\nВсе заказы — /orders")[:4000])
+    for t, st in low:
+        for cid in _shop_targets():
+            try:
+                await context.bot.send_message(cid, f"⚠️ «{t}»: на складе осталось кодов — {st}. "
+                                                    "Пополни: панель → 🛒 Магазин → товар → ➕ Коды.")
+            except Exception:  # noqa: BLE001
+                pass
     await _refresh_seller_msgs(context.bot, o)
     await _notify_sellers(context.bot, o, f"💰 Оплачен заказ №{o['id']} — {sp.total_amount} ⭐")
 
@@ -7736,6 +7793,11 @@ async def _shop_janitor(context):
             o["status"] = "expired"
             changed = True
             await _refresh_seller_msgs(context.bot, o)
+    carts = CONFIG.setdefault("carts", {})
+    for k, c in list(carts.items()):
+        if now - float((c or {}).get("ts", 0) or 0) > 30 * 86400:
+            carts.pop(k, None)
+            changed = True
     gws = CONFIG.setdefault("giveaways", {})
     for gid, g in list(gws.items()):
         if g.get("status") == "ended" and now - float(g.get("ends", 0) or 0) > 30 * 86400:
@@ -7796,6 +7858,7 @@ def _item_lines(it: dict) -> str:
              f"💰 Цена: {_price_txt(it.get('stars', 0))}",
              f"📝 Описание: {it.get('desc') or '—'}",
              f"🖼 Фото: {'есть' if it.get('photo') else 'нет'}",
+             f"📂 Раздел: {it.get('cat') or '—'}",
              f"📦 Выдача: {_MODES.get(mode, mode)}"]
     if mode == "same":
         lines.append(f"      текст: {(it.get('deliver') or '—')[:200]}")
@@ -7818,6 +7881,7 @@ def _item_card(it: dict):
     extra = {"same": "✏️ Текст выдачи", "random": "✏️ Варианты", "codes": "➕ Коды"}.get(mode)
     if extra:
         rows[-1].append(_B(extra, f"sie:deliver:{iid}"))
+    rows.append([_B("📂 Раздел витрины", f"sie:cat:{iid}")])
     rows.append([_B("🙈 Скрыть" if it.get("enabled", True) else "👁 Показать", f"sit:{iid}"),
                  _B("🗑 Удалить", f"sid:{iid}")])
     rows.append([_B("⬅️ К товарам", "m:shop")])
@@ -7882,6 +7946,8 @@ _EDIT_PROMPTS = {
     "title": "✏️ Пришли новое название (до 32 символов).",
     "desc": "📝 Пришли новое описание. «-» — убрать описание.",
     "photo": "🖼 Пришли новую картинку. «-» — убрать фото.",
+    "cat": "📂 Пришли название раздела витрины (например «Реклама» или «Ключи»). "
+           "Товары с одним разделом группируются. «-» — без раздела.",
 }
 
 
@@ -7903,6 +7969,13 @@ async def _shop_callback(query, context, data):
         ud["awaiting"] = "si_title"
         await edit("🛍 Новый товар · шаг 1/5\n\nКак называется товар? (до 32 символов)\n"
                    "Например: «Реклама в чате на сутки»", _cancel_kb())
+        return await ans()
+    if data == "add:shopabout":
+        ud["awaiting"] = "shopabout"
+        await edit("📝 Приветствие витрины — покупатель видит его, открыв /shop.\n"
+                   "Например: «Привет! Здесь реклама, ключи и консультации. Оплата звёздами ⭐»\n"
+                   "«-» — без приветствия.\n\nСейчас: " + ((CONFIG.get("shop") or {}).get("about") or "—"),
+                   _cancel_kb("m:shop"))
         return await ans()
     if data == "add:shopnotify":
         ud["awaiting"] = "shopnotify"
@@ -8041,6 +8114,11 @@ async def _shop_text(update, context, awaiting, text, msg):
         ud.pop("awaiting", None)
         return await send("🔔 Сохранено. Заказы будут приходить: " +
                           ", ".join(str(x) for x in _shop_targets()), reply_markup=shop_kb())
+    if awaiting == "shopabout":
+        _shop()["about"] = "" if text.strip() in ("-", "—") else text[:600]
+        save_config(force=True)
+        ud.pop("awaiting", None)
+        return await send("📝 Приветствие витрины сохранено.", reply_markup=shop_kb())
     if awaiting == "si_mode":
         return await send("Выбери способ выдачи кнопкой выше 👆 (или /cancel)")
     d = ud.setdefault("shop_draft", {})
@@ -8095,6 +8173,8 @@ async def _shop_text(update, context, awaiting, text, msg):
             it["title"] = text[:32]
         elif f == "desc":
             it["desc"] = "" if low in ("-", "—") else text[:500]
+        elif f == "cat":
+            it["cat"] = "" if low in ("-", "—") else text.strip()[:30]
         elif f == "photo":
             if msg.photo:
                 it["photo"] = msg.photo[-1].file_id
@@ -8127,6 +8207,398 @@ async def _shop_text(update, context, awaiting, text, msg):
         return await send("✅ Сохранено\n\n" + t, reply_markup=kb)
     ud.pop("awaiting", None)
     return await send("Не разобрал. Панель — /panel")
+
+
+# ───────────────────────────────────────────────────────────────────────────
+#  🛒 МАРКЕТ ПРЯМО В БОТЕ: витрина, разделы, карточки, корзина, оформление
+# ───────────────────────────────────────────────────────────────────────────
+
+_MK_PAGE = 8
+_PRO_CAT = "⭐ Тариф PRO для группы"
+
+
+def _cart(uid) -> dict:
+    c = CONFIG.setdefault("carts", {}).setdefault(str(uid), {})
+    c.setdefault("items", {})
+    c["ts"] = time.time()
+    return c
+
+
+def _mk_items(uid) -> list:
+    """Всё, что видит этот покупатель: тариф PRO (если пришёл из группы) + товары."""
+    c = (CONFIG.get("carts") or {}).get(str(uid)) or {}
+    chat = str(c.get("chat") or "")
+    out = []
+    if chat and chat in CONFIG.get("groups", {}):
+        gt = CONFIG["groups"][chat]
+        for key, p in PRO_PLANS.items():
+            out.append({"id": f"pro_{key}", "title": f"PRO · {p['title']}",
+                        "desc": f"Полный доступ бота в «{gt}» на {p['days']} дней: антиспам, капча, "
+                                f"автоответы, посты, статистика.",
+                        "stars": int(p["stars"]), "photo": "", "cat": _PRO_CAT, "stock": None})
+    for it in _shop_items():
+        if isinstance(it, dict) and it.get("id") and it.get("enabled", True):
+            out.append({"id": it["id"], "title": str(it.get("title", "")), "desc": str(it.get("desc", "")),
+                        "stars": int(it.get("stars", 0) or 0), "photo": it.get("photo") or "",
+                        "cat": str(it.get("cat") or ""), "stock": _item_stock(it)})
+    return out
+
+
+def _mk_cats(items) -> list:
+    cats = []
+    for i in items:
+        if i["cat"] and i["cat"] not in cats:
+            cats.append(i["cat"])
+    return cats
+
+
+def _mk_price(stars) -> str:
+    return f"{int(stars)} ⭐" if int(stars or 0) > 0 else "бесплатно"
+
+
+def _mk_resolve(uid, raw: dict) -> list:
+    """{item_id: qty} → строки с актуальными названиями и ценами."""
+    by = {i["id"]: i for i in _mk_items(uid)}
+    lines = []
+    for iid, qty in list((raw or {}).items()):
+        it = by.get(iid)
+        if it and int(qty) > 0:
+            lines.append({"item": iid, "title": it["title"], "qty": int(qty),
+                          "stars": int(it["stars"]), "stock": it["stock"]})
+    return lines
+
+
+def _mk_total(lines) -> int:
+    return sum(ln["stars"] * ln["qty"] for ln in lines)
+
+
+def _mk_count(uid) -> int:
+    c = (CONFIG.get("carts") or {}).get(str(uid)) or {}
+    return sum(int(q) for q in (c.get("items") or {}).values())
+
+
+def _mk_footer(uid, back=None) -> list:
+    n = _mk_count(uid)
+    rows = [[_B("🛒 Корзина" + (f" · {n}" if n else ""), "mk:cart"), _B("📦 Мои заказы", "mk:my")]]
+    if back:
+        rows.append([_B(back[0], back[1])])
+    return rows
+
+
+def _mk_head() -> str:
+    return f"🛒 <b>{html.escape((CONFIG.get('shop') or {}).get('title') or 'Магазин')}</b>"
+
+
+def _mk_home(uid):
+    items = _mk_items(uid)
+    cats = _mk_cats(items)
+    if not cats:
+        return _mk_list(uid, -1, 0)
+    about = (CONFIG.get("shop") or {}).get("about") or ""
+    text = _mk_head() + "\n\n" + (html.escape(about) + "\n\n" if about else "") + "Выбери раздел 👇"
+    rows = [[_B(f"{c} · {sum(1 for i in items if i['cat'] == c)}", f"mk:cat:{k}:0")]
+            for k, c in enumerate(cats)]
+    rows.append([_B(f"📋 Все товары · {len(items)}", "mk:cat:-1:0")])
+    return text, InlineKeyboardMarkup(rows + _mk_footer(uid)), None
+
+
+def _mk_list(uid, ci: int, page: int):
+    items = _mk_items(uid)
+    cats = _mk_cats(items)
+    if 0 <= ci < len(cats):
+        sel, head = [i for i in items if i["cat"] == cats[ci]], cats[ci]
+    else:
+        sel, head = items, ("Все товары" if cats else "")
+    pages = max(1, (len(sel) + _MK_PAGE - 1) // _MK_PAGE)
+    page = max(0, min(page, pages - 1))
+    about = (CONFIG.get("shop") or {}).get("about") or ""
+    text = _mk_head() + (f" · {html.escape(head)}" if head else "") + "\n\n"
+    if not cats and about:
+        text += html.escape(about) + "\n\n"
+    text += "Нажми на товар, чтобы открыть 👇" if sel else "Витрина пока пустая 🙂"
+    rows = []
+    for i in sel[page * _MK_PAGE:(page + 1) * _MK_PAGE]:
+        out = i["stock"] == 0
+        rows.append([_B(("🚫 " if out else "🛍 ") + f"{i['title'][:30]} — "
+                        + ("нет в наличии" if out else _mk_price(i["stars"])),
+                        f"mk:it:{i['id']}:{ci}:{page}")])
+    if pages > 1:
+        rows.append([_B("◀️", f"mk:cat:{ci}:{page - 1}") if page > 0 else _B("·", "mk:noop"),
+                     _B(f"{page + 1} / {pages}", "mk:noop"),
+                     _B("▶️", f"mk:cat:{ci}:{page + 1}") if page < pages - 1 else _B("·", "mk:noop")])
+    return text, InlineKeyboardMarkup(rows + _mk_footer(uid, ("⬅️ Разделы", "mk:home") if cats else None)), None
+
+
+def _mk_item(uid, iid: str, ci: int, page: int):
+    it = next((i for i in _mk_items(uid) if i["id"] == iid), None)
+    if not it:
+        return None
+    qty = int(_cart(uid)["items"].get(iid, 0))
+    out = it["stock"] == 0
+    e = html.escape
+    text = f"🛍 <b>{e(it['title'])}</b>\n\n💰 {_mk_price(it['stars'])}"
+    if it["stock"] is not None:
+        text += " · 🚫 нет в наличии" if out else f" · в наличии: {it['stock']}"
+    if it["desc"]:
+        text += "\n\n" + e(it["desc"])
+    if it["stars"] == 0:
+        text += "\n\n📝 Это заявка: продавец получит её и свяжется с тобой."
+    text = text[:1000]
+    tail = f":{ci}:{page}"
+    rows = []
+    if not out:
+        if qty:
+            rows.append([_B("➖", f"mk:sub:{iid}{tail}"), _B(f"🛒 {qty} в корзине", "mk:cart"),
+                         _B("➕", f"mk:add:{iid}{tail}")])
+        else:
+            rows.append([_B("🛒 В корзину", f"mk:add:{iid}{tail}")])
+        rows.append([_B(f"⚡ Купить сейчас · {_mk_price(it['stars'])}" if it["stars"] > 0
+                        else "📝 Оставить заявку", f"mk:buy:{iid}")])
+    rows.append([_B("⬅️ Назад", f"mk:cat:{ci}:{page}")])
+    return text, InlineKeyboardMarkup(rows), (it["photo"] or None)
+
+
+def _mk_cart_view(uid):
+    lines = _mk_resolve(uid, _cart(uid)["items"])
+    if not lines:
+        return ("🛒 <b>Корзина пуста</b>\n\nЗагляни в витрину 👇",
+                InlineKeyboardMarkup([[_B("🛍 В витрину", "mk:home"), _B("📦 Мои заказы", "mk:my")]]), None)
+    e = html.escape
+    total = _mk_total(lines)
+    text = ("🛒 <b>Корзина</b>\n\n" +
+            "\n".join(f"• {e(ln['title'])} × {ln['qty']} — {_mk_price(ln['stars'] * ln['qty'])}" for ln in lines) +
+            (f"\n\n<b>Итого: {total} ⭐</b>" if total else "\n\nИтого: бесплатно (заявка)"))
+    rows = []
+    for ln in lines:
+        rows.append([_B("➖", f"mk:cd:{ln['item']}"), _B(f"{ln['title'][:16]} × {ln['qty']}", f"mk:it:{ln['item']}:-1:0"),
+                     _B("➕", f"mk:ci:{ln['item']}"), _B("🗑", f"mk:cx:{ln['item']}")])
+    rows.append([_B("✅ Оформить заказ", "mk:co")])
+    rows.append([_B("🧹 Очистить", "mk:clr"), _B("🛍 В витрину", "mk:home")])
+    return text, InlineKeyboardMarkup(rows), None
+
+
+def _mk_co_view(uid):
+    co = _cart(uid).get("co") or {}
+    lines = _mk_resolve(uid, co.get("lines") or {})
+    if not lines:
+        return ("Нечего оформлять — корзина пуста.",
+                InlineKeyboardMarkup([[_B("🛍 В витрину", "mk:home")]]), None)
+    e = html.escape
+    total = _mk_total(lines)
+    text = ("🧾 <b>Оформление заказа</b>\n\n" +
+            "\n".join(f"• {e(ln['title'])} × {ln['qty']} — {_mk_price(ln['stars'] * ln['qty'])}" for ln in lines) +
+            (f"\n\n<b>К оплате: {total} ⭐</b>" if total else "\n\nБесплатно — продавец получит заявку") +
+            f"\n💬 Комментарий: {e(co.get('comment') or '—')}\n\n"
+            "Нажми «✅», и заказ сразу уйдёт продавцу." + ("\nСчёт на оплату звёздами придёт сюда же." if total else ""))
+    back = "mk:cart" if co.get("src") == "cart" else f"mk:it:{lines[0]['item']}:-1:0"
+    rows = [[_B("✏️ Изменить комментарий" if co.get("comment") else "💬 Добавить комментарий", "mk:cm")],
+            [_B(f"✅ Оплатить {total} ⭐" if total else "✅ Отправить заявку", "mk:ok")],
+            [_B("⬅️ Назад", back)]]
+    return text, InlineKeyboardMarkup(rows), None
+
+
+def _mk_my(uid):
+    mine = [o for o in (CONFIG.get("shop_orders") or []) if str(o.get("uid")) == str(uid) and o.get("id")][-8:][::-1]
+    e = html.escape
+    if not mine:
+        text = "📦 <b>Мои заказы</b>\n\nПока пусто — самое время что-нибудь выбрать 🙂"
+    else:
+        parts = []
+        for o in mine:
+            dt = datetime.fromtimestamp(o.get("ts", 0), _post_tz()).strftime("%d.%m %H:%M")
+            s = (f"<b>№{o['id']}</b> · {e(str(o.get('title'))[:60])} · {_mk_price(o.get('stars', 0))}\n"
+                 f"{_ORDER_ST.get(o.get('status'), '')} · {dt}")
+            if o.get("delivered"):
+                s += f"\n📦 <code>{e(str(o['delivered'])[:300])}</code>"
+            parts.append(s)
+        text = "📦 <b>Мои заказы</b>\n\n" + "\n\n".join(parts)
+    return text[:4000], InlineKeyboardMarkup([[_B("🛍 В витрину", "mk:home"), _B("🛒 Корзина", "mk:cart")]]), None
+
+
+async def _mk_show(bot, q, text, kb, photo=None):
+    """Показать экран маркета в том же сообщении (с фото или без — переключаемся сами)."""
+    m = q.message
+    try:
+        if photo:
+            if m.photo:
+                await m.edit_media(InputMediaPhoto(media=photo, caption=text, parse_mode="HTML"), reply_markup=kb)
+            else:
+                await bot.send_photo(m.chat.id, photo, caption=text, parse_mode="HTML", reply_markup=kb)
+                try:
+                    await m.delete()
+                except Exception:  # noqa: BLE001
+                    pass
+        elif m.photo:
+            await bot.send_message(m.chat.id, text, parse_mode="HTML", reply_markup=kb)
+            try:
+                await m.delete()
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            await m.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except BadRequest as e:
+        if "not modified" in str(e).lower():
+            return
+        log.debug("market show: %s", e)
+        await bot.send_message(m.chat.id, text, parse_mode="HTML", reply_markup=kb)
+
+
+async def _mk_send_home(bot, to_id, uid):
+    text, kb, _ = _mk_home(uid)
+    await bot.send_message(to_id, text, parse_mode="HTML", reply_markup=kb)
+
+
+async def _mk_checkout(bot, q, uid):
+    """Подтверждение: заказ СРАЗУ уходит продавцу; платный — ещё и счёт звёздами в чат."""
+    c = _cart(uid)
+    co = c.get("co") or {}
+    lines = _mk_resolve(uid, co.get("lines") or {})
+    if not lines:
+        return "Корзина пуста", None
+    for ln in lines:
+        if ln["stock"] is not None and ln["qty"] > ln["stock"]:
+            return f"«{ln['title']}»: в наличии только {ln['stock']}", None
+    if not _throttle(("mkok", uid), 5.0):
+        return "Секунду…", None
+    total = _mk_total(lines)
+    u = q.from_user
+    summary = ", ".join(f"{ln['title']}" + (f" ×{ln['qty']}" if ln["qty"] > 1 else "") for ln in lines)
+    o = {"id": _new_order_id(), "ts": time.time(), "uid": u.id,
+         "name": (u.full_name or str(u.id))[:64], "username": u.username or "",
+         "lines": [{k: ln[k] for k in ("item", "title", "qty", "stars")} for ln in lines],
+         "item": lines[0]["item"], "title": summary[:120], "stars": total,
+         "comment": (co.get("comment") or "")[:300], "chat": str(c.get("chat") or "0"),
+         "status": "wait" if total > 0 else "new", "from_cart": co.get("src") == "cart", "via": "bot"}
+    if total > 0:
+        try:
+            await bot.send_invoice(chat_id=uid, title=f"Заказ №{o['id']}"[:32],
+                                   description=summary[:255] or "Заказ", payload=f"sho:{o['id']}",
+                                   provider_token="", currency="XTR",
+                                   prices=[LabeledPrice(label=f"Заказ №{o['id']}", amount=total)])
+        except Exception as e:  # noqa: BLE001
+            log.warning("market invoice: %s", e)
+            return "Не получилось выставить счёт — попробуй позже", None
+    orders = CONFIG.setdefault("shop_orders", [])
+    orders.append(o)
+    del orders[:-300]
+    c.pop("co", None)
+    if total == 0 and o["from_cart"]:
+        for ln in lines:
+            c["items"].pop(ln["item"], None)
+    save_config(force=True)
+    await _notify_sellers(bot, o, "🆕 Новый заказ — ждёт оплаты" if total else "🆕 Новая заявка!")
+    if total:
+        text = (f"🧾 <b>Заказ №{o['id']} оформлен!</b>\n\nОплати счёт ниже 👇 — после оплаты товар придёт "
+                "сюда сразу (или продавец свяжется, если выдаёт вручную).")
+    else:
+        text = f"📝 <b>Заявка №{o['id']} отправлена продавцу!</b>\n\nОн скоро свяжется с тобой."
+    return None, (text, InlineKeyboardMarkup([[_B("📦 Мои заказы", "mk:my"), _B("🛍 В витрину", "mk:home")]]), None)
+
+
+async def handle_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Все кнопки маркета (mk:…)."""
+    q = update.callback_query
+    uid = q.from_user.id
+    p = (q.data or "mk:home").split(":")
+    act = p[1] if len(p) > 1 else "home"
+    if not (CONFIG.get("shop") or {}).get("enabled") and not is_manager(uid):
+        return await q.answer("🛒 Магазин сейчас закрыт", show_alert=True)
+    if act == "noop":
+        return await q.answer()
+    c = _cart(uid)
+    note, alert, view = None, False, None
+    iv = lambda k, d=0: int(p[k]) if len(p) > k and p[k].lstrip("-").isdigit() else d  # noqa: E731
+
+    if act == "home":
+        view = _mk_home(uid)
+    elif act == "cat":
+        view = _mk_list(uid, iv(2, -1), iv(3, 0))
+    elif act == "it":
+        view = _mk_item(uid, p[2], iv(3, -1), iv(4, 0)) if len(p) > 2 else None
+        if view is None:
+            note, alert, view = "Товар больше не продаётся", True, _mk_home(uid)
+    elif act in ("add", "sub"):
+        iid = p[2]
+        it = next((i for i in _mk_items(uid) if i["id"] == iid), None)
+        if not it:
+            return await q.answer("Товар больше не продаётся", show_alert=True)
+        qty = int(c["items"].get(iid, 0)) + (1 if act == "add" else -1)
+        if it["stock"] is not None and qty > it["stock"]:
+            return await q.answer(f"В наличии только {it['stock']}", show_alert=True)
+        if qty > 99:
+            return await q.answer("Максимум 99 штук")
+        if qty <= 0:
+            c["items"].pop(iid, None)
+        else:
+            c["items"][iid] = qty
+        note = "🛒 Добавлено в корзину" if act == "add" else "Убрано"
+        view = _mk_item(uid, iid, iv(3, -1), iv(4, 0))
+    elif act in ("ci", "cd", "cx"):
+        iid = p[2]
+        lines = {ln["item"]: ln for ln in _mk_resolve(uid, c["items"])}
+        qty = int(c["items"].get(iid, 0))
+        if act == "ci":
+            st = (lines.get(iid) or {}).get("stock")
+            if st is not None and qty + 1 > st:
+                return await q.answer(f"В наличии только {st}", show_alert=True)
+            qty += 1
+        elif act == "cd":
+            qty -= 1
+        else:
+            qty = 0
+        if qty <= 0:
+            c["items"].pop(iid, None)
+        else:
+            c["items"][iid] = min(99, qty)
+        view = _mk_cart_view(uid)
+    elif act == "cart":
+        view = _mk_cart_view(uid)
+    elif act == "clr":
+        c["items"] = {}
+        note, view = "Корзина очищена", _mk_cart_view(uid)
+    elif act == "buy":
+        c["co"] = {"lines": {p[2]: 1}, "src": "buy", "comment": ""}
+        view = _mk_co_view(uid)
+    elif act == "co":
+        if not c["items"]:
+            return await q.answer("Корзина пуста", show_alert=True)
+        c["co"] = {"lines": dict(c["items"]), "src": "cart", "comment": (c.get("co") or {}).get("comment", "")}
+        view = _mk_co_view(uid)
+    elif act == "cm":
+        if q.message.chat.type != "private":
+            return await q.answer("Комментарий пишется в личке с ботом", show_alert=True)
+        context.user_data["awaiting"] = "mk_comment"
+        await q.answer()
+        return await context.bot.send_message(uid, "💬 Напиши комментарий продавцу одним сообщением: "
+                                                    "пожелания, контакты, сроки. /cancel — отмена.")
+    elif act == "ok":
+        err, view = await _mk_checkout(context.bot, q, uid)
+        if err:
+            return await q.answer(err, show_alert=True)
+        note = "✅ Заказ оформлен"
+    elif act == "my":
+        view = _mk_my(uid)
+    else:
+        view = _mk_home(uid)
+    save_config()
+    if view:
+        await _mk_show(context.bot, q, *view)
+    try:
+        await q.answer(note, show_alert=alert)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _mk_comment_input(update, context, text, msg):
+    uid = update.effective_user.id
+    context.user_data.pop("awaiting", None)
+    co = _cart(uid).get("co")
+    if not co:
+        return await msg.reply_text("Оформление устарело — открой /shop заново.")
+    co["comment"] = (text or "").strip()[:300]
+    save_config()
+    t, kb, _ = _mk_co_view(uid)
+    return await msg.reply_text(t, parse_mode="HTML", reply_markup=kb)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -8566,6 +9038,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(handle_action_press, pattern=r"^(act|arole):"))
     app.add_handler(CallbackQueryHandler(handle_buy_group_press, pattern=r"^buyg:"))
     app.add_handler(CallbackQueryHandler(handle_allstop_press, pattern=r"^allstop$"))
+    app.add_handler(CallbackQueryHandler(handle_market, pattern=r"^mk:"))
     app.add_handler(CallbackQueryHandler(handle_order_press, pattern=r"^osd:"))
     app.add_handler(CallbackQueryHandler(handle_gw_join, pattern=r"^gwj:"))
     app.add_handler(CallbackQueryHandler(on_callback))
@@ -8621,7 +9094,7 @@ def main():
         jq.run_repeating(janitor_job, interval=3600, first=600)
         jq.run_repeating(maintenance_daily_job, interval=86400, first=120)
         jq.run_repeating(weekly_digest_job, interval=3600, first=900)
-    log.info("Channel Guard v6.1 запускается…")
+    log.info("Channel Guard v6.2 запускается…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
