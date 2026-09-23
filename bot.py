@@ -1,16 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Channel Guard Bot  —  версия 6.2 («всё в одном»)
+Channel Guard Bot  —  версия 6.3 («всё в одном»)
 ================================================
 Антиспам + автоответы (текст/медиа/кнопки) + панель в ЛС + модерация + капча +
 приветствие + привлечение (промо, рассылки, посты по расписанию) + роли +
 анти-снос/анти-рейд + оплата звёздами Telegram.
 
+Что нового в v6.3:
+  • Убран тариф «Профессиональный»: больше нет платного доступа, пробного периода,
+    команд /pro и /grantpro и раздела PRO в магазине. Бот бесплатный для всех групп.
+  • Доступ к группе — просто одобрение владельцем бота (или «допуск не требуется»).
+  • Звёзды остаются только в магазине: продавец торгует своими товарами.
+
 Что нового в v6.2:
   • 🛒 Маркет прямо в боте — без ссылок и сайтов: /shop открывает витрину в чате с ботом.
     Разделы, страницы, карточки товаров с фото, «В корзину» с количеством, «Купить сейчас»,
     корзина с ➖/➕, комментарий продавцу, оплата звёздами счётом прямо в чате.
-  • В группе /shop отправляет витрину покупателю в личку (там же — тариф PRO для этой группы).
+  • В группе /shop отправляет витрину покупателю в личку.
   • Заказ из корзины может состоять из нескольких товаров; выдача по каждому (коды, рандом, текст).
   • В панели: 📝 приветствие витрины, 📂 разделы товаров, «открыть витрину как покупатель».
 
@@ -31,7 +37,7 @@ Channel Guard Bot  —  версия 6.2 («всё в одном»)
   • Панель из 6 разделов-хабов: 🛡 Защита, ⚖️ Модерация, 💬 Общение, 📮 Посты,
     📊 Статистика, ⚙️ Система. Все стоп-списки — в одном месте «🚫 Фильтры слов».
     Кнопка «Назад» возвращает в свой раздел, а не в корень. Старые настройки не менялись.
-  • 🛒 Магазин Mini App: тариф PRO для группы и свои товары за звёзды Telegram.
+  • 🛒 Магазин Mini App: свои товары за звёзды Telegram.
     Встроенный веб-сервер (aiohttp) отдаёт страницу магазина и выставляет счета.
     Настройка: WEBAPP_URL (публичный https-адрес), SHOP_PORT, SHOP_APP_NAME.
 
@@ -346,11 +352,6 @@ DEFAULT_CONFIG = {
     "approved_chats": [],
     # Подписчики ЛС по группам (кто прошёл капчу-заявку): {chat_id: [user_ids]}
     "dm_subscribers": {},
-    # Подписки на тариф «Профессиональный»: {chat_id: ts окончания}
-    "subscriptions": {},
-    # Пробный период: дней по умолчанию и выданные триалы {chat_id: ts окончания}
-    "trial_days": 3,
-    "trials": {},
     # Статистика: {chat_id: {users, names, days, total, mod}} — единое хранилище
     # (users/names — и роспись активности, и список участников для /all; mod — счётчики модерации)
     "msg_stats": {},
@@ -367,7 +368,7 @@ DEFAULT_CONFIG = {
     # Если для чата записи нет — используются глобальные настройки выше (как шаблон).
     "chats": {},
     # Служебное состояние, переживающее перезапуск (метки рассылок, ожидания капчи, мягкие муты)
-    # Магазин Mini App: свои товары (тариф PRO для группы добавляется автоматически)
+    # Магазин: свои товары продавца
     # items: [{"id","title","desc","stars","deliver","enabled"}]
     "shop": {"enabled": False, "title": "Магазин", "items": [], "notify": [], "seq": 0},
     # Розыгрыши в группах: {id: {chat, mid, prize, winners, ends, parts, names, status, won}}
@@ -1039,13 +1040,10 @@ async def can_edit_target(context, user_id: int, target) -> bool:
 
 
 def chat_allowed(chat_id: int) -> bool:
-    """True, если бот допущен работать в этом чате: одобрение (бесплатно),
-    оплата звёздами или активный пробный период."""
+    """True, если бот допущен работать в этом чате (одобрение владельцем бота)."""
     if not CONFIG.get("require_approval", True):
         return True
-    if chat_id in CONFIG.get("approved_chats", []):
-        return True
-    return is_pro(chat_id) or trial_active(chat_id)
+    return chat_id in CONFIG.get("approved_chats", [])
 
 
 def chat_cfg(chat_id) -> dict:
@@ -1636,7 +1634,7 @@ def track_nuke(chat_id, actor_id):
 
 async def _gate_unapproved(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Регистрируется в group=-1: в группах без допуска глушит все остальные
-    хендлеры. Пропускает владельца/менеджеров бота, /diag /pro /start,
+    хендлеры. Пропускает владельца/менеджеров бота, /diag /start /shop,
     сообщения об оплате и миграции."""
     chat = update.effective_chat
     if chat is None or getattr(chat, "type", None) not in ("group", "supergroup"):
@@ -1654,7 +1652,7 @@ async def _gate_unapproved(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if msg.migrate_to_chat_id or msg.migrate_from_chat_id:
             return
         txt = msg.text or ""
-        if txt.startswith(("/diag", "/pro", "/start", "/shop")):
+        if txt.startswith(("/diag", "/start", "/shop")):
             return
     raise ApplicationHandlerStop
 
@@ -1664,7 +1662,7 @@ def _migrate_chat(old_id: int, new_id: int) -> None:
     o, n = str(old_id), str(new_id)
     if o == n:
         return
-    for key in ("groups", "invite_links", "chats", "subscriptions", "trials",
+    for key in ("groups", "invite_links", "chats",
                 "msg_stats", "warns", "warns_ts", "all_optout", "dm_subscribers"):
         d = CONFIG.get(key)
         if isinstance(d, dict) and o in d:
@@ -2922,14 +2920,13 @@ async def on_my_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]])
         await alert_owners(context,
                            f"➕ Бота добавили в «{chat.title}» (id {chat.id}), добавил: {who}.\n"
-                           f"Группа пока без допуска — бот молчит. Одобрить или пусть оформляют тариф (/pro)?",
+                           f"Группа пока без допуска — бот там молчит. Одобрить?",
                            reply_markup=kb)
         try:
             await context.bot.send_message(
                 chat.id,
-                "👋 Привет! Я включусь в этой группе после одобрения владельцем бота "
-                "или оформления тарифа — команда /pro. Выдайте мне права администратора "
-                "(удаление сообщений, бан, приглашения).")
+                "👋 Привет! Я включусь в этой группе после одобрения владельцем бота. "
+                "Выдайте мне права администратора (удаление сообщений, бан, приглашения).")
         except Exception:  # noqa: BLE001
             pass
     elif new in ("left", "kicked"):
@@ -4131,113 +4128,12 @@ async def _send_scheduled_post(context, post):
 #  ТАРИФ «ПРОФЕССИОНАЛЬНЫЙ» (оплата звёздами) И ПРОБНЫЙ ПЕРИОД
 # ───────────────────────────────────────────────────────────────────────────
 
-PRO_PLANS = {
-    "1m": {"stars": 225, "days": 30, "title": "1 месяц"},
-    "3m": {"stars": 651, "days": 90, "title": "3 месяца (-3%)"},
-    "6m": {"stars": 1254, "days": 180, "title": "6 месяцев (-7%)"},
-    "1y": {"stars": 2304, "days": 365, "title": "1 год (-15%)"},
-}
-
-
-def pro_until(chat_id) -> float:
-    return float(CONFIG.get("subscriptions", {}).get(str(chat_id), 0) or 0)
-
-
-def is_pro(chat_id) -> bool:
-    return pro_until(chat_id) > time.time()
-
-
-def extend_pro(chat_id, days: int):
-    base = max(time.time(), pro_until(chat_id))
-    CONFIG.setdefault("subscriptions", {})[str(chat_id)] = base + days * 86400
-    _expiry_clear(chat_id)
-    save_config(force=True)
-
-
-def trial_until(chat_id) -> float:
-    return float(CONFIG.get("trials", {}).get(str(chat_id), 0) or 0)
-
-
-def trial_active(chat_id) -> bool:
-    return trial_until(chat_id) > time.time()
-
-
-def grant_trial(chat_id, days=None):
-    days = days or CONFIG.get("trial_days", 3)
-    CONFIG.setdefault("trials", {})[str(chat_id)] = time.time() + days * 86400
-    _expiry_clear(chat_id)
-    save_config(force=True)
-
-
 def access_status(chat_id) -> str:
-    if chat_id in CONFIG.get("approved_chats", []):
-        return "✅ одобрено владельцем (бессрочно)"
-    if is_pro(chat_id):
-        return "⭐ тариф до " + datetime.fromtimestamp(pro_until(chat_id)).strftime("%d.%m.%Y")
-    if trial_active(chat_id):
-        return "🎁 пробный до " + datetime.fromtimestamp(trial_until(chat_id)).strftime("%d.%m.%Y %H:%M")
     if not CONFIG.get("require_approval", True):
         return "✅ допуск не требуется"
-    return "⛔ нет допуска (нужно одобрение или тариф /pro)"
-
-
-def tariff_text(chat_id) -> str:
-    return (
-        "⭐ Тариф «Профессиональный»\n\n"
-        f"Статус этой группы: {access_status(chat_id)}\n\n"
-        "Полный функционал бота: антиспам, капча, автоответы, посты, статистика.\n"
-        "Оплата звёздами Telegram прямо здесь — выбери срок:"
-    )
-
-
-def tariff_kb(chat_id) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(f"⭐ {p['stars']} — {p['title']}",
-                                  callback_data=f"buyg:{chat_id}:{key}")]
-            for key, p in PRO_PLANS.items()]
-    return InlineKeyboardMarkup(rows)
-
-
-async def cmd_pro(update: Update, context):
-    chat = update.effective_chat
-    if chat.type in ("group", "supergroup"):
-        remember_group(chat)
-        return await update.effective_message.reply_text(
-            tariff_text(chat.id), reply_markup=tariff_kb(chat.id))
-    lines = ["⭐ Тариф «Профессиональный» — оплата в самой группе командой /pro.", ""]
-    for key, p in PRO_PLANS.items():
-        lines.append(f"• {p['title']} — {p['stars']} ⭐")
-    lines.append("\nДобавь бота в группу, дай права админа и вызови там /pro.")
-    await update.effective_message.reply_text("\n".join(lines))
-
-
-async def handle_buy_group_press(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = update.effective_user
-    try:
-        _, cid, plan = (query.data or "").split(":", 2)
-        cid = int(cid)
-    except ValueError:
-        return await query.answer()
-    p = PRO_PLANS.get(plan)
-    if not p:
-        return await query.answer("Неизвестный тариф", show_alert=True)
-    if not (is_manager(user.id) or is_group_manager(cid, user.id)
-            or user.id in await group_admin_ids(context, cid)):
-        return await query.answer("Тариф оформляют администраторы группы", show_alert=True)
-    title = CONFIG.get("groups", {}).get(str(cid), "группа")
-    try:
-        await context.bot.send_invoice(
-            chat_id=cid,
-            title=f"Тариф PRO · {p['title']}",
-            description=f"Полный доступ бота в «{title}» на {p['days']} дней.",
-            payload=f"pro:{cid}:{plan}",
-            provider_token="",  # Telegram Stars
-            currency="XTR",
-            prices=[LabeledPrice(label=p["title"], amount=p["stars"])],
-        )
-        await query.answer("Счёт отправлен — оплати звёздами ⭐")
-    except Exception as e:  # noqa: BLE001
-        await query.answer(f"Оплата сейчас недоступна: {e}"[:190], show_alert=True)
+    if chat_id in CONFIG.get("approved_chats", []):
+        return "✅ группа одобрена владельцем бота"
+    return "⛔ нет допуска — нужно одобрение владельца бота"
 
 
 async def on_pre_checkout(update: Update, context):
@@ -4265,40 +4161,8 @@ async def on_successful_payment(update: Update, context):
         return await _shop_paid_order(update, context, sp, parts[1])
     if len(parts) == 4 and parts[0] == "shop":
         return await _shop_paid(update, context, sp, parts)
-    if len(parts) == 3 and parts[0] == "pro":
-        cid, plan = int(parts[1]), parts[2]
-        p = PRO_PLANS.get(plan, {"days": 30, "stars": sp.total_amount})
-        extend_pro(cid, p["days"])
-        until = datetime.fromtimestamp(pro_until(cid)).strftime("%d.%m.%Y")
-        try:
-            await context.bot.send_message(
-                cid, f"⭐ Оплата получена! Тариф активен до {until}. Спасибо! Панель управления — в ЛС бота: /panel")
-        except Exception:  # noqa: BLE001
-            pass
-        title = CONFIG.get("groups", {}).get(str(cid), str(cid))
-        payer = mention(update.effective_user) if update.effective_user else "?"
-        await alert_owners(context, f"💰 Оплата {sp.total_amount} ⭐ за «{title}» ({plan}) от {payer}. До {until}.")
+    log.info("Оплата с неизвестным payload: %s", payload)
 
-
-async def cmd_grantpro(update: Update, context):
-    if not is_owner(update.effective_user.id):
-        return await _deny(update)
-    args = context.args or []
-    chat = update.effective_chat
-    cid = chat.id if chat.type in ("group", "supergroup") else None
-    days = 30
-    for a in args:
-        if re.fullmatch(r"-?\d{6,}", a):
-            cid = int(a)
-        elif a.isdigit():
-            days = int(a)
-    if cid is None:
-        return await update.effective_message.reply_text(
-            "Формат: /grantpro <chat_id> <дней>  (в группе chat_id можно не указывать)")
-    extend_pro(cid, days)
-    until = datetime.fromtimestamp(pro_until(cid)).strftime("%d.%m.%Y")
-    await update.effective_message.reply_text(
-        f"⭐ Выдал PRO чату {CONFIG.get('groups', {}).get(str(cid), cid)} на {days} дн (до {until}).")
 
 # ───────────────────────────────────────────────────────────────────────────
 #  ФОНОВЫЕ ЗАДАЧИ: единый минутный тик + уборщик + сводки
@@ -4452,22 +4316,6 @@ async def weekly_digest_job(context):
                                f"банов {s.get('banned', 0)}, киков {s.get('kicked', 0)}")
         except Exception as e:  # noqa: BLE001
             log.debug("digest %s: %s", cid, e)
-
-
-async def maintenance_daily_job(context):
-    """Раз в сутки: напоминание об окончании тарифа/триала."""
-    for cid in list(CONFIG.get("groups", {}).keys()):
-        had_paid = str(cid) in CONFIG.get("subscriptions", {}) or str(cid) in CONFIG.get("trials", {})
-        if not had_paid or chat_allowed(int(cid)) or str(cid) in _rt().get("expiry_notified", []):
-            continue
-        _expiry_mark(cid)
-        title = CONFIG["groups"].get(str(cid), cid)
-        try:
-            await context.bot.send_message(int(cid),
-                                           "⛔ Доступ бота в этой группе закончился. Продлить — /pro.")
-        except Exception:  # noqa: BLE001
-            pass
-        await alert_owners(context, f"⌛ У «{title}» закончился доступ (тариф/триал).")
 
 
 async def flush_config_job(context):
@@ -5186,14 +5034,11 @@ def access_kb(tgt, is_mgr: bool) -> InlineKeyboardMarkup:
 
 
 def access_menu_text(tgt, label) -> str:
-    lines = [f"⭐ Доступ и тариф · {label}", ""]
+    lines = [f"✅ Доступ бота · {label}", ""]
     if tgt and tgt != "defaults":
         lines.append(f"Статус: {access_status(int(tgt))}")
-    lines += ["",
-              "Тариф оформляется в самой группе командой /pro (оплата звёздами Telegram):"]
-    for key, p in PRO_PLANS.items():
-        lines.append(f"• {p['title']} — {p['stars']} ⭐")
-    lines.append("\nВладелец бота может одобрять группы бесплатно (раздел «Одобрение групп»).")
+    lines += ["", "Бот бесплатный. В группе он работает после одобрения владельцем бота "
+                  "(раздел «Одобрение групп») либо если требование допуска выключено совсем."]
     return "\n".join(lines)
 
 
@@ -5215,8 +5060,7 @@ def approve_menu_text() -> str:
     ok = sum(1 for cid in CONFIG.get("groups", {}) if chat_allowed(int(cid)))
     return ("✅ Одобрение групп\n\n"
             f"Известно групп: {total} · с допуском: {ok}\n\n"
-            "«✅» — бесплатный бессрочный допуск, «🚫» — оставить без допуска "
-            "(пусть оформляют тариф /pro или пробный период).")
+            "«✅» — включить бота в группе, «🚫» — оставить без допуска.")
 
 
 def promo_kb() -> InlineKeyboardMarkup:
@@ -5462,7 +5306,7 @@ def hub_stats(cfg, label, mgr, tgt):
 
 
 def hub_sys(cfg, label, mgr):
-    items = [("⭐ Доступ и тариф", "m:access"), ("⚙️ Прочее", "m:other")]
+    items = [("✅ Доступ бота", "m:access"), ("⚙️ Прочее", "m:other")]
     if mgr:
         items += [("🗄 Бэкапы", "m:backup"), ("✅ Одобрение групп", "m:approve"),
                   ("🛒 Магазин", "m:shop")]
@@ -5579,7 +5423,7 @@ add_help_text = (
 
 def about_text() -> str:
     return (
-        "🤖 Channel Guard Bot v6.2 — защита и оживление групп.\n\n"
+        "🤖 Channel Guard Bot v6.3 — защита и оживление групп.\n\n"
         "Антиспам: стоп-слова (2 списка + глобальный), исключения, ссылки и скрытые ссылки, "
         "спам-домены, антифлуд, медиа-фильтр, проверка имён, чёрные списки, ночной режим, "
         "анти-рейд, анти-снос, капча (в чате и через заявку в ЛС).\n"
@@ -5589,8 +5433,7 @@ def about_text() -> str:
         "(умные ответы на обращения, шутки, эмодзи-реакции), мат-фильтр из коробки "
         "(пред ×3 → бан), /all, зазывала, "
         "авто-промо, посты по расписанию, рассылки в группы и в ЛС подписчикам.\n"
-        "Оплата: тариф «Профессиональный» звёздами Telegram (/pro), пробный период, "
-        "бесплатное одобрение владельцем.\n\n"
+        "🛒 Магазин прямо в боте: витрина, корзина, оплата звёздами (/shop), заказы продавцу.\n\n"
         "Настройка — в ЛС: /panel. Помощь: /help."
     )
 
@@ -5599,7 +5442,7 @@ HELP_TEXT = (
     "📖 Команды бота\n\n"
     "В личке:\n"
     "/panel — панель управления (выбор группы и все настройки)\n"
-    "/status — сводка по выбранной группе · /pro — тариф\n"
+    "/status — сводка по выбранной группе\n"
     "/userid — узнать свой ID · /cancel — отменить ввод · /skip — пропустить шаг\n"
     + add_help_text + "\n\n"
     "В группе (модерация — по правам):\n"
@@ -5610,7 +5453,7 @@ HELP_TEXT = (
     "/rules /setrules — правила · /report — жалоба модераторам · /me — обо мне\n"
     "/stats /top — статистика и топ · /invite — ссылка · /zazyvala — зазывала\n"
     "/all /stopall — призыв участников · /reg /anreg — подписка на призыв\n"
-    "/block /unblock — чёрный список группы · /diag — диагностика · /pro — тариф\n"
+    "/block /unblock — чёрный список группы · /diag — диагностика\n"
     "/gmanager /ungmanager /gmanagers — менеджеры группы (назначает создатель)\n"
     "/appeal текст — апелляция владельцам бота\n"
     "/shop — магазин прямо в боте: витрина, корзина, оплата звёздами · /orders — мои заказы\n"
@@ -6400,10 +6243,6 @@ async def cmd_start(update: Update, context):
                                 "👋 Я на месте. Настройки — в ЛС: открой меня и набери /panel.")
     context.user_data.pop("awaiting", None)
     if context.args and context.args[0].startswith("shop"):
-        cid = context.args[0][4:]
-        if cid.lstrip("-").isdigit():
-            _cart(user.id)["chat"] = cid
-            save_config()
         return await _mk_send_home(context.bot, chat.id, user.id)
     text = ("👋 Привет! Я — Channel Guard: антиспам, модерация, капча, автоответы, болталка, "
             "посты и рассылки для твоих групп.\n\n"
@@ -7271,12 +7110,6 @@ def _shop_catalog(chat: str) -> list:
     if not s.get("enabled"):
         return []
     items = []
-    if chat and str(chat) in CONFIG.get("groups", {}):
-        title = CONFIG["groups"][str(chat)]
-        for key, p in PRO_PLANS.items():
-            items.append({"id": f"pro_{key}", "title": f"⭐ PRO · {p['title']}"[:32],
-                          "desc": f"Полный доступ бота в «{title}» на {p['days']} дней",
-                          "stars": int(p["stars"]), "photo": "", "stock": None})
     for it in s.get("items") or []:
         if isinstance(it, dict) and it.get("enabled", True) and it.get("id"):
             items.append({
@@ -7419,8 +7252,6 @@ async def cmd_shop(update: Update, context):
     if not (CONFIG.get("shop") or {}).get("enabled") and not is_manager(user.id):
         return await reply_tidy(update, context, "🛒 Магазин пока закрыт.")
     if chat.type in ("group", "supergroup"):
-        _cart(user.id)["chat"] = str(chat.id)
-        save_config()
         try:
             await _mk_send_home(context.bot, user.id, user.id)
             return await reply_tidy(update, context, f"📬 {mention(user)}, открыл магазин тебе в личке.",
@@ -7447,20 +7278,6 @@ async def _shop_paid(update, context, sp, parts):
     save_config(force=True)
     msg = update.effective_message
     buyer = mention(update.effective_user) if update.effective_user else uid
-    if item_id.startswith("pro_") and chat.lstrip("-").isdigit() and chat != "0":
-        p = PRO_PLANS.get(item_id[4:])
-        if p:
-            cid = int(chat)
-            extend_pro(cid, p["days"])
-            until = datetime.fromtimestamp(pro_until(cid)).strftime("%d.%m.%Y")
-            title = CONFIG.get("groups", {}).get(chat, chat)
-            try:
-                await context.bot.send_message(cid, f"⭐ Тариф PRO активен до {until}. Спасибо, {buyer}!")
-            except Exception:  # noqa: BLE001
-                pass
-            await msg.reply_text(f"✅ Оплата получена! PRO для «{title}» активен до {until}.")
-            return await alert_owners(context, f"💰 Магазин: PRO {p['title']} для «{title}» — "
-                                               f"{sp.total_amount} ⭐ от {buyer}.")
     it = next((i for i in (CONFIG.get("shop") or {}).get("items", []) if i.get("id") == item_id), {})
     deliver_text = it.get("deliver") or "С тобой скоро свяжутся. Спасибо!"
     await msg.reply_text(f"✅ Оплата получена: {it.get('title', item_id)}\n\n{deliver_text}")
@@ -7677,21 +7494,6 @@ async def _shop_paid_order(update, context, sp, oid):
         iid = str(ln.get("item"))
         qty = max(1, int(ln.get("qty", 1) or 1))
         t = ln.get("title") or iid
-        if iid.startswith("pro_"):
-            chat = str(o.get("chat") or "0")
-            if chat in ("0", ""):
-                manual.append(t)
-                continue
-            p = PRO_PLANS.get(iid[4:]) or {"days": 30}
-            cid = int(chat)
-            extend_pro(cid, int(p["days"]) * qty)
-            until = datetime.fromtimestamp(pro_until(cid)).strftime("%d.%m.%Y")
-            got.append(f"{t}: PRO для «{CONFIG.get('groups', {}).get(chat, chat)}» до {until}")
-            try:
-                await context.bot.send_message(cid, f"⭐ Тариф PRO активен до {until}. Спасибо!")
-            except Exception:  # noqa: BLE001
-                pass
-            continue
         it = _item_by_id(iid) or {}
         for _ in range(qty):
             d, emp = _deliver_one(it) if it else (None, False)
@@ -8214,7 +8016,6 @@ async def _shop_text(update, context, awaiting, text, msg):
 # ───────────────────────────────────────────────────────────────────────────
 
 _MK_PAGE = 8
-_PRO_CAT = "⭐ Тариф PRO для группы"
 
 
 def _cart(uid) -> dict:
@@ -8225,17 +8026,8 @@ def _cart(uid) -> dict:
 
 
 def _mk_items(uid) -> list:
-    """Всё, что видит этот покупатель: тариф PRO (если пришёл из группы) + товары."""
-    c = (CONFIG.get("carts") or {}).get(str(uid)) or {}
-    chat = str(c.get("chat") or "")
+    """Товары витрины, которые видит покупатель."""
     out = []
-    if chat and chat in CONFIG.get("groups", {}):
-        gt = CONFIG["groups"][chat]
-        for key, p in PRO_PLANS.items():
-            out.append({"id": f"pro_{key}", "title": f"PRO · {p['title']}",
-                        "desc": f"Полный доступ бота в «{gt}» на {p['days']} дней: антиспам, капча, "
-                                f"автоответы, посты, статистика.",
-                        "stars": int(p["stars"]), "photo": "", "cat": _PRO_CAT, "stock": None})
     for it in _shop_items():
         if isinstance(it, dict) and it.get("id") and it.get("enabled", True):
             out.append({"id": it["id"], "title": str(it.get("title", "")), "desc": str(it.get("desc", "")),
@@ -8890,7 +8682,6 @@ async def _post_init(app: Application):
             BotCommand("status", "сводка по группе"),
             BotCommand("add", "автоответ: ключ - ответ"),
             BotCommand("list", "список автоответов"),
-            BotCommand("pro", "тариф и оплата"),
             BotCommand("shop", "магазин"),
             BotCommand("orders", "мои заказы"),
             BotCommand("random", "рандом: число, выбор"),
@@ -8907,7 +8698,6 @@ async def _post_init(app: Application):
             BotCommand("reg", "участвовать в призывах"),
             BotCommand("anreg", "не упоминать меня в /all"),
             BotCommand("top", "топ актива"),
-            BotCommand("pro", "тариф для группы"),
             BotCommand("shop", "магазин"),
             BotCommand("orders", "мои заказы"),
             BotCommand("random", "рандом: число, выбор"),
@@ -9023,7 +8813,7 @@ def build_app() -> Application:
         ("block", cmd_block), ("unblock", cmd_unblock),
         ("gblock", cmd_gblock), ("gunblock", cmd_gunblock),
         ("say", cmd_say), ("diag", cmd_diag), ("reload", cmd_reload),
-        ("pro", cmd_pro), ("grantpro", cmd_grantpro), ("broadcast", cmd_broadcast),
+        ("broadcast", cmd_broadcast),
         ("grant", cmd_grant), ("revoke", cmd_revoke), ("managers", cmd_managers),
         ("gmanager", cmd_gmanager), ("shop", cmd_shop),
         ("random", cmd_random), ("rand", cmd_random), ("giveaway", cmd_random),
@@ -9036,7 +8826,6 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(handle_join_request_press, pattern=r"^jrok:"))
     app.add_handler(CallbackQueryHandler(handle_setstaff_press, pattern=r"^ss:"))
     app.add_handler(CallbackQueryHandler(handle_action_press, pattern=r"^(act|arole):"))
-    app.add_handler(CallbackQueryHandler(handle_buy_group_press, pattern=r"^buyg:"))
     app.add_handler(CallbackQueryHandler(handle_allstop_press, pattern=r"^allstop$"))
     app.add_handler(CallbackQueryHandler(handle_market, pattern=r"^mk:"))
     app.add_handler(CallbackQueryHandler(handle_order_press, pattern=r"^osd:"))
@@ -9092,9 +8881,8 @@ def main():
         jq.run_repeating(minute_tick, interval=60, first=15)
         jq.run_repeating(flush_config_job, interval=90, first=30)
         jq.run_repeating(janitor_job, interval=3600, first=600)
-        jq.run_repeating(maintenance_daily_job, interval=86400, first=120)
         jq.run_repeating(weekly_digest_job, interval=3600, first=900)
-    log.info("Channel Guard v6.2 запускается…")
+    log.info("Channel Guard v6.3 запускается…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
