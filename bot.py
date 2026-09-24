@@ -1,10 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Channel Guard Bot  —  версия 7.2 («всё в одном»)
+Channel Guard Bot  —  версия 7.3 («всё в одном»)
 ================================================
 Антиспам + автоответы (текст/медиа/кнопки) + панель в ЛС + модерация + капча +
 приветствие + привлечение (промо, рассылки, посты по расписанию) + роли +
 анти-снос/анти-рейд + магазин с оплатой по реквизитам + розыгрыши.
+
+Что нового в v7.3 (конфиденциальность):
+  • 🔐 Шифрование данных на диске: задай DATA_KEY (+ pip install cryptography) — config.json
+    превращается в config.json.enc, старый открытый файл затирается. Бэкапы тоже шифруются.
+    Файл данных создаётся с правами 600 (читает только владелец процесса).
+  • 🙈 Приватные карточки: в общем чате менеджеров не видно контактов, комментария, чека
+    и выданных кодов — только «🔐 Подробнее» присылает всё нажавшему в личку.
+  • 🚫 Карточки заказов и чеки менеджерам нельзя переслать или сохранить (protect_content);
+    по желанию — запрет пересылки и выданного товара покупателю.
+  • 🗄 Полный бэкап — только главному владельцу. 📜 Журнал действий с данными; выгрузки,
+    бэкапы, новые менеджеры и новые получатели заказов — сразу владельцу в личку.
+  • 🗑 Хранение: личные данные закрытых заказов обезличиваются через N дней (по умолчанию 180).
+    /mydata — покупатель видит, что о нём хранится, и может удалить свои данные.
+  • Повреждённый config.json больше не затирается — сохраняется копия .broken.
 
 Что нового в v7.2 (заказы):
   • 🔒 Бронь: при оформлении коды и остаток сразу откладываются за покупателем;
@@ -127,7 +141,8 @@ Channel Guard Bot  —  версия 7.2 («всё в одном»)
     предупреждение, три предупреждения → бан (настраивается в панели).
 
 Запуск: переменная окружения BOT_TOKEN. Главный владелец: ADMIN_IDS.
-Зависимости: pip install "python-telegram-bot[job-queue,rate-limiter]"
+Зависимости: pip install "python-telegram-bot[job-queue,rate-limiter]" cryptography
+(cryptography нужна для шифрования данных с DATA_KEY; без неё бот работает, но без шифрования)
 """
 
 import os
@@ -145,6 +160,13 @@ import logging
 import functools
 
 import httpx  # идёт в комплекте с python-telegram-bot
+import base64
+import hashlib
+
+try:  # шифрование данных на диске (необязательно: pip install cryptography)
+    from cryptography.fernet import Fernet
+except ImportError:  # noqa: SIM105
+    Fernet = None
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
@@ -186,6 +208,18 @@ ADMIN_IDS = {
 
 DATA_DIR = os.environ.get("DATA_DIR") or ("/data" if os.path.isdir("/data") else ".")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+ENC_PATH = CONFIG_PATH + ".enc"
+
+# ── Шифрование данных: задай DATA_KEY (любая длинная фраза) и установи cryptography.
+#    Потеряешь ключ — данные не восстановить. Храни его отдельно от сервера.
+DATA_KEY = os.environ.get("DATA_KEY", "").strip()
+
+
+def _cipher():
+    """Fernet-шифратор из DATA_KEY или None, если шифрование не настроено."""
+    if not DATA_KEY or Fernet is None:
+        return None
+    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(DATA_KEY.encode("utf-8")).digest()))
 
 # ── Необязательный ИИ для болталки (любой OpenAI-совместимый API) ──
 # Задай переменные окружения — и в панели болталки появится рабочий тумблер «🤖 ИИ-ответы»:
@@ -399,7 +433,10 @@ DEFAULT_CONFIG = {
     # Магазин: оплата по реквизитам (pay_methods) или при получении (cod), чек проверяет менеджер
     "shop": {"enabled": False, "title": "Магазин", "items": [], "notify": [], "seq": 0, "about": "",
              "currency": "сум", "pay_methods": [], "cod": False, "promos": {}, "expire_h": 24,
-             "max_unpaid": 2, "daily": True, "daily_h": 21, "blacklist": []},
+             "max_unpaid": 2, "daily": True, "daily_h": 21, "blacklist": [],
+             "private": True, "protect_goods": False, "retention_days": 180},
+    # Журнал действий с данными (выгрузки, бэкапы, доступы) — последние 300 записей
+    "audit": [],
     # Розыгрыши в группах: {id: {chat, mid, prize, winners, ends, parts, names, status, won}}
     "giveaways": {},
     # Корзины покупателей маркета: {user_id: {"items": {item_id: qty}, "chat": "", "co": {...}, "ts": ...}}
@@ -625,11 +662,45 @@ def _migrate_v6(cfg: dict) -> None:
             up(c)
 
 
-def load_config() -> dict:
+def _read_raw_config():
+    """Прочитать сырые данные: зашифрованный файл (если есть ключ) или обычный JSON.
+    Никогда не затираем данные при ошибке: неверный ключ — остановка, битый файл — копия .broken."""
+    c = _cipher()
+    if DATA_KEY and c is None:
+        log.error("DATA_KEY задан, но нет библиотеки cryptography (pip install cryptography) — "
+                  "данные пока НЕ шифруются.")
+    if os.path.exists(ENC_PATH):
+        if c is None:
+            raise SystemExit("Найден зашифрованный config.json.enc, но DATA_KEY не задан или нет cryptography. "
+                             "Бот остановлен, чтобы не потерять данные.")
+        try:
+            with open(ENC_PATH, "rb") as f:
+                return json.loads(c.decrypt(f.read()).decode("utf-8"))
+        except Exception as e:  # noqa: BLE001
+            raise SystemExit(f"Не удалось расшифровать {ENC_PATH} (неверный DATA_KEY?): {e}. "
+                             "Бот остановлен, чтобы не затереть данные.")
     if os.path.exists(CONFIG_PATH):
         try:
+            os.chmod(CONFIG_PATH, 0o600)
+        except OSError:
+            pass
+        try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                raw = json.load(f)
+                return json.load(f)
+        except Exception as e:  # noqa: BLE001
+            bad = CONFIG_PATH + f".broken-{int(time.time())}"
+            try:
+                os.replace(CONFIG_PATH, bad)
+            except OSError:
+                pass
+            log.error("config.json повреждён (%s) — копия сохранена в %s, старт с настроек по умолчанию", e, bad)
+    return None
+
+
+def load_config() -> dict:
+    raw = _read_raw_config()
+    if raw is not None:
+        try:
             cfg = _merge_defaults(raw)
             # Миграция при обновлении со старой версии: уже известные группы
             # автоматически считаем разрешёнными, чтобы бот в них не замолчал.
@@ -664,6 +735,19 @@ def save_config(force: bool = False) -> None:
         _flush_config()
 
 
+def _wipe(path: str) -> None:
+    """Затереть файл нулями и удалить (для старого открытого config.json после шифрования)."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "r+b") as f:
+            f.write(b"\0" * size)
+            f.flush()
+            os.fsync(f.fileno())
+        os.remove(path)
+    except OSError as e:
+        log.warning("Не удалось затереть %s: %s", path, e)
+
+
 def _flush_config() -> None:
     global _cfg_dirty
     if not _cfg_dirty:
@@ -671,15 +755,30 @@ def _flush_config() -> None:
     _cfg_dirty = False
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
-        tmp = CONFIG_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(CONFIG, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, CONFIG_PATH)
+        data = json.dumps(CONFIG, ensure_ascii=False, indent=2).encode("utf-8")
+        c = _cipher()
+        path = ENC_PATH if c else CONFIG_PATH
+        if c:
+            data = c.encrypt(data)
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # права 600 сразу
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        if c and os.path.exists(CONFIG_PATH):
+            _wipe(CONFIG_PATH)
     except Exception as e:  # noqa: BLE001
         log.warning("Не сохранить настройки: %s", e)
 
 
 CONFIG = load_config()
+if _cipher() and os.path.exists(CONFIG_PATH):
+    save_config(force=True)   # старый открытый файл → зашифрованный, открытый затираем
+    log.info("Данные зашифрованы: %s", ENC_PATH)
 
 # ───────────────────────────────────────────────────────────────────────────
 #  ПАМЯТЬ (оперативная; периодически чистится janitor_job)
@@ -4354,10 +4453,18 @@ def _slug(s: str) -> str:
 async def send_backup(context, to_id: int):
     _flush_config()
     data = json.dumps(CONFIG, ensure_ascii=False, indent=2).encode("utf-8")
+    c = _cipher()
+    name = f"config_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
+    if c:
+        data, name = c.encrypt(data), name + ".enc"
     bio = io.BytesIO(data)
-    bio.name = f"config_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
-    await context.bot.send_document(to_id, bio,
-                                    caption="🗄 Полный бэкап настроек. Восстановить: пришли этот файл мне в ЛС.")
+    bio.name = name
+    await context.bot.send_document(
+        to_id, bio,
+        caption="🗄 Полный бэкап. ⚠️ Внутри личные данные покупателей — не пересылай и храни в надёжном месте."
+                + (" Файл зашифрован твоим DATA_KEY." if c else
+                   " Совет: задай DATA_KEY на сервере — бэкапы станут зашифрованными.")
+                + " Восстановить: пришли файл мне в ЛС.")
 
 
 def extract_chat_settings(chat_id) -> dict:
@@ -5317,7 +5424,7 @@ def hub_sys(cfg, label, mgr):
     items = [("✅ Доступ бота", "m:access"), ("⚙️ Прочее", "m:other")]
     if mgr:
         items += [("🗄 Бэкапы", "m:backup"), ("✅ Одобрение групп", "m:approve"),
-                  ("🛒 Магазин", "m:shop")]
+                  ("🛒 Магазин", "m:shop"), ("🛡 Безопасность", "m:sec")]
     text = (f"⚙️ Система · {label}\n\n"
             "Доступ бота, ID новичков, «зазывала», сброс настроек"
             + (", бэкапы, одобрение групп и магазин." if mgr else "."))
@@ -5456,7 +5563,7 @@ add_help_text = (
 
 def about_text() -> str:
     return (
-        "🤖 Channel Guard Bot v7.2 — защита и оживление групп.\n\n"
+        "🤖 Channel Guard Bot v7.3 — защита и оживление групп.\n\n"
         "Антиспам: стоп-слова (2 списка + глобальный), исключения, ссылки и скрытые ссылки, "
         "спам-домены, антифлуд, медиа-фильтр, проверка имён, чёрные списки, ночной режим, "
         "анти-рейд, анти-снос, капча (в чате и через заявку в ЛС).\n"
@@ -5493,7 +5600,8 @@ HELP_TEXT = (
     "/shop — магазин прямо в боте: витрина, корзина, оплата по реквизитам · /orders — мои заказы\n"
     "/random — рандом: /random 100 · /random 5 50 · /random а, б, в\n"
     "/random Приз | победителей | 1д — розыгрыш в группе · /gwend · /reroll\n"
-    "/shopchat — в группе менеджеров: присылать сюда заказы магазина"
+    "/shopchat — в группе менеджеров: присылать сюда заказы магазина\n"
+    "/mydata — какие мои данные хранит бот и как их удалить"
 )
 
 GROUPADMIN_HELP = (
@@ -5581,6 +5689,7 @@ async def _render_menu(query, context, view: str):
         "m:shop_rules": shop_rules_view(),
         "m:shop_quick": shop_quick_view(),
         "m:shop_bl": shop_bl_view(),
+        "m:sec": sec_view(),
         "m:gw": gw_view(tgt, label),
     }
     hubs = {"m:h_protect": hub_protect, "m:h_words": hub_words, "m:h_mod": hub_mod,
@@ -5648,6 +5757,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:  # noqa: BLE001
             await _render_menu(query, context, "m:approve")
         return await query.answer("Готово")
+
+    # ── безопасность — только главный владелец ──
+    if (data == "m:sec" or data.startswith("sec:")) and not is_owner(user.id):
+        return await query.answer("Только для главного владельца бота", show_alert=True)
+    if data.startswith("sec:"):
+        return await _sec_callback(query, context, data)
 
     # ── выбор группы ──
     if data == "m:pick":
@@ -6172,12 +6287,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── бэкапы ──
     if data == "bk:full":
+        if not is_owner(user.id):
+            return await query.answer("Полный бэкап содержит личные данные покупателей — его может скачать "
+                                      "только главный владелец", show_alert=True)
         await send_backup(context, user.id)
+        await _audit(context, user, "скачал полный бэкап", "", alert=True)
         return await query.answer("🗄 Отправил файл")
     if data == "bk:chat":
         if not tgt or tgt == "defaults":
             return await query.answer("Сначала выбери группу", show_alert=True)
         await send_chat_backup(context, user.id, tgt)
+        await _audit(context, user, "скачал бэкап настроек группы", str(tgt))
         return await query.answer("📂 Отправил файл")
 
     await query.answer()
@@ -6428,6 +6548,7 @@ async def cmd_grant(update: Update, context):
     if uid not in CONFIG.setdefault("managers", []):
         CONFIG["managers"].append(uid)
         save_config(force=True)
+    await _audit(context, update.effective_user, "выдал доступ менеджера", str(uid), alert=True)
     await update.effective_message.reply_text(f"✅ {uid} теперь менеджер бота.")
 
 
@@ -6441,6 +6562,7 @@ async def cmd_revoke(update: Update, context):
     if uid in CONFIG.get("managers", []):
         CONFIG["managers"].remove(uid)
         save_config(force=True)
+        await _audit(context, update.effective_user, "забрал доступ менеджера", str(uid), alert=True)
         return await update.effective_message.reply_text(f"✅ {uid} больше не менеджер.")
     await update.effective_message.reply_text("Такого менеджера нет.")
 
@@ -6979,13 +7101,19 @@ async def on_private_document(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     doc = msg.document
     user = update.effective_user
-    if not doc or not (doc.file_name or "").lower().endswith(".json"):
+    fname = (doc.file_name or "").lower() if doc else ""
+    if not doc or not (fname.endswith(".json") or fname.endswith(".enc")):
         return await msg.reply_text("Файлы принимаю только как JSON-бэкапы. Панель — /panel.")
     if doc.file_size and doc.file_size > 2 * 1024 * 1024:
         return await msg.reply_text("Файл слишком большой (лимит 2 МБ).")
     try:
         f = await context.bot.get_file(doc.file_id)
         raw = bytes(await f.download_as_bytearray())
+        if fname.endswith(".enc"):
+            c = _cipher()
+            if not c:
+                return await msg.reply_text("Файл зашифрован — нужен тот же DATA_KEY на сервере.")
+            raw = c.decrypt(raw)
         data = json.loads(raw.decode("utf-8"))
     except Exception as e:  # noqa: BLE001
         return await msg.reply_text(f"Не смог прочитать файл: {e}")
@@ -7004,6 +7132,7 @@ async def on_private_document(update: Update, context: ContextTypes.DEFAULT_TYPE
     _load_soft_mutes()
     save_config(force=True)
     await msg.reply_text("🗄 Полный бэкап восстановлен. Перезапуск не требуется.")
+    await _audit(context, user, "восстановил полный бэкап", "", alert=True)
 
 # ───────────────────────────────────────────────────────────────────────────
 #  ОШИБКИ, СТАРТ, РЕГИСТРАЦИЯ
@@ -7416,13 +7545,64 @@ def _pay_text(o) -> str:
             "и бот сразу выдаст заказ.")
 
 
+def _is_public(cid) -> bool:
+    """Групповой чат менеджеров при включённом режиме приватных карточек."""
+    try:
+        return int(cid) < 0 and bool(_shop().get("private", True))
+    except (TypeError, ValueError):
+        return False
+
+
+def _order_text_public(o) -> str:
+    """Карточка для общего чата: без контактов, комментария, чека и выданных кодов."""
+    e = html.escape
+    nm = str(o.get("name") or "").strip()
+    lines = [f"🧾 <b>Заказ №{e(str(o.get('id')))}</b> · {_ORDER_ST.get(o.get('status'), o.get('status'))}",
+             _order_items_html(o),
+             f"👤 Покупатель: {e((nm[:1] + '***') if nm else '***')}"]
+    if _method_name(o):
+        lines.append(f"Оплата: {e(_method_name(o))}")
+    if o.get("receipt"):
+        lines.append("🧾 Чек получен")
+    if o.get("delivered"):
+        lines.append(f"📦 Выдано позиций: {len(str(o['delivered']).splitlines())}")
+    if o.get("reason"):
+        lines.append(f"📝 Причина: {e(o['reason'])}")
+    if o.get("dup_of"):
+        lines.append(f"🚨 Этот чек уже присылали к заказу №{e(str(o['dup_of']))}!")
+    if o.get("refund_needed"):
+        lines.append("⚠️ Оплата была подтверждена — нужен возврат вручную.")
+    if o.get("taker_name"):
+        lines.append(f"🙋 Занимается: {e(o['taker_name'])}")
+    if o.get("by_name"):
+        lines.append(e(o["by_name"]))
+    lines.append("🔐 Контакты, комментарий, чек и выданное скрыты — «🔐 Подробнее» пришлёт всё тебе в личку.")
+    return "\n".join(lines)
+
+
+def _card_text(o, cid) -> str:
+    return _order_text_public(o) if _is_public(cid) else _order_text(o)
+
+
+def _card_kb(o, cid, panel: bool = False):
+    kb = _order_kb(o, panel)
+    if not _is_public(cid):
+        return kb
+    rows = [[_B("🔐 Подробнее (в личку)", _ocb("det", o["id"], panel=panel))]]
+    for row in kb.inline_keyboard:
+        r = [b for b in row if not getattr(b, "url", None)]      # без ссылки на профиль
+        if r:
+            rows.append(r)
+    return InlineKeyboardMarkup(rows)
+
+
 async def _notify_sellers(bot, o, head: str = ""):
-    """Карточка заказа менеджерам — при оформлении, при получении чека и т.д."""
+    """Карточка заказа менеджерам (в общих чатах — приватная, пересылать нельзя)."""
     msgs = o.setdefault("msgs", [])
     for cid in _shop_targets():
         try:
-            m = await bot.send_message(cid, (f"<b>{html.escape(head)}</b>\n\n" if head else "") + _order_text(o),
-                                       parse_mode="HTML", reply_markup=_order_kb(o))
+            m = await bot.send_message(cid, (f"<b>{html.escape(head)}</b>\n\n" if head else "") + _card_text(o, cid),
+                                       parse_mode="HTML", reply_markup=_card_kb(o, cid), protect_content=True)
             msgs.append([cid, m.message_id])
         except Exception as e:  # noqa: BLE001
             log.debug("order notify %s: %s", cid, e)
@@ -7431,16 +7611,19 @@ async def _notify_sellers(bot, o, head: str = ""):
 
 
 async def _send_receipt(bot, o):
+    """Чек — только в личку менеджерам (в общий чат не отправляем при приватном режиме)."""
     rc = o.get("receipt") or {}
     if rc.get("type") not in ("photo", "document"):
         return
     cap = f"🧾 Чек по заказу №{o['id']} от {o.get('name')}" + (f"\n{rc['text']}" if rc.get("text") else "")
     for cid in _shop_targets():
+        if _is_public(cid):
+            continue
         try:
             if rc["type"] == "photo":
-                await bot.send_photo(cid, rc["file_id"], caption=cap[:1000])
+                await bot.send_photo(cid, rc["file_id"], caption=cap[:1000], protect_content=True)
             else:
-                await bot.send_document(cid, rc["file_id"], caption=cap[:1000])
+                await bot.send_document(cid, rc["file_id"], caption=cap[:1000], protect_content=True)
         except Exception as e:  # noqa: BLE001
             log.debug("receipt %s: %s", cid, e)
 
@@ -7448,16 +7631,16 @@ async def _send_receipt(bot, o):
 async def _refresh_seller_msgs(bot, o):
     for cid, mid in list(o.get("msgs") or []):
         try:
-            await bot.edit_message_text(_order_text(o), chat_id=cid, message_id=mid,
-                                        parse_mode="HTML", reply_markup=_order_kb(o))
+            await bot.edit_message_text(_card_text(o, cid), chat_id=cid, message_id=mid,
+                                        parse_mode="HTML", reply_markup=_card_kb(o, cid))
         except Exception:  # noqa: BLE001
             pass
 
 
-async def _tell_buyer(bot, o, text: str, kb=None, html_mode: bool = False):
+async def _tell_buyer(bot, o, text: str, kb=None, html_mode: bool = False, protect: bool = False):
     try:
         await bot.send_message(int(o.get("uid")), text, reply_markup=kb,
-                               parse_mode="HTML" if html_mode else None)
+                               parse_mode="HTML" if html_mode else None, protect_content=protect)
     except Exception as e:  # noqa: BLE001
         log.debug("buyer %s: %s", o.get("uid"), e)
 
@@ -7539,12 +7722,13 @@ async def _approve_and_deliver(bot, o, by_name: str = "", head: str = ""):
     if manual:
         body.append(("⏳ Остальное продавец выдаст лично: " if (got or files) else "⏳ Продавец выдаст лично: ") +
                     ", ".join(dict.fromkeys(manual)) + ". Он скоро свяжется.")
+    prot = bool(_shop().get("protect_goods"))
     await _tell_buyer(bot, o, ((head or f"✅ Заказ №{o['id']} подтверждён!") + "\n\n" + "\n\n".join(body) +
-                               "\n\nВсе заказы — /orders")[:4000], _buyer_kb(o))
+                               "\n\nВсе заказы — /orders")[:4000], _buyer_kb(o), protect=prot)
     for t, f in files:
         try:
             send = bot.send_photo if f.get("type") == "photo" else bot.send_document
-            await send(int(o["uid"]), f["file_id"], caption=f"📁 {t} · заказ №{o['id']}")
+            await send(int(o["uid"]), f["file_id"], caption=f"📁 {t} · заказ №{o['id']}", protect_content=prot)
         except Exception as e:  # noqa: BLE001
             log.debug("deliver file: %s", e)
     if o["status"] == "done":
@@ -7580,6 +7764,7 @@ async def handle_order_press(update: Update, context: ContextTypes.DEFAULT_TYPE)
     st = o.get("status")
     note = ""
     uid = update.effective_user.id
+    here = q.message.chat.id if q.message else 0
     if act in ("ok", "again", "done", "rj", "rej") and o.get("taker") and o["taker"] != uid and not is_owner(uid):
         return await q.answer(f"🙋 Заказом занимается {o.get('taker_name')}", show_alert=True)
     if act == "take":
@@ -7604,6 +7789,7 @@ async def handle_order_press(update: Update, context: ContextTypes.DEFAULT_TYPE)
             bl.append(int(o["uid"]))
             note = "⛔ Покупатель в ЧС: магазин для него закрыт"
         save_config(force=True)
+        await _audit(context, update.effective_user, "ЧС магазина", f"заказ №{oid}: {note}")
     elif act == "note":
         context.user_data["awaiting"] = "ord_note"
         context.user_data["ord_oid"] = str(oid)
@@ -7637,13 +7823,21 @@ async def handle_order_press(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception:  # noqa: BLE001
             note = "Не доставлено — покупатель закрыл чат с ботом"
         try:
-            await q.edit_message_reply_markup(_order_kb(o, panel))
+            await q.edit_message_reply_markup(_card_kb(o, here, panel))
         except Exception:  # noqa: BLE001
             pass
         return await q.answer(note, show_alert=True)
+    if act == "det":
+        try:
+            await context.bot.send_message(uid, _order_text(o), parse_mode="HTML",
+                                           reply_markup=_order_kb(o), protect_content=True)
+        except Exception:  # noqa: BLE001
+            return await q.answer("Сначала открой личку с ботом (/start)", show_alert=True)
+        await _audit(context, update.effective_user, "открыл данные заказа", f"№{oid}")
+        return await q.answer("🔐 Отправил подробности тебе в личку")
     if act == "rej":
         try:
-            await q.edit_message_text(_order_text(o) + "\n\n<b>Выбери причину — покупатель её увидит.</b>" +
+            await q.edit_message_text(_card_text(o, here) + "\n\n<b>Выбери причину — покупатель её увидит.</b>" +
                                       ("\nОплата уже подтверждена — деньги вернёшь вручную."
                                        if o.get("paid_ts") else ""),
                                       parse_mode="HTML", reply_markup=_reject_kb(o, panel))
@@ -7655,7 +7849,8 @@ async def handle_order_press(update: Update, context: ContextTypes.DEFAULT_TYPE)
         cap = f"🧾 Чек по заказу №{o['id']} от {o.get('name')}" + (f"\n{rc['text']}" if rc.get("text") else "")
         try:
             send = context.bot.send_photo if rc.get("type") == "photo" else context.bot.send_document
-            await send(update.effective_user.id, rc["file_id"], caption=cap[:1000])
+            await send(update.effective_user.id, rc["file_id"], caption=cap[:1000], protect_content=True)
+            await _audit(context, update.effective_user, "открыл чек", f"№{oid}")
         except Exception:  # noqa: BLE001
             return await q.answer("Не смог отправить — открой личку с ботом (/start)", show_alert=True)
         return await q.answer("🧾 Отправил чек тебе в личку")
@@ -7715,7 +7910,7 @@ async def handle_order_press(update: Update, context: ContextTypes.DEFAULT_TYPE)
                               _buyer_kb(o))
             note = "🚫 Отклонено" + (" — не забудь вернуть оплату" if o.get("paid_ts") else "")
     try:
-        await q.edit_message_text(_order_text(o), parse_mode="HTML", reply_markup=_order_kb(o, panel))
+        await q.edit_message_text(_card_text(o, here), parse_mode="HTML", reply_markup=_card_kb(o, here, panel))
     except Exception:  # noqa: BLE001
         pass
     if note:
@@ -7956,7 +8151,7 @@ def _orders_csv(days: int) -> bytes:
                     _ORDER_ST.get(o.get("status"), o.get("status")), o.get("name", ""),
                     ("@" + o["username"]) if o.get("username") else "", o.get("uid", ""), items,
                     _o_total(o), _o_cur(o), o.get("promo", ""), o.get("discount", ""), _method_name(o),
-                    o.get("comment", ""), str(o.get("delivered", "")).replace("\n", " / "),
+                    o.get("comment", ""), (f"{len(str(o['delivered']).splitlines())} поз." if o.get("delivered") else ""),
                     o.get("taker_name") or o.get("by_name", ""), o.get("rating", ""), o.get("review", "")])
     return ("\ufeff" + buf.getvalue()).encode("utf-8")
 
@@ -8049,7 +8244,7 @@ async def _auto_receipt(update, context) -> bool:
     uid = update.effective_user.id
     msg = update.effective_message
     doc = getattr(msg, "document", None)
-    if doc and (doc.file_name or "").lower().endswith(".json") and is_manager(uid):
+    if doc and (doc.file_name or "").lower().endswith((".json", ".enc")) and is_manager(uid):
         return False  # владелец присылает бэкап настроек
     mine = [o for o in (CONFIG.get("shop_orders") or [])
             if str(o.get("uid")) == str(uid) and o.get("id") and o.get("status") in _WAIT_ST + ("check",)]
@@ -8099,6 +8294,8 @@ async def _shop_janitor(context):
             await _refresh_seller_msgs(context.bot, o)
             await _tell_buyer(context.bot, o, f"⌛ Заказ №{o['id']} отменён: оплата не поступила вовремя. "
                                               "Можно оформить заново — /shop")
+    if _anonymize_old(int(_shop().get("retention_days", 180) or 0)):
+        changed = True
     carts = CONFIG.setdefault("carts", {})
     for k, c in list(carts.items()):
         if now - float((c or {}).get("ts", 0) or 0) > 30 * 86400:
@@ -8138,6 +8335,7 @@ async def cmd_shopchat(update: Update, context):
         return await update.effective_message.reply_text("🔕 Этот чат больше не получает заказы магазина.")
     lst.append(chat.id)
     save_config(force=True)
+    await _audit(context, user, "подключил чат к заказам", f"{chat.title} ({chat.id})", alert=True)
     await update.effective_message.reply_text(
         "🔔 Теперь заказы магазина приходят сюда. Подтверждать и отклонять их могут админы этого чата "
         "и владельцы бота. Повторная команда /shopchat — отключить.")
@@ -8430,6 +8628,7 @@ async def _shop_callback(query, context, data):
                                                     "Открывается в Excel (разделитель «;»).")
         except Exception:  # noqa: BLE001
             return await ans("Не смог отправить файл — открой личку с ботом", True)
+        await _audit(context, query.from_user, "выгрузил заказы CSV", f"{days or 'все'} дн", alert=True)
         return await ans("📤 Отправил файл")
     if data == "add:ordsearch":
         ud["awaiting"] = "ordsearch"
@@ -8553,6 +8752,7 @@ async def _shop_callback(query, context, data):
         if sub == "me":
             if query.from_user.id not in lst:
                 lst.append(query.from_user.id)
+                await _audit(context, query.from_user, "стал получателем заказов", "", alert=True)
             note = "Добавил тебя"
         elif sub == "add":
             ud["awaiting"] = "shopnotify"
@@ -8741,7 +8941,10 @@ async def _shop_text(update, context, awaiting, text, msg):
             ids = [int(x) for x in re.findall(r"-?\d{5,}", text)]
             if not ids:
                 return await send("Не вижу ID. Пришли числа через запятую или «-» (или /cancel)")
-            _add_unique(s.setdefault("notify", []), ids)
+            added = _add_unique(s.setdefault("notify", []), ids)
+            if added:
+                await _audit(context, update.effective_user, "добавил получателей заказов",
+                             ", ".join(map(str, added)), alert=True)
         save_config(force=True)
         ud.pop("awaiting", None)
         t, kb = shop_notify_view()
@@ -9855,6 +10058,164 @@ async def _gw_text_input(update, context, text, msg):
                                 f"итоги через {human_duration(secs)}.")
 
 
+# ───────────────────────────────────────────────────────────────────────────
+#  🛡 КОНФИДЕНЦИАЛЬНОСТЬ: журнал, хранение и удаление данных, панель безопасности
+# ───────────────────────────────────────────────────────────────────────────
+
+_CLOSED_ST = ("done", "rejected", "canceled", "expired", "refunded")
+_PD_FIELDS = ("username", "comment", "receipt", "talk", "notes", "delivered", "msgs", "taker_name", "by_name")
+
+
+async def _audit(context, user, action: str, detail: str = "", alert: bool = False):
+    """Запись в журнал; важное — сразу владельцам (кроме их собственных действий)."""
+    uid = getattr(user, "id", 0) or 0
+    who = mention(user) if user else "—"
+    lst = CONFIG.setdefault("audit", [])
+    lst.append({"ts": time.time(), "uid": uid, "who": who, "action": action, "detail": str(detail)[:200]})
+    del lst[:-300]
+    save_config()
+    if alert and not is_owner(uid):
+        try:
+            await alert_owners(context, f"🛡 {who} (id {uid}): {action}" + (f" — {detail}" if detail else ""))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _anonymize(o) -> None:
+    for k in _PD_FIELDS:
+        o.pop(k, None)
+    o["name"], o["uid"], o["anon"] = "(данные удалены)", 0, True
+
+
+def _anonymize_old(days: int) -> int:
+    """Обезличить закрытые заказы старше days дней (0 — хранить всегда)."""
+    if not days:
+        return 0
+    lim = time.time() - days * 86400
+    n = 0
+    for o in CONFIG.get("shop_orders") or []:
+        if not o.get("anon") and o.get("status") in _CLOSED_ST and float(o.get("ts", 0) or 0) < lim:
+            _anonymize(o)
+            n += 1
+    if n:
+        save_config(force=True)
+    return n
+
+
+def sec_view():
+    s = _shop()
+    c = _cipher()
+    enc = ("🟢 включено" if c else
+           "🔴 DATA_KEY задан, но нет библиотеки cryptography" if DATA_KEY else
+           "⚪ выключено — задай DATA_KEY на сервере (+ pip install cryptography)")
+    path = ENC_PATH if c else CONFIG_PATH
+    try:
+        mode = os.stat(path).st_mode & 0o777
+        perm = "🟢 600 — читает только бот" if mode & 0o077 == 0 else f"🟠 {oct(mode)[2:]} — доступно другим пользователям сервера"
+    except OSError:
+        perm = "— файл ещё не создан —"
+    ret = int(s.get("retention_days", 180) or 0)
+    fmt = lambda ts: datetime.fromtimestamp(ts, _post_tz()).strftime("%d.%m %H:%M")  # noqa: E731
+    audit = CONFIG.get("audit") or []
+    last = "\n".join(f"{fmt(a['ts'])} · {a['who']}: {a['action']}" + (f" — {a['detail']}" if a.get("detail") else "")
+                     for a in audit[-12:][::-1]) or "— пока пусто —"
+    text = ("🛡 Безопасность и конфиденциальность\n\n"
+            f"🔐 Шифрование данных на диске: {enc}\n"
+            f"📁 Файл данных: {perm}\n"
+            f"🙈 Приватные карточки в чатах менеджеров: {'вкл' if s.get('private', True) else 'выкл'}\n"
+            f"🚫 Запрет пересылки выданного товара: {'вкл' if s.get('protect_goods') else 'выкл'}\n"
+            f"🗑 Личные данные закрытых заказов хранятся: {f'{ret} дн' if ret else 'всегда'}\n"
+            f"👥 Доступ к панели: владельцев {len(ADMIN_IDS)}, менеджеров бота {len(CONFIG.get('managers', []))}\n"
+            f"🔔 Получателей заказов: {len(_shop_targets())}\n\n"
+            "Всегда включено: карточки и чеки менеджерам нельзя переслать или сохранить; переписка "
+            "с покупателем идёт через бота без раскрытия контактов; полный бэкап — только главному "
+            "владельцу; выгрузки, бэкапы, новые менеджеры и получатели заказов — сразу тебе в личку.\n\n"
+            f"📜 Журнал (последние записи):\n{last}")
+    rows = [[_B(f"{onoff(s.get('private', True))} Приватные карточки в чатах", "sec:priv")],
+            [_B(f"{onoff(s.get('protect_goods'))} Запрет пересылки выданного товара", "sec:prot")],
+            [_B(f"🗑 Хранение данных: {ret or '∞'} дн", "sec:ret"),
+             _B("🧹 Обезличить старые", "sec:anon")],
+            [_B("⬅️ Назад", "m:h_sys")]]
+    return text[:4000], InlineKeyboardMarkup(rows)
+
+
+async def _sec_callback(query, context, data):
+    s = _shop()
+    k = data[4:]
+    if k == "priv":
+        s["private"] = not s.get("private", True)
+    elif k == "prot":
+        s["protect_goods"] = not s.get("protect_goods")
+    elif k == "ret":
+        s["retention_days"] = _cycle([30, 90, 180, 365, 0], int(s.get("retention_days", 180) or 0))
+    elif k == "anon":
+        days = int(s.get("retention_days", 180) or 0)
+        n = _anonymize_old(days)
+        await _audit(context, query.from_user, "обезличил старые заказы", str(n))
+        await query.answer(f"🧹 Обезличено заказов: {n}" if days else "Хранение «всегда» — выбери срок",
+                           show_alert=True)
+        return await _render_menu(query, context, "m:sec")
+    save_config(force=True)
+    await _audit(context, query.from_user, "изменил настройки безопасности", k)
+    return await _render_menu(query, context, "m:sec")
+
+
+def _mydata_text(uid) -> str:
+    orders = [o for o in CONFIG.get("shop_orders") or [] if str(o.get("uid")) == str(uid)]
+    open_n = sum(1 for o in orders if o.get("status") not in _CLOSED_ST)
+    subs = sum(1 for lst in (CONFIG.get("dm_subscribers") or {}).values() if uid in (lst or []))
+    ret = int(_shop().get("retention_days", 180) or 0)
+    return ("🔐 Твои данные в этом боте\n\n"
+            f"🛒 Заказов в магазине: {len(orders)} (незакрытых: {open_n})\n"
+            "По заказам хранится: имя, @username, ID, состав, комментарий, чек, переписка с магазином.\n"
+            f"🧺 Корзина: {'есть' if str(uid) in (CONFIG.get('carts') or {}) else 'пусто'}\n"
+            f"📬 Подписок на рассылки групп: {subs}\n"
+            + (f"🗑 Закрытые заказы обезличиваются автоматически через {ret} дн.\n" if ret else "")
+            + "\nКнопка ниже удалит твои личные данные из закрытых заказов, корзину, подписки на "
+            "рассылки и твоё имя из статистики групп. Незакрытые заказы останутся, пока их не закроют.")
+
+
+async def cmd_mydata(update: Update, context):
+    if update.effective_chat.type != "private":
+        return await reply_tidy(update, context, "🔐 Свои данные смотри в личке бота: /mydata")
+    uid = update.effective_user.id
+    await update.effective_message.reply_text(
+        _mydata_text(uid), reply_markup=InlineKeyboardMarkup([[_B("🗑 Удалить мои данные", "pd:ask")]]))
+
+
+async def handle_pd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    act = (q.data or "pd:").split(":", 1)[1]
+    await q.answer()
+    if act == "ask":
+        return await q.edit_message_text("⚠️ Точно удалить твои данные? Это нельзя отменить.",
+                                         reply_markup=InlineKeyboardMarkup([[_B("🗑 Да, удалить", "pd:yes"),
+                                                                             _B("Нет", "pd:no")]]))
+    if act == "no":
+        return await q.edit_message_text("Ок, ничего не удаляю. /mydata — посмотреть снова.")
+    if act != "yes":
+        return
+    n = 0
+    for o in CONFIG.get("shop_orders") or []:
+        if str(o.get("uid")) == str(uid) and o.get("status") in _CLOSED_ST:
+            _anonymize(o)
+            n += 1
+    (CONFIG.get("carts") or {}).pop(str(uid), None)
+    for lst in (CONFIG.get("dm_subscribers") or {}).values():
+        while uid in (lst or []):
+            lst.remove(uid)
+    for ms in (CONFIG.get("msg_stats") or {}).values():
+        (ms.get("names") or {}).pop(str(uid), None)
+        (ms.get("users") or {}).pop(str(uid), None)
+    save_config(force=True)
+    await _audit(context, q.from_user, "удалил свои данные (/mydata)", f"заказов: {n}")
+    left = sum(1 for o in CONFIG.get("shop_orders") or [] if str(o.get("uid")) == str(uid))
+    await q.edit_message_text(f"✅ Готово. Обезличено заказов: {n}. Корзина, подписки и статистика очищены."
+                              + (f"\nНезакрытых заказов осталось: {left} — удалю после их закрытия "
+                                 "(нажми /mydata ещё раз)." if left else ""))
+
+
 async def on_error(update, context):
     err = context.error
     if isinstance(err, (NetworkError, TimedOut)):
@@ -9880,6 +10241,7 @@ async def _post_init(app: Application):
             BotCommand("shop", "магазин"),
             BotCommand("orders", "мои заказы"),
             BotCommand("random", "рандом: число, выбор"),
+            BotCommand("mydata", "мои данные и их удаление"),
             BotCommand("userid", "мой ID"),
             BotCommand("skip", "пропустить шаг"),
             BotCommand("cancel", "отменить ввод"),
@@ -10012,7 +10374,7 @@ def build_app() -> Application:
         ("grant", cmd_grant), ("revoke", cmd_revoke), ("managers", cmd_managers),
         ("gmanager", cmd_gmanager), ("shop", cmd_shop),
         ("random", cmd_random), ("rand", cmd_random), ("giveaway", cmd_random),
-        ("reroll", cmd_reroll), ("gwend", cmd_gwend), ("orders", cmd_orders), ("shopchat", cmd_shopchat), ("ungmanager", cmd_ungmanager), ("gmanagers", cmd_gmanagers),
+        ("reroll", cmd_reroll), ("gwend", cmd_gwend), ("orders", cmd_orders), ("shopchat", cmd_shopchat), ("mydata", cmd_mydata), ("ungmanager", cmd_ungmanager), ("gmanagers", cmd_gmanagers),
     ):
         app.add_handler(CommandHandler(name, fn))
 
@@ -10022,6 +10384,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(handle_setstaff_press, pattern=r"^ss:"))
     app.add_handler(CallbackQueryHandler(handle_action_press, pattern=r"^(act|arole):"))
     app.add_handler(CallbackQueryHandler(handle_allstop_press, pattern=r"^allstop$"))
+    app.add_handler(CallbackQueryHandler(handle_pd, pattern=r"^pd:"))
     app.add_handler(CallbackQueryHandler(handle_market, pattern=r"^mk:"))
     app.add_handler(CallbackQueryHandler(handle_order_press, pattern=r"^osd:"))
     app.add_handler(CallbackQueryHandler(handle_gw_join, pattern=r"^gwj:"))
@@ -10075,7 +10438,7 @@ def main():
         jq.run_repeating(flush_config_job, interval=90, first=30)
         jq.run_repeating(janitor_job, interval=3600, first=600)
         jq.run_repeating(weekly_digest_job, interval=3600, first=900)
-    log.info("Channel Guard v7.2 запускается…")
+    log.info("Channel Guard v7.3 запускается…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
