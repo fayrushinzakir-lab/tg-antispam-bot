@@ -1,10 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-Channel Guard Bot  —  версия 7.3 («всё в одном»)
+Channel Guard Bot  —  версия 7.5 («всё в одном»)
 ================================================
 Антиспам + автоответы (текст/медиа/кнопки) + панель в ЛС + модерация + капча +
 приветствие + привлечение (промо, рассылки, посты по расписанию) + роли +
 анти-снос/анти-рейд + магазин с оплатой по реквизитам + розыгрыши.
+
+Что нового в v7.5:
+  • 🖼 Оплата картой: покупатель получает картинку банковской карты с реквизитами продавца —
+    название банка, номер (по 4 цифры), получатель, а снизу сумма и «Заказ №…» для комментария.
+    Цвет и логотип подбираются по названию (Uzcard, Humo, Visa, Mastercard, Сбер, Kaspi…).
+    Включается/выключается в «💳 Оплата»; нужен Pillow (pip install pillow), без него — текст.
+  • Разделитель «|» убран отовсюду — везде запятые: розыгрыш «/random Приз, 2, 1д»,
+    авто-сообщения «120, текст», рандомизация «{Привет, Салют}». Старые записи с «|» работают.
+
+Что нового в v7.4 (магазин без дублей, удобная оплата):
+  • Меню магазина — только разделы: Товары, Заказы, Оплата, Уведомления, Витрина, Промокоды,
+    Правила. На главном экране — чек-лист готовности («что ещё настроить»).
+  • 💳 Способ оплаты — пошаговый мастер: Что → Куда → Кому → Сколько (лимит суммы) → Как
+    (подсказка), с предпросмотром «как увидит покупатель». Номер карты сам разбивается по 4 цифры.
+    Каждый способ — карточка: правка любого поля, вкл/выкл, удаление.
+  • Покупателю: «Куда / Кому / Сколько / Комментарий к платежу» — всё по полочкам; способы
+    с лимитом суммы показываются только подходящим заказам.
+  • Убраны дубли: вход в магазин только из главного меню, название/приветствие — в «🏪 Витрина»,
+    валюта — в «💳 Оплата», старые ветки настроек удалены.
 
 Что нового в v7.3 (конфиденциальность):
   • 🔐 Шифрование данных на диске: задай DATA_KEY (+ pip install cryptography) — config.json
@@ -87,7 +106,7 @@ Channel Guard Bot  —  версия 7.3 («всё в одном»)
   • Выдача после оплаты: один текст всем, 🎲 случайный вариант, 🔑 уникальные коды со склада
     (случайный из оставшихся, остаток виден в витрине), либо вручную продавцом.
   • 🎲 Рандом: /random 100, /random 5 50, /random а, б, в — и 🎉 розыгрыши в группах:
-    /random Приз | победителей | 1д, кнопка «Участвовать», авто-итоги, /reroll, /gwend.
+    /random Приз, победителей, 1д, кнопка «Участвовать», авто-итоги, /reroll, /gwend.
   • Витрина Mini App: плитки с фото, карточка товара, комментарий продавцу, нативная кнопка.
   • /orders — покупатель видит свои заказы и их статусы.
 
@@ -117,7 +136,7 @@ Channel Guard Bot  —  версия 7.3 («всё в одном»)
   • Наказание за спам настраивается: удалить / предупреждение / мут / бан.
     Предупреждения идут в общий счётчик (/warns) с эскалацией по настройкам.
   • Автоответы: медиа (фото/видео/гиф/стикер/документ), HTML-форматирование,
-    инлайн-кнопки-ссылки, рандомизация {а|б}, кулдаун от само-спама.
+    инлайн-кнопки-ссылки, рандомизация {а, б}, кулдаун от само-спама.
   • Владелец/менеджеры бота: команды работают даже в неодобренных чатах,
     можно модерировать админов групп (мут по админу — «мягкий», удалением).
   • Ловля скрытых ссылок (text_link) и точные границы доменов.
@@ -141,7 +160,8 @@ Channel Guard Bot  —  версия 7.3 («всё в одном»)
     предупреждение, три предупреждения → бан (настраивается в панели).
 
 Запуск: переменная окружения BOT_TOKEN. Главный владелец: ADMIN_IDS.
-Зависимости: pip install "python-telegram-bot[job-queue,rate-limiter]" cryptography
+Зависимости: pip install "python-telegram-bot[job-queue,rate-limiter]" cryptography pillow
+(pillow — для картинки банковской карты при оплате; без неё реквизиты приходят текстом)
 (cryptography нужна для шифрования данных с DATA_KEY; без неё бот работает, но без шифрования)
 """
 
@@ -162,6 +182,11 @@ import functools
 import httpx  # идёт в комплекте с python-telegram-bot
 import base64
 import hashlib
+
+try:  # картинка «банковская карта» при оплате (необязательно: pip install pillow)
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:  # noqa: SIM105
+    Image = ImageDraw = ImageFont = None
 
 try:  # шифрование данных на диске (необязательно: pip install cryptography)
     from cryptography.fernet import Fernet
@@ -310,17 +335,17 @@ DEFAULT_CONFIG = {
         ],
         "phrases": [
             "Так-так, кто тут веселится без меня? 😏",
-            "Читаю вас и {улыбаюсь|хихикаю} в проводах 🤖",
-            "Минутка от бота: этот чат — {огонь|топ} 🔥",
+            "Читаю вас и {улыбаюсь, хихикаю} в проводах 🤖",
+            "Минутка от бота: этот чат — {огонь, топ} 🔥",
             "Живу тут бесплатно и не жалуюсь 😎",
-            "Интересная тема! Продолжайте, я {записываю|конспектирую} 📝",
+            "Интересная тема! Продолжайте, я {записываю, конспектирую} 📝",
             "Если что, я всё вижу 👀 Шучу. Или нет…",
             "С вами не соскучишься 😄",
             "Плюс один к карме этого чата ✨",
             "Так, где мой попкорн? 🍿 Продолжайте!",
-            "Официально заявляю: вы — {лучший|самый душевный} чат в моей памяти 💾❤️",
+            "Официально заявляю: вы — {лучший, самый душевный} чат в моей памяти 💾❤️",
             "Тут так интересно, что я чуть не забыл ловить спам 😅",
-            "{Кстати|Между прочим}, сегодня отличный день, чтобы позвать друга в чат 😉",
+            "{Кстати, Между прочим}, сегодня отличный день, чтобы позвать друга в чат 😉",
             "Хотел промолчать, но не удержался: вы классные 🙌",
             "Сижу, никого не баню… красота 🧘",
             "Вжух — и я здесь! ⚡ Ладно, продолжайте.",
@@ -328,25 +353,25 @@ DEFAULT_CONFIG = {
             "Запомните этот момент: бот был тут 🗿",
             "А помните времена без меня? Вот и я не помню 😌",
             "Тихо! Слышите? Это звук идеальной модерации 🎧",
-            "Ставлю этому чату {десять|сто} из десяти 💯",
+            "Ставлю этому чату {десять, сто} из десяти 💯",
             "Не хочу хвастаться, но спам обходит нас стороной 😎",
-            "Улыбнитесь, вас снимает {скрытая камера|бот} 📸",
+            "Улыбнитесь, вас снимает {скрытая камера, бот} 📸",
             "Пока вы общаетесь, я тренирую чувство юмора. Как получается? 😅",
             "Ем электричество, шучу бесплатно ⚡😄",
         ],
         "replies": [
             "Да-да, я тут 🤖",
-            "{Слушаю|Внимаю} внимательно 👂",
+            "{Слушаю, Внимаю} внимательно 👂",
             "Меня звали? Я всегда на посту 😎",
             "Бип-буп! Если нужна помощь — /help 🙌",
             "Я бот, но с душой ❤️",
-            "{Привет|Салют|Йо}! Я на месте ✋",
+            "{Привет, Салют, Йо}! Я на месте ✋",
             "На связи! ⚡ Чем могу?",
             "Весь во внимании, {name} 🙂",
             "Кто-то сказал «бот»? Появляюсь эффектно 💨",
             "Всегда рядом. Иногда даже слишком 😄",
             "Загрузился на 100%, слушаю 🔋",
-            "{Ну наконец-то|О!} обо мне вспомнили 🥹",
+            "{Ну наконец-то, О!} обо мне вспомнили 🥹",
             "Спрашивай — отвечу. Ну, постараюсь 😅",
             "Здесь! Спам не пройдёт, шутка — всегда 🤝",
         ],
@@ -434,7 +459,7 @@ DEFAULT_CONFIG = {
     "shop": {"enabled": False, "title": "Магазин", "items": [], "notify": [], "seq": 0, "about": "",
              "currency": "сум", "pay_methods": [], "cod": False, "promos": {}, "expire_h": 24,
              "max_unpaid": 2, "daily": True, "daily_h": 21, "blacklist": [],
-             "private": True, "protect_goods": False, "retention_days": 180},
+             "private": True, "protect_goods": False, "retention_days": 180, "card_img": True},
     # Журнал действий с данными (выгрузки, бэкапы, доступы) — последние 300 записей
     "audit": [],
     # Розыгрыши в группах: {id: {chat, mid, prize, winners, ends, parts, names, status, won}}
@@ -1943,11 +1968,11 @@ _chat_daymark: dict = {}     # chat_id -> ts последнего сообщен
 _CHATTER_BANKS = {
     "greet": [
         "Привет, {name}! 👋",
-        "{Здарова|Салют|Приветствую}, {name}! 😎",
+        "{Здарова, Салют, Приветствую}, {name}! 😎",
         "О, {name}! Рад видеть 🤗",
         "Ку-ку! Я тут, всё под контролем 🤖",
         "Привет-привет! Чем удивишь? 🙂",
-        "{Салам|Йо}, {name}! Как настроение? ✨",
+        "{Салам, Йо}, {name}! Как настроение? ✨",
     ],
     "greet_morning": [
         "Доброе утро, {name}! ☀️ Кофе уже был?",
@@ -1971,13 +1996,13 @@ _CHATTER_BANKS = {
         "Работаю 24/7 и не жалуюсь 🤖",
         "Лучше всех: процессор холодный, настроение горячее 🔥",
         "Живу на серверном, дышу апдейтами. А ты как, {name}?",
-        "Бодрячком! {Спам ловится|Чат под охраной}, жизнь удалась 💪",
+        "Бодрячком! {Спам ловится, Чат под охраной}, жизнь удалась 💪",
     ],
     "thanks": [
         "Всегда пожалуйста, {name}! 🤝",
         "Обращайся 😉",
         "Да не за что — я тут для этого 🤖",
-        "На здоровье! {Работаем дальше|Служу чату} 🫡",
+        "На здоровье! {Работаем дальше, Служу чату} 🫡",
     ],
     "bye": [
         "Пока, {name}! Возвращайся 👋",
@@ -2012,7 +2037,7 @@ _CHATTER_BANKS = {
         "Хороший вопрос! Но я по шуткам, а по фактам чат подскажет лучше 🙂",
         "Хм, дай подумать… 🤔 Голосуем в чате?",
         "Если бы я знал ответы на всё — брал бы звёздами 😄",
-        "{Сложно сказать|Загадка века}! Но звучит интересно 👀",
+        "{Сложно сказать, Загадка века}! Но звучит интересно 👀",
     ],
     "support": [
         "Держись, {name} 🤗 Я рядом, и чат тоже.",
@@ -2063,10 +2088,10 @@ _CHATTER_BANKS = {
     ],
     "default": [
         "Да-да, я тут 🤖",
-        "{Слушаю|Внимаю} внимательно 👂",
+        "{Слушаю, Внимаю} внимательно 👂",
         "Меня звали? Я всегда на посту 😎",
         "Бип-буп! Если нужна помощь — /help 🙌",
-        "{Привет|Салют|Йо}! Я на месте ✋",
+        "{Привет, Салют, Йо}! Я на месте ✋",
         "Весь во внимании, {name} 🙂",
     ],
     "gm": [
@@ -3960,7 +3985,7 @@ async def cmd_gblock(update: Update, context):
             save_config(force=True)
         return await update.effective_message.reply_text(
             f"🌐 Подстрока имени «{arg}» в глобальном ЧС.")
-    await update.effective_message.reply_text("Формат: /gblock (реплай | ID | подстрока имени)")
+    await update.effective_message.reply_text("Формат: /gblock (реплай, ID или подстрока имени)")
 
 
 async def cmd_gunblock(update: Update, context):
@@ -3978,24 +4003,24 @@ async def cmd_gunblock(update: Update, context):
         gb["names"].remove(arg.lower())
         save_config(force=True)
         return await update.effective_message.reply_text("Убрал подстроку из глобального ЧС.")
-    await update.effective_message.reply_text("Не нашёл такого в глобальном ЧС. Формат: /gunblock ID | подстрока")
+    await update.effective_message.reply_text("Не нашёл такого в глобальном ЧС. Формат: /gunblock ID или подстрока")
 
 # ───────────────────────────────────────────────────────────────────────────
 #  ДОСТАВКА ПОСТОВ (единый отправщик)
 # ───────────────────────────────────────────────────────────────────────────
 
-_SPINTAX_RE = re.compile(r"\{([^{}|]*(?:\|[^{}|]*)+)\}")
+_SPINTAX_RE = re.compile(r"\{([^{}|,]*(?:[|,][^{}|,]*)+)\}")
 
 
 def _spintax(text: str) -> str:
-    """Рандомизация {вариант1|вариант2|вариант3} — в т.ч. вложенные проходы."""
+    """Рандомизация {вариант1, вариант2, вариант3} (старый вид с «|» тоже работает)."""
     if not text:
         return text
     for _ in range(10):
         m = _SPINTAX_RE.search(text)
         if not m:
             break
-        text = text[:m.start()] + random.choice(m.group(1).split("|")) + text[m.end():]
+        text = text[:m.start()] + random.choice([v.strip() for v in re.split(r"[|,]", m.group(1))]) + text[m.end():]
     return text
 
 
@@ -4793,7 +4818,7 @@ def triggers_menu_text(cfg, label) -> str:
             f"Всего: {len(cfg.get('triggers', {}))}\n\n"
             "Бот отвечает, когда в сообщении встречается ключ. Формат добавления: "
             "ключ - ответ (несколько ключей через запятую).\n"
-            "Ответ может быть с медиа и кнопками, работает {рандомизация|вариантов} "
+            "Ответ может быть с медиа и кнопками, работает {рандомизация, вариантов} "
             "и HTML-разметка. Ключи со «*» матчатся как стоп-слова.\n"
             "Быстрое добавление командой: /add ключ - ответ.")
 
@@ -4852,7 +4877,7 @@ def chatter_menu_text(cfg, label) -> str:
             "мат-фильтр действует и на него. Без ключа всё работает офлайн.\n"
             "🧢 Гоп-режим: бот говорит «по-пацански» и сам отзывается на слова-триггеры "
             "(«слышь», «чё каво», «семки»…) — свои триггеры добавляются кнопкой ниже.\n"
-            "Свои фразы — по одной на строку, работает {рандомизация|вариантов}.\n"
+            "Свои фразы — по одной на строку, работает {рандомизация, вариантов}.\n"
             "Команды бот не комментирует; поверх автоответа не шутит.\n"
             "Осмысленные ответы по темам — это 💬 Автоответы (/add ключ - ответ).")
 
@@ -5089,7 +5114,7 @@ def recurring_menu_text(cfg, label) -> str:
     return (f"🔁 Авто-сообщения · {label}\n\n"
             f"Всего: {len(cfg.get('recurring') or [])}\n\n"
             "Повторяющиеся сообщения в эту группу с заданным интервалом (в минутах). "
-            "Формат добавления: интервал_минут | текст. Работает {рандомизация|вариантов}.")
+            "Формат добавления: интервал_минут, текст. Работает {рандомизация, вариантов}.")
 
 
 def other_kb(cfg) -> InlineKeyboardMarkup:
@@ -5238,7 +5263,7 @@ def sched_menu_text() -> str:
             f"Всего: {len(CONFIG.get('scheduled_posts', []))}\n\n"
             "Пост уходит в выбранные группы (кнопка 👥) в заданное время по дням недели.\n"
             "Формат времени при создании: ЧЧ:ММ [дни: пн,ср,пт] — без дней = ежедневно.\n"
-            "Контент — любой: текст/медиа, HTML, кнопки, {рандомизация|вариантов}.")
+            "Контент — любой: текст/медиа, HTML, кнопки, {рандомизация, вариантов}.")
 
 
 def sched_groups_kb(post) -> InlineKeyboardMarkup:
@@ -5398,7 +5423,7 @@ def hub_posts(cfg, label, mgr):
             "• Авто-сообщения — повторяются в этой группе каждые N минут\n"
             + ("• Промо — авто-реклама и рассылки по всем группам и в ЛС\n"
                "• Расписание — посты в заданное время по дням недели\n" if mgr else "")
-            + "\nВезде работают медиа, кнопки, HTML и {рандомизация|вариантов}.")
+            + "\nВезде работают медиа, кнопки, HTML и {рандомизация, вариантов}.")
     return text, _hub_kb(items)
 
 
@@ -5424,10 +5449,10 @@ def hub_sys(cfg, label, mgr):
     items = [("✅ Доступ бота", "m:access"), ("⚙️ Прочее", "m:other")]
     if mgr:
         items += [("🗄 Бэкапы", "m:backup"), ("✅ Одобрение групп", "m:approve"),
-                  ("🛒 Магазин", "m:shop"), ("🛡 Безопасность", "m:sec")]
+                  ("🛡 Безопасность", "m:sec")]
     text = (f"⚙️ Система · {label}\n\n"
             "Доступ бота, ID новичков, «зазывала», сброс настроек"
-            + (", бэкапы, одобрение групп и магазин." if mgr else "."))
+            + (", бэкапы, одобрение групп и безопасность." if mgr else "."))
     return text, _hub_kb(items)
 
 
@@ -5435,29 +5460,23 @@ def hub_sys(cfg, label, mgr):
 
 
 def shop_kb() -> InlineKeyboardMarkup:
+    """Главный экран магазина: только разделы, без дублей."""
     s = CONFIG.get("shop") or {}
+    items = [i for i in (s.get("items") or []) if isinstance(i, dict) and i.get("id")]
     open_n = sum(1 for o in CONFIG.get("shop_orders") or [] if o.get("status") in _OPEN_ST)
-    rows = [[InlineKeyboardButton(f"{onoff(s.get('enabled'))} Магазин открыт", callback_data="shp:tgl")],
-            [InlineKeyboardButton("➕ Добавить товар", callback_data="add:shopitem")],
-            [InlineKeyboardButton("📦 Заказы" + (f" · 🔔 {open_n}" if open_n else ""),
-                                  callback_data="m:shop_orders"),
-             InlineKeyboardButton("🔔 Куда приходят заказы", callback_data="add:shopnotify")],
-            [InlineKeyboardButton("💳 Оплата и валюта", callback_data="m:shop_pay"),
-             InlineKeyboardButton("🎟 Промокоды", callback_data="m:shop_promo")],
+    on = [m for m in _pay_methods() if m.get("on", True)]
+    rows = [[InlineKeyboardButton("🟢 Магазин открыт — закрыть" if s.get("enabled") else
+                                  "🔴 Магазин закрыт — открыть", callback_data="shp:tgl")],
+            [InlineKeyboardButton(f"📦 Товары · {len(items)}", callback_data="m:shop_items"),
+             InlineKeyboardButton("🧾 Заказы" + (f" · 🔔 {open_n}" if open_n else ""),
+                                  callback_data="m:shop_orders")],
+            [InlineKeyboardButton(f"💳 Оплата · {len(on)}" + (" +🤝" if s.get("cod") else ""),
+                                  callback_data="m:shop_pay"),
+             InlineKeyboardButton(f"🔔 Уведомления · {len(_shop_targets())}", callback_data="add:shopnotify")],
+            [InlineKeyboardButton("🏪 Витрина", callback_data="m:shop_front"),
+             InlineKeyboardButton(f"🎟 Промокоды · {len(s.get('promos') or {})}", callback_data="m:shop_promo")],
             [InlineKeyboardButton("⚙️ Правила, шаблоны, ЧС", callback_data="m:shop_rules")],
-            [InlineKeyboardButton("✏️ Название", callback_data="add:shoptitle"),
-             InlineKeyboardButton("📝 Приветствие", callback_data="add:shopabout")],
-            [InlineKeyboardButton("🛍 Открыть витрину как покупатель", callback_data="mk:home")]]
-    for it in (s.get("items") or [])[:30]:
-        if not isinstance(it, dict) or not it.get("id"):
-            continue
-        st = _item_stock(it)
-        tail = f" · {st} шт" if st is not None else ""
-        eye = "" if it.get("enabled", True) else "🙈 "
-        price = _money(_item_price(it)) if _item_price(it) else "заявка"
-        rows.append([InlineKeyboardButton(f"{eye}🛍 {str(it.get('title', '?'))[:22]} · {price}{tail}",
-                                          callback_data=f"shi:{it['id']}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:main")])
+            [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")]]
     return InlineKeyboardMarkup(rows)
 
 
@@ -5466,25 +5485,76 @@ def shop_menu_text() -> str:
     orders = [o for o in CONFIG.get("shop_orders") or [] if o.get("id")]
     cur = _cur()
     sold = [o for o in orders if o.get("status") in ("done", "approved", "paid") and _o_cur(o) == cur]
-    revenue = _num(sum(_o_total(o) for o in sold))
-    open_n = sum(1 for o in orders if o.get("status") in _OPEN_ST)
-    wait_n = sum(1 for o in orders if o.get("status") in _WAIT_ST)
-    who = ", ".join(_target_label(x) for x in _shop_targets())
-    top = sorted((i for i in s.get("items") or [] if isinstance(i, dict)),
-                 key=lambda i: int(i.get("sold", 0) or 0), reverse=True)[:3]
-    top_txt = ", ".join(f"{i.get('title')} ({i.get('sold', 0)})" for i in top if i.get("sold")) or "—"
-    pays = len(s.get("pay_methods") or [])
-    return (f"🛒 Магазин «{s.get('title', 'Магазин')}»\n\n"
-            "Витрина прямо в боте — /shop. Оплата — по твоим реквизитам, без Telegram Stars.\n\n"
-            f"📦 Заказов: {len(orders)} · ждут оплаты: {wait_n} · ждут твоего решения: {open_n}\n"
-            f"💰 Продано на: {_money(revenue)} · выполнено заказов: {len(sold)}\n"
-            f"🏆 Хиты: {top_txt}\n"
-            f"💳 Способов оплаты: {pays}{' + при получении' if s.get('cod') else ''} · валюта: {cur}\n"
-            f"🔔 Заказы приходят: {who}{'' if s.get('notify') else ' (владельцы бота)'}\n\n"
-            "Как проходит заказ: покупатель оформляет → тебе сразу карточка → он переводит "
-            "по реквизитам и присылает чек → ты жмёшь «✅ Оплата подтверждена» → бот выдаёт товар "
-            "(коды, текст, файл) или ты отдаёшь сам.\n"
-            + ("\n⚠️ Добавь способ оплаты: 💳 Оплата и валюта." if not pays and not s.get("cod") else ""))
+    items = [i for i in (s.get("items") or []) if isinstance(i, dict) and i.get("id")]
+    visible = [i for i in items if i.get("enabled", True)]
+    on = [m for m in _pay_methods() if m.get("on", True)]
+    ok = lambda b: "✅" if b else "⚠️"  # noqa: E731
+    check = [
+        f"{ok(visible)} Товары в витрине: {len(visible)}" + ("" if visible else " — добавь в «📦 Товары»"),
+        f"{ok(on or s.get('cod'))} Способы оплаты: {len(on)}" + (" + при получении" if s.get("cod") else "")
+        + ("" if (on or s.get("cod")) else " — настрой в «💳 Оплата»"),
+        f"{ok(s.get('notify'))} Уведомления: " + (", ".join(_target_label(x) for x in _shop_targets())
+                                                 if s.get("notify") else "владельцам бота (по умолчанию)"),
+        ("🟢 Магазин открыт — покупатели видят витрину" if s.get("enabled")
+         else "🔴 Магазин закрыт — покупатели витрину не видят"),
+    ]
+    return (f"🛒 Магазин «{s.get('title') or 'Магазин'}»\n\n"
+            "Готовность:\n" + "\n".join(check) + "\n\n"
+            f"📊 Заказов: {len(orders)} · ждут решения: {sum(1 for o in orders if o.get('status') in _OPEN_ST)} · "
+            f"ждут оплаты: {sum(1 for o in orders if o.get('status') in _WAIT_ST)}\n"
+            f"💰 Продано на: {_money(_num(sum(_o_total(o) for o in sold)))} · выполнено: {len(sold)}\n\n"
+            "Покупатели открывают витрину командой /shop или пишут боту название товара.")
+
+
+def shop_items_view():
+    items = [i for i in (_shop().get("items") or []) if isinstance(i, dict) and i.get("id")]
+    rows = [[_B("➕ Добавить товар", "add:shopitem")]]
+    for it in items[:40]:
+        st = _item_stock(it)
+        flag = "🙈 " if not it.get("enabled", True) else ("⚠️ " if st == 0 else "")
+        tail = f" · {st} шт" if st is not None else ""
+        price = _money(_item_price(it)) if _item_price(it) else "заявка"
+        rows.append([_B(f"{flag}{str(it.get('title', '?'))[:22]} · {price}{tail}"[:60], f"shi:{it['id']}")])
+    rows.append([_B("⬅️ В магазин", "m:shop")])
+    text = (f"📦 Товары · {len(items)}\n\n"
+            + ("Нажми на товар — откроется карточка: цена, количество, остаток, выдача, фото.\n"
+               "🙈 — скрыт из витрины · ⚠️ — нет в наличии." if items else
+               "Пока нет товаров. Нажми «➕ Добавить товар» — мастер проведёт по шагам."))
+    return text, InlineKeyboardMarkup(rows)
+
+
+def shop_front_view():
+    s = _shop()
+    items = [i for i in (s.get("items") or []) if isinstance(i, dict) and i.get("enabled", True)]
+    cats = {}
+    for i in items:
+        if i.get("cat"):
+            cats[i["cat"]] = cats.get(i["cat"], 0) + 1
+    text = ("🏪 Витрина — что видит покупатель в /shop\n\n"
+            f"Название: {s.get('title') or 'Магазин'}\n"
+            f"Приветствие: {s.get('about') or '—'}\n"
+            "Разделы: " + (", ".join(f"{c} ({n})" for c, n in cats.items()) or
+                           "нет (раздел задаётся в карточке товара)"))
+    rows = [[_B("✏️ Название", "add:shoptitle"), _B("📝 Приветствие", "add:shopabout")],
+            [_B("👁 Открыть как покупатель", "mk:home")],
+            [_B("⬅️ В магазин", "m:shop")]]
+    return text, InlineKeyboardMarkup(rows)
+
+
+def shop_cur_view():
+    cur = _cur()
+    rows, row = [], []
+    for i, c in enumerate(_CURRENCIES):
+        row.append(_B(("✅ " if c == cur else "") + c, f"scu:{i}"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([_B("✏️ Своя валюта", "add:shopcur")])
+    rows.append([_B("⬅️ К оплате", "m:shop_pay")])
+    return (f"💱 Валюта витрины: {cur}\n\nВо всех ценах и суммах к оплате будет эта валюта. "
+            "Старые заказы сохранят свою."), InlineKeyboardMarkup(rows)
 
 
 _ORD_FILTERS = [("all", "Все"), ("act", "🔔 Решение"), ("wait", "⏳ Оплата"), ("done", "✅ Готово"),
@@ -5545,7 +5615,7 @@ def gw_view(tgt, label):
             rows.append([InlineKeyboardButton(f"🔁 Перевыбрать: {prize[:22]}", callback_data=f"gwr:{g['id']}")])
     if not items:
         lines.append("Розыгрышей ещё не было.")
-    lines.append("\nВ группе: /random Приз | победителей | время (напр. 1д)\n"
+    lines.append("\nВ группе: /random Приз, победителей, время (напр. 1д)\n"
                  "Рандом: /random 100 · /random 5 50 · /random пицца, суши, бургер")
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:main")])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
@@ -5563,7 +5633,7 @@ add_help_text = (
 
 def about_text() -> str:
     return (
-        "🤖 Channel Guard Bot v7.3 — защита и оживление групп.\n\n"
+        "🤖 Channel Guard Bot v7.5 — защита и оживление групп.\n\n"
         "Антиспам: стоп-слова (2 списка + глобальный), исключения, ссылки и скрытые ссылки, "
         "спам-домены, антифлуд, медиа-фильтр, проверка имён, чёрные списки, ночной режим, "
         "анти-рейд, анти-снос, капча (в чате и через заявку в ЛС).\n"
@@ -5599,7 +5669,7 @@ HELP_TEXT = (
     "/appeal текст — апелляция владельцам бота\n"
     "/shop — магазин прямо в боте: витрина, корзина, оплата по реквизитам · /orders — мои заказы\n"
     "/random — рандом: /random 100 · /random 5 50 · /random а, б, в\n"
-    "/random Приз | победителей | 1д — розыгрыш в группе · /gwend · /reroll\n"
+    "/random Приз, победителей, 1д — розыгрыш в группе · /gwend · /reroll\n"
     "/shopchat — в группе менеджеров: присылать сюда заказы магазина\n"
     "/mydata — какие мои данные хранит бот и как их удалить"
 )
@@ -5636,9 +5706,9 @@ _MANAGER_CB = (
     "add:gword", "add:gbid", "add:gbname", "add:invitetext",
     "add:promo_content", "add:promo_btns", "add:bcast", "add:post",
     "sptgl:", "spdel:", "spg:", "tz:", "bk:",
-    "m:shop", "shp:", "dsi:", "add:shopitem", "add:shoptitle", "add:shopnotify", "add:shopabout",
+    "m:shop", "shp:", "add:shopitem", "add:shoptitle", "add:shopnotify", "add:shopabout",
     "sip:", "siq:", "sim:", "sis:", "shi:", "sie:", "sep:", "seq:", "sem:", "sit:", "sid:", "sidy:", "shn:",
-    "spm:", "spr:", "add:shoppay", "add:shoppromo", "add:shopcur",
+    "spr:", "add:shoppromo", "add:shopcur", "spw:", "spc:", "scu:",
     "sof:", "sex:", "sru:", "sqr:", "sbl:", "add:shopquick", "add:shopbl", "add:ordsearch",
 )
 
@@ -5689,6 +5759,9 @@ async def _render_menu(query, context, view: str):
         "m:shop_rules": shop_rules_view(),
         "m:shop_quick": shop_quick_view(),
         "m:shop_bl": shop_bl_view(),
+        "m:shop_items": shop_items_view(),
+        "m:shop_front": shop_front_view(),
+        "m:shop_cur": shop_cur_view(),
         "m:sec": sec_view(),
         "m:gw": gw_view(tgt, label),
     }
@@ -5819,9 +5892,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "add:wword": ("wword", "Пришли исключения (белый список) через запятую. (или /cancel)"),
         "add:link": ("link", "Пришли спам-домены через запятую, например: casino-x.com, spam.ru (или /cancel)"),
         "add:trigger": ("trigger", "Формат: ключ - ответ\nНесколько ключей: цена,прайс - смотри закреп\n"
-                                   "Работает {рандомизация|вариантов}. (или /cancel)"),
+                                   "Работает {рандомизация, вариантов}. (или /cancel)"),
         "add:chphrase": ("chphrase", "Пришли шутки для болталки — по одной на строку.\n"
-                                     "Работает {рандомизация|вариантов}. (или /cancel)"),
+                                     "Работает {рандомизация, вариантов}. (или /cancel)"),
         "add:chreply": ("chreply", "Пришли ответы на обращения к боту — по одной на строку. (или /cancel)"),
         "add:gopword": ("gopword", "Пришли слова-триггеры гоп-режима через запятую — на них бот "
                                    "ответит по-пацански даже без обращения.\n"
@@ -5834,8 +5907,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "add:welcome_btns": ("welcome_btns", "Кнопки приветствия: «Текст - https://ссылка», по строке на ряд; "
                                              "несколько в ряд — через «;». «-» — убрать кнопки. (или /cancel)"),
         "add:rules": ("rules", "Пришли новый текст правил. (или /cancel)"),
-        "add:recurring": ("recurring", "Формат: интервал_минут | текст\nНапример: 120 | Не забывайте про "
-                                       "правила 🙌\nРаботает {рандомизация|вариантов}. (или /cancel)"),
+        "add:recurring": ("recurring", "Формат: интервал_минут, текст\nНапример: 120, Не забывайте про "
+                                       "правила 🙌\nРаботает {рандомизация, вариантов}. (или /cancel)"),
         "add:rolenew": ("rolenew", "Название новой роли (одно слово, без «:»). (или /cancel)"),
         "add:invitetext": ("invitetext", "Пришли текст «зазывалы» — сообщения с кнопкой "
                                          "«Пригласить друга». (или /cancel)"),
@@ -5846,12 +5919,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "add:gbid": ("gbid", "Пришли ID для глобального чёрного списка через запятую. (или /cancel)"),
         "add:gbname": ("gbname", "Пришли подстроки имени для глобального ЧС через запятую. (или /cancel)"),
         "add:promo_content": ("promo_content", "Пришли контент промо: текст или медиа с подписью "
-                                               "(HTML и {рандомизация|вариантов} работают). (или /cancel)"),
+                                               "(HTML и {рандомизация, вариантов} работают). (или /cancel)"),
         "add:promo_btns": ("promo_btns", "Кнопки промо: «Текст - https://ссылка», по строке на ряд; "
                                          "«-» — убрать. (или /cancel)"),
         "add:bcast": ("bcast", "Пришли пост для рассылки в группы: текст или медиа с подписью, "
                                "потом выберешь группы. (или /cancel)"),
-        "add:shoptitle": ("shoptitle", "Название магазина (видно в шапке витрины). (или /cancel)"),
         "add:post": ("sp_time", "Шаг 1/3. Время поста: ЧЧ:ММ [дни через запятую]\n"
                                 "Например: 09:30 пн,ср,пт — без дней = ежедневно. (или /cancel)"),
     }
@@ -6270,21 +6342,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s["enabled"] = not s.get("enabled")
         save_config(force=True)
         return await _render_menu(query, context, "m:shop")
-    if data == "shp:appr":
-        s = CONFIG.setdefault("shop", {})
-        s["approve"] = not s.get("approve", True)
-        save_config(force=True)
-        await query.answer("🔎 Проверка менеджером включена" if s["approve"]
-                           else "⚡ Товар будет выдаваться сразу после оплаты", show_alert=True)
-        return await _render_menu(query, context, "m:shop")
-    if data.startswith("dsi:"):
-        items = CONFIG.setdefault("shop", {}).setdefault("items", [])
-        i = int(data.split(":", 1)[1])
-        if 0 <= i < len(items):
-            items.pop(i)
-            save_config(force=True)
-        return await _render_menu(query, context, "m:shop")
-
     # ── бэкапы ──
     if data == "bk:full":
         if not is_owner(user.id):
@@ -6342,7 +6399,7 @@ async def cmd_block(update: Update, context):
             bl["names"].append(arg.lower())
             save_config()
         return await reply_tidy(update, context, f"⛔ Подстрока имени «{arg}» в чёрном списке группы.")
-    await update.effective_message.reply_text("Формат: /block (реплай | ID | подстрока имени)")
+    await update.effective_message.reply_text("Формат: /block (реплай, ID или подстрока имени)")
 
 
 async def cmd_unblock(update: Update, context):
@@ -6364,7 +6421,7 @@ async def cmd_unblock(update: Update, context):
         bl["names"].remove(arg.lower())
         save_config()
         return await reply_tidy(update, context, "✅ Подстроку убрал из чёрного списка.")
-    await update.effective_message.reply_text("Не нашёл такого в ЧС. Формат: /unblock ID | подстрока")
+    await update.effective_message.reply_text("Не нашёл такого в ЧС. Формат: /unblock ID или подстрока")
 
 # ───────────────────────────────────────────────────────────────────────────
 #  ЛИЧНЫЕ КОМАНДЫ
@@ -6700,7 +6757,8 @@ _MANAGER_STATES = ("gword", "gbid", "gbname", "invitetext", "promo_content", "pr
                    "bcast", "dmcast", "sp_time", "sp_content", "sp_btns", "mgr",
                    "shoptitle", "si_title", "si_price", "si_desc", "si_photo",
                    "si_mode", "si_deliver", "se", "shopnotify", "shopabout", "si_qty",
-                   "shoppay", "shoppromo", "shopcur", "shopquick", "shopbl", "ordsearch")
+                   "shoppromo", "shopcur", "shopquick", "shopbl", "ordsearch",
+                   "pw_name", "pw_details", "pw_holder", "pw_url", "pw_lim", "pw_note", "pme")
 
 
 async def _state_allowed(update: Update, context) -> bool:
@@ -6801,7 +6859,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["trig_draft"] = {"keys": keys}
         context.user_data["awaiting"] = "trig_content"
         return await msg.reply_text("Шаг 2/3. Пришли контент ответа: текст или медиа с подписью "
-                                    "(HTML и {рандомизация|вариантов} работают).")
+                                    "(HTML и {рандомизация, вариантов} работают).")
     if awaiting == "trig_content":
         content = _capture_post_content(msg)
         if not content:
@@ -6893,9 +6951,9 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await msg.reply_text(f"📜 Правила сохранены ({label})", reply_markup=rules_kb(cfg))
 
     if awaiting == "recurring":
-        m = re.match(r"(\d+)\s*\|\s*(.+)$", text, re.S)
+        m = re.match(r"(\d+)\s*[|,]\s*(.+)$", text, re.S)
         if not m:
-            return await msg.reply_text("Формат: интервал_минут | текст (или /cancel)")
+            return await msg.reply_text("Формат: интервал_минут, текст (или /cancel)")
         cfg.setdefault("recurring", []).append(
             {"interval": max(1, int(m.group(1))), "text": m.group(2).strip(), "enabled": True})
         save_config()
@@ -6954,11 +7012,6 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         done()
         return await msg.reply_text("👔 Служебный чат сохранён.", reply_markup=staff_kb(cfg))
 
-    if awaiting == "shoptitle":
-        CONFIG.setdefault("shop", {})["title"] = text[:40] or "Магазин"
-        save_config(force=True)
-        done()
-        return await msg.reply_text("🛒 Название магазина сохранено.", reply_markup=shop_kb())
 
     if awaiting == "invitetext":
         CONFIG["invite_text"] = text
@@ -7174,7 +7227,7 @@ _MODES = {
 }
 _MODE_HINT = {
     "same": "Пришли текст, который получит КАЖДЫЙ покупатель после подтверждения оплаты: ссылку, "
-            "инструкцию, промокод. Работает {рандомизация|вариантов}.",
+            "инструкцию, промокод. Работает {рандомизация, вариантов}.",
     "random": "Пришли варианты — КАЖДЫЙ С НОВОЙ СТРОКИ. Покупатель получит один случайный "
               "(лутбоксы, рандом-призы, случайные карточки).",
     "codes": "Пришли коды/ключи — КАЖДЫЙ С НОВОЙ СТРОКИ. Каждый продаётся один раз: выдаётся "
@@ -7185,10 +7238,10 @@ _MODE_HINT = {
 _QTY_PRESETS = [("1️⃣ Только 1 шт", 1, 1), ("1–5 шт", 1, 5), ("1–10 шт", 1, 10), ("♾ Без ограничений", 1, 0)]
 _CURRENCIES = ["сум", "₽", "$", "€", "₸", "₴", "Br", "₼"]
 _SHOP_STATES = ("si_title", "si_price", "si_qty", "si_desc", "si_photo", "si_mode", "si_deliver", "se",
-                "shopnotify", "shopabout", "shoppay", "shoppromo", "shopcur", "shopquick", "shopbl",
-                "ordsearch")
+                "shopnotify", "shopabout", "shoptitle", "shoppromo", "shopcur", "shopquick", "shopbl",
+                "ordsearch", "pw_name", "pw_details", "pw_holder", "pw_url", "pw_lim", "pw_note", "pme")
 _SHOP_CB = ("sip:", "siq:", "sim:", "sis:", "shi:", "sie:", "sep:", "seq:", "sem:", "sit:", "sid:", "sidy:",
-            "shn:", "spm:", "spr:", "add:shoppay", "add:shoppromo", "add:shopcur",
+            "shn:", "spr:", "add:shoppromo", "add:shopcur", "add:shoptitle", "spw:", "spc:", "scu:",
             "sof:", "sex:", "sru:", "sqr:", "sbl:", "add:shopquick", "add:shopbl", "add:ordsearch")
 
 
@@ -7528,21 +7581,31 @@ def _pay_url(o) -> str:
 
 
 def _pay_text(o) -> str:
-    """Инструкция по оплате для покупателя (HTML)."""
+    """Инструкция по оплате для покупателя (HTML): что, куда, кому, сколько, как."""
     e = html.escape
     m = o.get("method") or {}
-    det = "\n".join(f"<code>{e(ln)}</code>" for ln in str(m.get("details") or "").splitlines() if ln.strip())
+    det = [ln.strip() for ln in str(m.get("details") or "").splitlines() if ln.strip()]
+    lines = [f"💳 Оплата: <b>{e(str(m.get('name') or 'по реквизитам'))}</b>", ""]
+    if det:
+        lines.append(f"📍 Куда: <code>{e(_fmt_account(det[0]))}</code>")
+        lines += [f"      {e(x)}" for x in det[1:]]
+    if m.get("holder"):
+        lines.append(f"👤 Кому: <b>{e(str(m['holder']))}</b>")
+    lines.append(f"💰 Сколько: <b>{_o_money(o, _o_total(o))}</b>")
+    lines.append(f"📝 Комментарий к платежу: <code>Заказ №{e(str(o.get('id')))}</code>")
+    if m.get("note"):
+        lines.append(f"ℹ️ {e(str(m['note']))}")
     how = []
     if det:
-        how.append("Переведи по реквизитам выше (нажми на номер — он скопируется).")
+        how.append("Нажми на номер — он скопируется.")
     if _pay_url(o):
         how.append("Или нажми «💳 Перейти к оплате» ниже." if det else "Нажми «💳 Перейти к оплате» ниже.")
-    return (f"💳 Оплата: <b>{e(str(m.get('name') or 'по реквизитам'))}</b>\n" + (det + "\n" if det else "") +
-            f"\nСумма: <b>{_o_money(o, _o_total(o))}</b>\n"
-            f"В комментарии к платежу укажи: <code>Заказ №{o['id']}</code>\n\n" +
-            ("\n".join(how) + "\n\n" if how else "") +
-            "📎 После оплаты просто пришли сюда скриншот или файл чека — менеджер проверит "
-            "и бот сразу выдаст заказ.")
+    lines.append("")
+    if how:
+        lines.append(" ".join(how))
+    lines.append("📎 После оплаты просто пришли сюда скриншот или файл чека — менеджер проверит "
+                 "и бот сразу выдаст заказ.")
+    return "\n".join(lines)
 
 
 def _is_public(cid) -> bool:
@@ -8438,7 +8501,7 @@ def _item_card(it: dict):
         rows.append([_B("📦 Остаток на складе", f"sie:stock:{iid}")])
     rows.append([_B("🙈 Скрыть" if it.get("enabled", True) else "👁 Показать", f"sit:{iid}"),
                  _B("🗑 Удалить", f"sid:{iid}")])
-    rows.append([_B("⬅️ К товарам", "m:shop")])
+    rows.append([_B("⬅️ К товарам", "m:shop_items")])
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -8466,39 +8529,426 @@ def shop_notify_view():
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
+_PAY_PRESETS = {"card": ["Uzcard", "Humo", "Visa", "Mastercard", "Сбербанк", "Тинькофф", "Kaspi", "Перевод по телефону"],
+                "link": ["Click", "Payme", "Uzum", "ЮMoney", "PayPal", "Оплата картой онлайн"]}
+_PW_SEQ = {"card": ["name", "details", "holder", "lim", "note"], "link": ["name", "url", "lim", "note"]}
+_PW_TITLE = {"name": "Что", "details": "Куда", "holder": "Кому", "url": "Куда (ссылка)", "lim": "Сколько",
+             "note": "Как"}
+_PW_PROMPT = {
+    "name": "Как назовём способ оплаты? Выбери или пришли своё название.",
+    "details": "Куда платить? Пришли номер карты, счёта или телефона.\n"
+               "Можно в несколько строк — например, номер и банк. Покупатель скопирует номер одним нажатием.",
+    "holder": "Кому? Получатель — как его увидит покупатель в банке при переводе (например «Иван И.»).",
+    "url": "Ссылка на оплату (Click, Payme, банк…). Покупатель получит кнопку «💳 Перейти к оплате».\n"
+           "В ссылке можно писать {sum} — подставлю сумму заказа, {order} — номер заказа.\n"
+           "Например: https://my.click.uz/services/pay?service_id=123&amount={sum}",
+    "lim": "Сколько? Для заказов на какую сумму показывать этот способ.\n"
+           "Например: «от 10000», «до 5000000» или «10000-5000000». Обычно ограничение не нужно.",
+    "note": "Как платить? Короткая подсказка покупателю (необязательно).\n"
+            "Например: «Переводите точную сумму» или «После перевода пришлите скрин».",
+}
+
+
+def _pay_methods() -> list:
+    """Способы оплаты (с доведением старых записей до нового формата)."""
+    lst = _shop().setdefault("pay_methods", [])
+    for m in lst:
+        if not m.get("id"):
+            m["id"] = f"m{random.randrange(10 ** 8):08d}"
+        m.setdefault("type", "link" if m.get("url") and not m.get("details") else "card")
+        m.setdefault("on", True)
+    return lst
+
+
+def _pm_find(mid):
+    return next((m for m in _pay_methods() if m.get("id") == mid), None)
+
+
+def _fmt_account(s: str) -> str:
+    """Номер карты группами по 4: 8600123456789012 → 8600 1234 5678 9012."""
+    s = str(s or "").strip()
+    d = re.sub(r"\D", "", s)
+    if 12 <= len(d) <= 19 and re.fullmatch(r"[\d\s\-]+", s):
+        return " ".join(d[i:i + 4] for i in range(0, len(d), 4))
+    return s
+
+
+def _lim_txt(m) -> str:
+    mn, mx = _num(m.get("min")), _num(m.get("max"))
+    if mn and mx:
+        return f"{_money(mn)} – {_money(mx)}"
+    if mn:
+        return f"от {_money(mn)}"
+    if mx:
+        return f"до {_money(mx)}"
+    return ""
+
+
+def _parse_lim(text: str):
+    t = (text or "").lower().replace(" ", "")
+    nums = [_num(x.replace(",", ".")) for x in re.findall(r"\d+(?:[.,]\d+)?", t)]
+    if not nums:
+        return None
+    if len(nums) >= 2:
+        a, b = sorted(nums[:2])
+        return a, b
+    return (0, nums[0]) if "до" in t else (nums[0], 0)
+
+
+def _method_line(m) -> str:
+    bits = [("🟢 " if m.get("on", True) else "🔴 ") + ("🔗 " if m.get("type") == "link" else "💳 ") + str(m.get("name"))]
+    d = re.sub(r"\D", "", str(m.get("details") or "").split("\n")[0])
+    if d:
+        bits.append(f"•••• {d[-4:]}" if len(d) >= 8 else str(m["details"])[:16])
+    if m.get("holder"):
+        bits.append(str(m["holder"])[:18])
+    if m.get("url"):
+        bits.append("ссылка")
+    if _lim_txt(m):
+        bits.append(_lim_txt(m))
+    return " · ".join(bits)
+
+
+def _pay_example_total():
+    prices = [_item_price(i) for i in _shop_items() if isinstance(i, dict) and _item_price(i) > 0]
+    return prices[0] if prices else 100000
+
+
+def _pay_preview(m, total=None):
+    """(HTML-текст, ссылка) — как покупатель увидит оплату этим способом."""
+    fake = {"id": "123", "total": total or _pay_example_total(), "cur": _cur(), "method": dict(m)}
+    return _pay_text(fake), _pay_url(fake)
+
+
 def shop_pay_view():
     s = _shop()
-    cur = _cur()
-    methods = s.get("pay_methods") or []
+    ms = _pay_methods()
     h = int(s.get("expire_h", 24) or 24)
-    lines = ["💳 Оплата и валюта", "",
-             f"Валюта витрины: {cur}",
-             f"Способов оплаты: {len(methods)}"]
-    lines += [f"• {m.get('name')}" + (" · 💳 реквизиты" if m.get("details") else "") +
-              (" · 🔗 кнопка оплаты" if m.get("url") else "") for m in methods]
-    lines += [f"🤝 Оплата при получении / по договорённости: {'вкл' if s.get('cod') else 'выкл'}",
-              f"⌛ Неоплаченный заказ отменяется через {h} ч (за час до этого покупателю — напоминание).",
+    lines = ["💳 Оплата", "", f"💱 Валюта: {_cur()}"]
+    if ms:
+        lines += ["", "Способы оплаты (нажми, чтобы изменить):"] + [f"{i + 1}. {_method_line(m)}" for i, m in enumerate(ms)]
+    else:
+        lines += ["", "⚠️ Пока нет ни одного способа оплаты — добавь первый 👇"]
+    lines += ["",
+              f"🤝 Оплата при получении / по договорённости: {'вкл' if s.get('cod') else 'выкл'}",
+              f"⌛ На оплату даётся {h} ч — потом заказ отменяется, бронь снимается.",
               "",
-              "Как это работает: покупатель выбирает способ оплаты, видит твои реквизиты и сумму, "
-              "переводит деньги и присылает чек. Тебе приходит карточка с чеком — "
-              "нажимаешь «✅ Оплата подтверждена», и бот сразу выдаёт товар.",
-              "Реквизиты покупатель копирует одним нажатием, ссылка превращается в кнопку "
-              "«💳 Перейти к оплате». Чек клиент просто присылает боту — скрином или файлом."]
-    rows, row = [], []
-    for i, c in enumerate(_CURRENCIES):
-        row.append(_B(("✅ " if c == cur else "") + c, f"spm:cur:{i}"))
-        if len(row) == 4:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([_B("✏️ Своя валюта", "add:shopcur")])
-    rows.append([_B("➕ Способ оплаты", "add:shoppay")])
-    for i, m in enumerate(methods[:15]):
-        rows.append([_B(f"❌ {str(m.get('name'))[:40]}", f"spm:del:{i}")])
-    rows.append([_B(f"{onoff(s.get('cod'))} Оплата при получении", "spm:cod"), _B(f"⌛ {h} ч", "spm:exp")])
+              "Покупатель выбирает способ → видит, куда, кому и сколько платить → переводит → "
+              "присылает боту чек → ты подтверждаешь → бот выдаёт товар.",
+              "🖼 Для оплаты картой бот присылает картинку банковской карты с твоими реквизитами, "
+              "суммой и номером заказа." if Image else
+              "🖼 Картинка банковской карты недоступна: на сервере нет Pillow (pip install pillow)."]
+    rows = [[_B("➕ Добавить способ оплаты", "spw:new")]]
+    rows += [[_B(_method_line(m)[:60], f"spc:v:{m['id']}")] for m in ms[:12]]
+    rows.append([_B(f"💱 Валюта: {_cur()}", "m:shop_cur"),
+                 _B(f"{onoff(s.get('cod'))} При получении", "spc:cod")])
+    rows.append([_B(f"⌛ На оплату: {h} ч", "spc:exp"), _B("👁 Как видит покупатель", "spc:prev")])
+    rows.append([_B((f"{onoff(s.get('card_img', True))} 🖼 Картинка банковской карты") if Image
+                    else "🖼 Картинка карты — нужен Pillow", "spc:img")])
     rows.append([_B("⬅️ В магазин", "m:shop")])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _pm_card(m):
+    link = m.get("type") == "link"
+    lines = [f"{'🔗' if link else '💳'} Способ оплаты: {m.get('name')}",
+             f"Статус: {'🟢 включён' if m.get('on', True) else '🔴 выключен — покупатели его не видят'}", "",
+             f"Что: {m.get('name')}",
+             f"Куда: {_fmt_account(str(m.get('details') or '').split(chr(10))[0]) or '—'}",
+             f"Кому: {m.get('holder') or '—'}",
+             f"Ссылка: {m.get('url') or '—'}",
+             f"Сколько: {_lim_txt(m) or 'любая сумма'}",
+             f"Как: {m.get('note') or '—'}"]
+    mid = m["id"]
+    rows = [[_B("✏️ Что (название)", f"spc:e:name:{mid}"), _B("✏️ Куда (реквизиты)", f"spc:e:details:{mid}")],
+            [_B("✏️ Кому", f"spc:e:holder:{mid}"), _B("✏️ Ссылка", f"spc:e:url:{mid}")],
+            [_B("✏️ Сколько (лимит)", f"spc:e:lim:{mid}"), _B("✏️ Как (подсказка)", f"spc:e:note:{mid}")],
+            [_B("🔴 Выключить" if m.get("on", True) else "🟢 Включить", f"spc:t:{mid}"),
+             _B("👁 Как видит покупатель", f"spc:pv:{mid}")],
+            [_B("🗑 Удалить", f"spc:d:{mid}")],
+            [_B("⬅️ К оплате", "m:shop_pay")]]
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _pw_kb(step: str, typ: str = "card"):
+    rows = []
+    if step == "name":
+        pr = _PAY_PRESETS.get(typ, [])
+        rows += [[_B(n, f"spw:name:{i}") for i, n in enumerate(pr) if i // 2 == r] for r in range((len(pr) + 1) // 2)]
+    if step in ("holder", "lim", "note"):
+        rows.append([_B("♾ Любая сумма" if step == "lim" else "⏭ Пропустить", "spw:skip")])
+    rows.append([_B("❌ Отмена", "spw:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _pw_next(send, context):
+    """Показать следующий шаг мастера способа оплаты или предпросмотр."""
+    pw = context.user_data.setdefault("pw", {})
+    seq = _PW_SEQ[pw.get("type", "card")]
+    i = int(pw.get("i", 0))
+    if i >= len(seq):
+        context.user_data.pop("awaiting", None)
+        text, url = _pay_preview(pw)
+        rows = [[InlineKeyboardButton("💳 Перейти к оплате", url=url)]] if url else []
+        rows += [[_B("✅ Сохранить", "spw:save")], [_B("✏️ Заново", "spw:new"), _B("❌ Отмена", "spw:cancel")]]
+        img = _card_image(pw, _pay_example_total(), "123", _cur()) \
+            if pw.get("type") != "link" and _shop().get("card_img", True) else None
+        if img and context.user_data.get("pw_chat"):
+            try:
+                await context.bot.send_photo(context.user_data["pw_chat"], img,
+                                             caption="🖼 Такую карточку покупатель получит вместе с реквизитами 👇")
+            except Exception as e:  # noqa: BLE001
+                log.debug("card preview: %s", e)
+        return await send("👁 <b>Так покупатель увидит оплату</b> (пример на сумму "
+                          f"{html.escape(_money(_pay_example_total()))}):\n\n" + text,
+                          InlineKeyboardMarkup(rows), True)
+    step = seq[i]
+    context.user_data["awaiting"] = "pw_" + step
+    return await send(f"➕ Способ оплаты · шаг {i + 2} из {len(seq) + 1} · {_PW_TITLE[step]}\n\n{_PW_PROMPT[step]}",
+                      _pw_kb(step, pw.get("type", "card")), False)
+
+
+def _pw_apply(pw_or_m: dict, step: str, text: str):
+    """Проверить и записать значение шага. Возвращает текст ошибки или None."""
+    t = (text or "").strip()
+    if step == "name":
+        if not t:
+            return "Пришли название текстом"
+        pw_or_m["name"] = t[:40]
+    elif step == "details":
+        if t in ("-", "—"):
+            pw_or_m["details"] = ""
+        elif len(t) < 4:
+            return "Пришли номер карты, счёта или телефона"
+        else:
+            first, *rest = t.split("\n")
+            pw_or_m["details"] = "\n".join([_fmt_account(first)] + rest)[:500]
+    elif step == "holder":
+        pw_or_m["holder"] = "" if t in ("-", "—") else t[:60]
+    elif step == "url":
+        if t in ("-", "—"):
+            pw_or_m["url"] = ""
+        elif not re.match(r"^(https?://|tg://)\S+$", t):
+            return "Это не похоже на ссылку — она должна начинаться с https://"
+        else:
+            pw_or_m["url"] = t[:500]
+    elif step == "lim":
+        if t in ("-", "—") or "любая" in t.lower():
+            pw_or_m["min"], pw_or_m["max"] = 0, 0
+        else:
+            v = _parse_lim(t)
+            if v is None:
+                return "Пришли сумму, например «от 10000» или «10000-5000000»"
+            pw_or_m["min"], pw_or_m["max"] = v
+    elif step == "note":
+        pw_or_m["note"] = "" if t in ("-", "—") else t[:200]
+    if "type" in pw_or_m and pw_or_m.get("url") and not pw_or_m.get("details"):
+        pw_or_m["type"] = "link"
+    elif "type" in pw_or_m and pw_or_m.get("details"):
+        pw_or_m["type"] = "card"
+    return None
+
+
+async def _pay_callback(query, context, data):
+    """Кнопки раздела «💳 Оплата»: мастер (spw:), карточка способа (spc:), валюта (scu:)."""
+    ud = context.user_data
+    s = _shop()
+
+    async def send(t, kb=None, html_mode=False):
+        try:
+            await query.edit_message_text(t, reply_markup=kb, parse_mode="HTML" if html_mode else None,
+                                          disable_web_page_preview=True)
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                log.debug("pay edit: %s", e)
+
+    async def ans(t=None, alert=False):
+        try:
+            await query.answer(t, show_alert=alert)
+        except Exception:  # noqa: BLE001
+            pass
+
+    if data.startswith("scu:"):
+        i = int(data[4:])
+        if 0 <= i < len(_CURRENCIES):
+            s["currency"] = _CURRENCIES[i]
+            save_config(force=True)
+        t, kb = shop_pay_view()
+        await send(t, kb)
+        return await ans(f"💱 Валюта: {_cur()}")
+    if data == "spw:new":
+        ud["pw"] = {}
+        ud["pw_chat"] = query.message.chat.id if query.message else None
+        ud.pop("awaiting", None)
+        await send("➕ Способ оплаты · шаг 1 · Как покупатель будет платить?",
+                   InlineKeyboardMarkup([[_B("💳 Переводом по реквизитам (карта, счёт, телефон)", "spw:type:card")],
+                                         [_B("🔗 По ссылке (Click, Payme, банк…)", "spw:type:link")],
+                                         [_B(f"🤝 При получении — сейчас {'вкл' if s.get('cod') else 'выкл'}",
+                                             "spc:cod")],
+                                         [_B("❌ Отмена", "spw:cancel")]]))
+        return await ans()
+    if data.startswith("spw:type:"):
+        ud["pw"] = {"type": data[9:], "i": 0}
+        await _pw_next(send, context)
+        return await ans()
+    if data.startswith("spw:name:"):
+        pw = ud.get("pw")
+        if not pw:
+            return await ans("Мастер устарел — начни заново", True)
+        pr = _PAY_PRESETS.get(pw.get("type", "card"), [])
+        i = int(data[9:])
+        if 0 <= i < len(pr):
+            pw["name"] = pr[i]
+            pw["i"] = int(pw.get("i", 0)) + 1
+        await _pw_next(send, context)
+        return await ans()
+    if data == "spw:skip":
+        pw = ud.get("pw")
+        if not pw:
+            return await ans("Мастер устарел — начни заново", True)
+        step = _PW_SEQ[pw.get("type", "card")][int(pw.get("i", 0))]
+        _pw_apply(pw, step, "-")
+        pw["i"] = int(pw.get("i", 0)) + 1
+        await _pw_next(send, context)
+        return await ans()
+    if data == "spw:save":
+        pw = ud.pop("pw", None)
+        ud.pop("awaiting", None)
+        if not pw or not pw.get("name"):
+            return await ans("Нечего сохранять — начни заново", True)
+        m = {"id": f"m{random.randrange(10 ** 8):08d}", "type": pw.get("type", "card"), "name": pw["name"],
+             "details": pw.get("details", ""), "holder": pw.get("holder", ""), "url": pw.get("url", ""),
+             "min": pw.get("min", 0), "max": pw.get("max", 0), "note": pw.get("note", ""), "on": True}
+        _pay_methods().append(m)
+        save_config(force=True)
+        await _audit(context, query.from_user, "добавил способ оплаты", m["name"], alert=True)
+        t, kb = _pm_card(m)
+        await send("✅ Способ оплаты добавлен и уже виден покупателям.\n\n" + t, kb)
+        return await ans("Сохранено")
+    if data == "spw:cancel":
+        ud.pop("pw", None)
+        ud.pop("awaiting", None)
+        t, kb = shop_pay_view()
+        await send(t, kb)
+        return await ans()
+    if data == "spc:cod":
+        s["cod"] = not s.get("cod")
+        save_config(force=True)
+        t, kb = shop_pay_view()
+        await send(t, kb)
+        return await ans("🤝 Оплата при получении " + ("включена" if s["cod"] else "выключена"))
+    if data == "spc:img":
+        if Image is None:
+            return await ans("Для картинки нужен Pillow: pip install pillow — и перезапусти бота", True)
+        s["card_img"] = not s.get("card_img", True)
+        save_config(force=True)
+        t, kb = shop_pay_view()
+        await send(t, kb)
+        return await ans("🖼 Картинка карты " + ("включена" if s["card_img"] else "выключена"))
+    if data == "spc:exp":
+        s["expire_h"] = _cycle([6, 12, 24, 48, 72], int(s.get("expire_h", 24) or 24))
+        save_config(force=True)
+        t, kb = shop_pay_view()
+        await send(t, kb)
+        return await ans()
+    if data == "spc:prev":
+        on = [m for m in _pay_methods() if m.get("on", True)]
+        if not on:
+            return await ans("Нет включённых способов оплаты", True)
+        total = _pay_example_total()
+        parts = [f"👁 <b>Так покупатель увидит оплату</b> (пример на сумму {html.escape(_money(total))}).\n"
+                 f"Способы на выбор: {html.escape(', '.join(m['name'] for m in on))}"
+                 + (", при получении" if s.get("cod") else "")]
+        for m in on[:4]:
+            parts.append("━━━━━━━━\n" + _pay_preview(m, total)[0])
+        await send("\n\n".join(parts)[:4000], InlineKeyboardMarkup([[_B("⬅️ К оплате", "m:shop_pay")]]), True)
+        return await ans()
+    # ── карточка способа: spc:<act>:[поле:]<id> ──
+    parts = data.split(":")
+    act = parts[1] if len(parts) > 1 else ""
+    mid = parts[-1]
+    m = _pm_find(mid)
+    if not m:
+        t, kb = shop_pay_view()
+        await send(t, kb)
+        return await ans("Способ не найден", True)
+    if act == "t":
+        m["on"] = not m.get("on", True)
+        save_config(force=True)
+    elif act == "d":
+        await send(f"🗑 Удалить способ оплаты «{m.get('name')}»? Уже оформленные заказы сохранят свои реквизиты.",
+                   InlineKeyboardMarkup([[_B("Да, удалить", f"spc:dy:{mid}"), _B("Нет", f"spc:v:{mid}")]]))
+        return await ans()
+    elif act == "dy":
+        _pay_methods().remove(m)
+        save_config(force=True)
+        await _audit(context, query.from_user, "удалил способ оплаты", m.get("name", ""), alert=True)
+        t, kb = shop_pay_view()
+        await send(t, kb)
+        return await ans("Удалено")
+    elif act == "pv":
+        text, url = _pay_preview(m)
+        rows = [[InlineKeyboardButton("💳 Перейти к оплате", url=url)]] if url else []
+        rows.append([_B("⬅️ К способу", f"spc:v:{mid}")])
+        await send(f"👁 <b>Так покупатель увидит оплату</b> (пример на сумму "
+                   f"{html.escape(_money(_pay_example_total()))}):\n\n" + text, InlineKeyboardMarkup(rows), True)
+        img = _card_image(m, _pay_example_total(), "123", _cur()) \
+            if m.get("type") != "link" and s.get("card_img", True) else None
+        if img and query.message:
+            try:
+                await context.bot.send_photo(query.message.chat.id, img,
+                                             caption="🖼 Эту картинку покупатель получит вместе с реквизитами")
+            except Exception as e:  # noqa: BLE001
+                log.debug("card preview: %s", e)
+        return await ans()
+    elif act == "e":
+        field = parts[2] if len(parts) > 3 else "name"
+        ud["awaiting"] = "pme"
+        ud["pm_edit"] = {"id": mid, "field": field}
+        await send(f"✏️ {_PW_TITLE.get(field, field)} — «{m.get('name')}»\n\n{_PW_PROMPT[field]}"
+                   + ("" if field == "name" else "\n\n«-» — очистить."),
+                   InlineKeyboardMarkup([[_B("⬅️ Назад", f"spc:v:{mid}")]]))
+        return await ans()
+    t, kb = _pm_card(m)
+    await send(t, kb)
+    return await ans()
+
+
+async def _pay_text_input(update, context, awaiting, text, msg):
+    """Ввод текста в мастере и редакторе способов оплаты."""
+    ud = context.user_data
+
+    async def send(t, kb=None, html_mode=False):
+        await msg.reply_text(t, reply_markup=kb, parse_mode="HTML" if html_mode else None,
+                             disable_web_page_preview=True)
+
+    if awaiting == "pme":
+        pe = ud.get("pm_edit") or {}
+        m = _pm_find(pe.get("id"))
+        if not m:
+            ud.pop("awaiting", None)
+            return await send("Способ оплаты не найден.")
+        err = _pw_apply(m, pe.get("field", "name"), text)
+        if err:
+            return await send(err + " (или /cancel)")
+        if not m.get("details") and not m.get("url"):
+            return await send("У способа должны остаться реквизиты или ссылка — иначе покупателю некуда платить.")
+        ud.pop("awaiting", None)
+        ud.pop("pm_edit", None)
+        save_config(force=True)
+        await _audit(context, update.effective_user, "изменил способ оплаты", f"{m.get('name')}: {pe.get('field')}")
+        t, kb = _pm_card(m)
+        return await send("✅ Сохранено\n\n" + t, kb)
+    pw = ud.get("pw")
+    if not pw:
+        ud.pop("awaiting", None)
+        return await send("Мастер устарел — начни заново: /panel → 🛒 Магазин → 💳 Оплата.")
+    step = awaiting[3:]
+    err = _pw_apply(pw, step, text)
+    if err:
+        return await send(err + " (или /cancel)")
+    pw["i"] = int(pw.get("i", 0)) + 1
+    return await _pw_next(send, context)
 
 
 def shop_promo_view():
@@ -8614,6 +9064,13 @@ async def _shop_callback(query, context, data):
             pass
 
     s = _shop()
+    if data.startswith(("spw:", "spc:", "scu:")):
+        return await _pay_callback(query, context, data)
+    if data == "add:shoptitle":
+        ud["awaiting"] = "shoptitle"
+        await edit("✏️ Название магазина — видно в шапке витрины.\n\nСейчас: " + (s.get("title") or "Магазин"),
+                   _cancel_kb("m:shop_front"))
+        return await ans()
     if data.startswith("sof:"):
         t, kb = shop_orders_view(data[4:])
         await edit(t, kb)
@@ -8685,55 +9142,23 @@ async def _shop_callback(query, context, data):
         ud["awaiting"] = "shopabout"
         await edit("📝 Приветствие витрины — покупатель видит его, открыв /shop.\n"
                    "Например: «Привет! Здесь реклама, ключи и консультации. Доставка по городу — бесплатно»\n"
-                   "«-» — без приветствия.\n\nСейчас: " + (s.get("about") or "—"), _cancel_kb("m:shop"))
+                   "«-» — без приветствия.\n\nСейчас: " + (s.get("about") or "—"), _cancel_kb("m:shop_front"))
         return await ans()
     if data == "add:shopnotify":
         ud.pop("awaiting", None)
         t, kb = shop_notify_view()
         await edit(t, kb)
         return await ans()
-    if data == "add:shoppay":
-        ud["awaiting"] = "shoppay"
-        await edit("➕ Способ оплаты: «Название | реквизиты | ссылка»\n"
-                   "Нужно хотя бы что-то одно: реквизиты или ссылка.\n\n"
-                   "Реквизиты — клиент скопирует их одним нажатием:\n"
-                   "Карта Uzcard | 8600 1234 5678 9012 (Иван И.)\n\n"
-                   "Ссылка — клиент получит кнопку «💳 Перейти к оплате»:\n"
-                   "Click | https://my.click.uz/services/pay?service_id=123&amount={sum}\n\n"
-                   "И то и другое:\n"
-                   "Payme | +998 90 123 45 67 | https://payme.uz/…\n\n"
-                   "В ссылке можно писать {sum} — подставлю сумму заказа, и {order} — номер заказа.",
-                   _cancel_kb("m:shop_pay"))
-        return await ans()
     if data == "add:shopcur":
         ud["awaiting"] = "shopcur"
         await edit("✏️ Пришли обозначение валюты (до 6 символов), например: сум, руб, USDT.",
-                   _cancel_kb("m:shop_pay"))
+                   _cancel_kb("m:shop_cur"))
         return await ans()
     if data == "add:shoppromo":
         ud["awaiting"] = "shoppromo"
         await edit("🎟 Новый промокод: «КОД скидка% [лимит]»\n\n"
                    "Например:\nSALE10 10 — скидка 10%, без лимита\nVIP 25 50 — скидка 25%, первые 50 заказов",
                    _cancel_kb("m:shop_promo"))
-        return await ans()
-    if data.startswith("spm:"):
-        sub = data[4:]
-        if sub.startswith("cur:"):
-            i = int(sub[4:])
-            if 0 <= i < len(_CURRENCIES):
-                s["currency"] = _CURRENCIES[i]
-        elif sub.startswith("del:"):
-            lst = s.setdefault("pay_methods", [])
-            i = int(sub[4:])
-            if 0 <= i < len(lst):
-                lst.pop(i)
-        elif sub == "cod":
-            s["cod"] = not s.get("cod")
-        elif sub == "exp":
-            s["expire_h"] = _cycle([6, 12, 24, 48, 72], int(s.get("expire_h", 24) or 24))
-        save_config(force=True)
-        t, kb = shop_pay_view()
-        await edit(t, kb)
         return await ans()
     if data.startswith("spr:del:"):
         promos = s.setdefault("promos", {})
@@ -8824,13 +9249,13 @@ async def _shop_callback(query, context, data):
         t, kb = _item_card(it)
         warn = "" if s.get("enabled") else "\n⚠️ Магазин сейчас закрыт — открой его в разделе 🛒."
         if it["price"] and not (s.get("pay_methods") or s.get("cod")):
-            warn += "\n⚠️ Добавь способ оплаты: 🛒 Магазин → 💳 Оплата и валюта."
+            warn += "\n⚠️ Добавь способ оплаты: 🛒 Магазин → 💳 Оплата."
         await edit("✅ Товар добавлен в витрину!" + warn + "\n\n" + t, kb)
         return await ans("Сохранено")
     if data == "sis:cancel":
         for k in ("shop_draft", "awaiting", "shop_edit"):
             ud.pop(k, None)
-        return await _render_menu(query, context, "m:shop")
+        return await _render_menu(query, context, "m:shop_items")
 
     pref, _, rest = data.partition(":")
     val = ""
@@ -8843,7 +9268,7 @@ async def _shop_callback(query, context, data):
     it = _item_by_id(iid)
     if not it:
         await ans("Товар не найден", True)
-        return await _render_menu(query, context, "m:shop")
+        return await _render_menu(query, context, "m:shop_items")
 
     if pref == "shi":
         ud.pop("awaiting", None)
@@ -8859,7 +9284,7 @@ async def _shop_callback(query, context, data):
         _shop().setdefault("items", []).remove(it)
         save_config(force=True)
         await ans("Удалено")
-        return await _render_menu(query, context, "m:shop")
+        return await _render_menu(query, context, "m:shop_items")
     elif pref == "sep":
         it["price"] = _num(val)
         it.pop("stars", None)
@@ -8953,20 +9378,16 @@ async def _shop_text(update, context, awaiting, text, msg):
         s["about"] = "" if text.strip() in ("-", "—") else text[:600]
         save_config(force=True)
         ud.pop("awaiting", None)
-        return await send("📝 Приветствие витрины сохранено.", reply_markup=shop_kb())
-    if awaiting == "shoppay":
-        parts = [p.strip() for p in text.split("|")]
-        name = parts[0] if parts else ""
-        url = next((p for p in parts[1:] if re.match(r"^(https?://|tg://)\S+$", p)), "")
-        det = next((p for p in parts[1:] if p and p != url), "")
-        if not name or not (det or url):
-            return await send("Формат: Название | реквизиты | ссылка (реквизиты или ссылка — хотя бы одно). "
-                              "Или /cancel")
-        s.setdefault("pay_methods", []).append({"name": name[:40], "details": det[:500], "url": url[:500]})
+        t, kb = shop_front_view()
+        return await send("📝 Приветствие сохранено.\n\n" + t, reply_markup=kb)
+    if awaiting.startswith("pw_") or awaiting == "pme":
+        return await _pay_text_input(update, context, awaiting, text, msg)
+    if awaiting == "shoptitle":
+        s["title"] = text.strip()[:40] or "Магазин"
         save_config(force=True)
         ud.pop("awaiting", None)
-        t, kb = shop_pay_view()
-        return await send("✅ Способ оплаты добавлен.\n\n" + t, reply_markup=kb)
+        t, kb = shop_front_view()
+        return await send("✅ Название сохранено.\n\n" + t, reply_markup=kb)
     if awaiting == "shopcur":
         cur = text.strip()[:6]
         if not cur:
@@ -8977,7 +9398,7 @@ async def _shop_text(update, context, awaiting, text, msg):
         t, kb = shop_pay_view()
         return await send("✅ Валюта сохранена.\n\n" + t, reply_markup=kb)
     if awaiting == "shoppromo":
-        m = re.match(r"\s*([A-Za-zА-Яа-яЁё0-9_\-]{2,20})\s+(\d{1,2})\s*%?\s*(\d+)?\s*$", text)
+        m = re.match(r"\s*([A-Za-zА-Яа-яЁё0-9_\-]{2,20})[\s,]+(\d{1,2})\s*%?(?:[\s,]+(\d+))?\s*$", text)
         if not m or not (1 <= int(m.group(2)) <= 95):
             return await send("Формат: КОД скидка% [лимит], например SALE10 10 или VIP 25 50 (скидка 1–95%)")
         code = m.group(1).upper()
@@ -9025,7 +9446,7 @@ async def _shop_text(update, context, awaiting, text, msg):
         ud["awaiting"] = "si_price"
         return await send(f"🛍 {d['title']}\n\nШаг 2/6 · Цена за 1 шт в {_cur()}\n"
                           "Пришли число, например 15000. «Бесплатно» — покупатель оставляет заявку.\n"
-                          "Валюта меняется в 🛒 Магазин → 💳 Оплата и валюта.",
+                          "Валюта меняется в 🛒 Магазин → 💳 Оплата → 💱 Валюта.",
                           reply_markup=_price_kb(lambda n: f"sip:{n}"))
     if awaiting == "si_price":
         n = _parse_price(text)
@@ -9382,10 +9803,18 @@ def _mk_questions(lines) -> list:
     return [f"• {ln['title']}: {ln['ask']}" for ln in lines if ln.get("ask")]
 
 
-def _mk_pay_options():
-    """Варианты оплаты: [(ключ, название)]; ключ — индекс реквизитов или 'cod'."""
+def _mk_pay_options(total=0):
+    """Способы оплаты для заказа на сумму total: [(id, подпись)] + «при получении»."""
     s = _shop()
-    opts = [(str(i), m.get("name", "")) for i, m in enumerate(s.get("pay_methods") or [])]
+    opts = []
+    for m in _pay_methods():
+        if not m.get("on", True):
+            continue
+        if _num(m.get("min")) and total < _num(m["min"]):
+            continue
+        if _num(m.get("max")) and total > _num(m["max"]):
+            continue
+        opts.append((m["id"], ("🔗 " if m.get("type") == "link" else "💳 ") + str(m.get("name", ""))))
     if s.get("cod") or not opts:
         opts.append(("cod", "🤝 При получении / по договорённости"))
     return opts
@@ -9411,7 +9840,9 @@ def _mk_co_view(uid):
     if co.get("src") == "buy" and len(lines) == 1:
         rows.append([_B("➖", "mk:cqd"), _B(f"{lines[0]['qty']} шт", "mk:noop"), _B("➕", "mk:cqi")])
     if total:
-        opts = _mk_pay_options()
+        opts = _mk_pay_options(total)
+        if co.get("pm") not in dict(opts):
+            co.pop("pm", None)
         if len(opts) == 1:
             co["pm"] = opts[0][0]
         sel = dict(opts).get(co.get("pm", ""), "")
@@ -9518,15 +9949,15 @@ async def _mk_checkout(bot, q, uid):
     sub, disc, total, code = _mk_sums(lines, co.get("promo", ""))
     method = None
     if total:
-        opts = dict(_mk_pay_options())
+        opts = dict(_mk_pay_options(total))
         pm = co.get("pm")
         if pm not in opts:
             return "Выбери способ оплаты", None
         if pm == "cod":
             method = {"cod": True, "name": "При получении / по договорённости"}
         else:
-            m = (_shop().get("pay_methods") or [])[int(pm)]
-            method = {"name": m.get("name"), "details": m.get("details"), "url": m.get("url", "")}
+            m = _pm_find(pm) or {}
+            method = {k: m.get(k, "") for k in ("type", "name", "details", "holder", "url", "note")}
     lim = int(_shop().get("max_unpaid", 2) or 0)
     if lim and sum(1 for x in CONFIG.get("shop_orders") or []
                    if str(x.get("uid")) == str(uid) and x.get("status") in _WAIT_ST) >= lim:
@@ -9568,7 +9999,8 @@ async def _mk_checkout(bot, q, uid):
                 ("Оплата — при получении / по договорённости. " if total else "") +
                 "Менеджер подтвердит заказ и свяжется с тобой.")
         kb = InlineKeyboardMarkup([[_B("💬 Написать продавцу", f"mk:ask:{o['id']}")]] + nav)
-    return None, (text, kb, None)
+    img = _order_card_image(o) if status == "wait_pay" and len(text) <= 1000 else None
+    return None, (text, kb, img)
 
 
 async def handle_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9629,8 +10061,12 @@ async def handle_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await q.answer("Заказ уже не ждёт оплаты — статус в «Мои заказы»", show_alert=True)
         if act == "pay":
             await q.answer()
-            return await context.bot.send_message(uid, f"🧾 <b>Заказ №{o['id']}</b>\n\n" + _pay_text(o),
-                                                  parse_mode="HTML", reply_markup=_buyer_kb(o))
+            cap = f"🧾 <b>Заказ №{o['id']}</b>\n\n" + _pay_text(o)
+            img = _order_card_image(o)
+            if img and len(cap) <= 1000:
+                return await context.bot.send_photo(uid, img, caption=cap, parse_mode="HTML",
+                                                    reply_markup=_buyer_kb(o))
+            return await context.bot.send_message(uid, cap, parse_mode="HTML", reply_markup=_buyer_kb(o))
         if act == "paid":
             context.user_data["awaiting"] = "ord_receipt"
             context.user_data["ord_oid"] = str(o["id"])
@@ -9802,8 +10238,8 @@ RANDOM_HELP = (
     "/random 5 50 — число от 5 до 50\n"
     "/random пицца, суши, бургер — случайный выбор\n\n"
     "🎉 Розыгрыш (в группе, для админов):\n"
-    "/random Приз | победителей | время\n"
-    "Например: /random Подписка на месяц | 2 | 1д\n"
+    "/random Приз, победителей, время\n"
+    "Например: /random Подписка на месяц, 2, 1д\n"
     "Время: 30m, 2ч, 1д (по умолчанию 1 ч). Участники жмут кнопку, итоги — сами.\n"
     "/gwend — подвести итоги сейчас · /reroll — перевыбрать победителей "
     "(реплаем на розыгрыш или последний)"
@@ -9835,15 +10271,19 @@ def _gw_kb(g):
 
 
 def _gw_parse(text: str):
-    parts = [p.strip() for p in text.split("|")]
-    prize = parts[0]
-    winners, secs = 1, 3600
-    if len(parts) > 1 and parts[1]:
-        m = re.search(r"\d+", parts[1])
-        winners = int(m.group()) if m else 1
-    if len(parts) > 2 and parts[2]:
-        secs = parse_duration(parts[2].replace(" ", "").lower()) or 3600
-    return prize, max(1, min(50, winners)), max(60, min(30 * 86400, secs))
+    """«Приз, победителей, время» → (приз, победителей, секунд, похоже_на_розыгрыш).
+    Старый вид через «|» тоже понимаем; в названии приза запятые допустимы."""
+    parts = [p.strip() for p in re.split(r"\s*[|,]\s*", (text or "").strip()) if p.strip()]
+    winners, secs, ok = 1, 3600, False
+    dur = lambda s: parse_duration(s.replace(" ", "").lower())  # noqa: E731
+    if len(parts) >= 3 and re.fullmatch(r"\d+", parts[-2]) and dur(parts[-1]):
+        winners, secs, parts, ok = int(parts[-2]), dur(parts[-1]), parts[:-2], True
+    elif len(parts) >= 2 and re.fullmatch(r"\d+", parts[-1]):
+        winners, parts, ok = int(parts[-1]), parts[:-1], True
+    elif len(parts) >= 2 and dur(parts[-1]):
+        secs, parts, ok = dur(parts[-1]), parts[:-1], True
+    prize = ", ".join(parts)
+    return prize, max(1, min(50, winners)), max(60, min(30 * 86400, secs)), ok
 
 
 async def gw_start(bot, chat_id: int, prize: str, winners: int, secs: int, by: int):
@@ -9961,13 +10401,14 @@ async def _gw_allowed(update, context) -> bool:
 async def cmd_random(update: Update, context):
     chat, user = update.effective_chat, update.effective_user
     raw = _args_text(update)
-    if "|" in raw:
-        if chat.type not in ("group", "supergroup"):
+    prize, n, secs, gw_like = _gw_parse(raw)
+    is_group = chat.type in ("group", "supergroup")
+    if "|" in raw or (gw_like and prize and is_group and await _gw_allowed(update, context)):
+        if not is_group:
             return await update.effective_message.reply_text(
-                "🎉 Розыгрыш запускается в группе: /random Приз | победителей | время")
+                "🎉 Розыгрыш запускается в группе: /random Приз, победителей, время")
         if not await _gw_allowed(update, context):
             return await _deny(update)
-        prize, n, secs = _gw_parse(raw)
         if not prize:
             return await update.effective_message.reply_text(RANDOM_HELP)
         try:
@@ -10027,8 +10468,8 @@ async def _gw_callback(query, context, data):
         if not tgt or tgt == "defaults":
             return await query.answer("Сначала выбери группу", show_alert=True)
         return await _ask(query, context, "gwnew",
-                          "🎉 Новый розыгрыш в выбранной группе.\nФормат: Приз | победителей | время\n"
-                          "Например: Подписка на месяц | 2 | 1д\nВремя: 30m, 2ч, 1д. (или /cancel)")
+                          "🎉 Новый розыгрыш в выбранной группе.\nФормат: Приз, победителей, время\n"
+                          "Например: Подписка на месяц, 2, 1д\nВремя: 30m, 2ч, 1д. (или /cancel)")
     g = _gw_all().get(data.split(":", 1)[1])
     if not g:
         return await query.answer("Розыгрыш не найден", show_alert=True)
@@ -10045,9 +10486,9 @@ async def _gw_callback(query, context, data):
 
 async def _gw_text_input(update, context, text, msg):
     tgt = context.user_data.get("cfg_target")
-    prize, n, secs = _gw_parse(text)
+    prize, n, secs, _ok = _gw_parse(text)
     if not prize or not tgt or tgt == "defaults":
-        return await msg.reply_text("Формат: Приз | победителей | время (или /cancel)")
+        return await msg.reply_text("Формат: Приз, победителей, время (или /cancel)")
     context.user_data.pop("awaiting", None)
     try:
         await gw_start(context.bot, int(tgt), prize, n, secs, update.effective_user.id)
@@ -10216,6 +10657,194 @@ async def handle_pd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  "(нажми /mydata ещё раз)." if left else ""))
 
 
+# ───────────────────────────────────────────────────────────────────────────
+#  🖼 КАРТИНКА «БАНКОВСКАЯ КАРТА» С РЕКВИЗИТАМИ ПРОДАВЦА (Pillow, необязательно)
+# ───────────────────────────────────────────────────────────────────────────
+
+_FONT_DIRS = ["/usr/share/fonts", "/usr/local/share/fonts", "/Library/Fonts", "/System/Library/Fonts",
+              "C:/Windows/Fonts", os.path.expanduser("~/.fonts")]
+_FONT_NAMES = {False: ["DejaVuSans.ttf", "LiberationSans-Regular.ttf", "NotoSans-Regular.ttf", "arial.ttf",
+                       "Arial.ttf", "FreeSans.ttf"],
+               True: ["DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "NotoSans-Bold.ttf", "arialbd.ttf",
+                      "Arial Bold.ttf", "FreeSansBold.ttf"]}
+_font_cache: dict = {}
+
+
+def _font_path(bold: bool):
+    env = os.environ.get("CARD_FONT_BOLD" if bold else "CARD_FONT", "").strip()
+    if env and os.path.exists(env):
+        return env
+    for d in _FONT_DIRS:
+        if not os.path.isdir(d):
+            continue
+        for root, _dirs, files in os.walk(d):
+            for name in _FONT_NAMES[bold]:
+                if name in files:
+                    return os.path.join(root, name)
+    return None
+
+
+def _card_font(size: int, bold: bool = False):
+    """(шрифт, умеет_кириллицу). Без системного шрифта — встроенный Pillow (только латиница)."""
+    key = (size, bold)
+    if key not in _font_cache:
+        path = _font_path(bold) or _font_path(False)
+        try:
+            _font_cache[key] = (ImageFont.truetype(path, size), True) if path else (ImageFont.load_default(size), False)
+        except Exception:  # noqa: BLE001
+            _font_cache[key] = (ImageFont.load_default(), False)
+    return _font_cache[key]
+
+
+_TRANSLIT = dict(zip("абвгдеёжзийклмнопрстуфхцчшщъыьэюяўқғҳ",
+                     ["a", "b", "v", "g", "d", "e", "e", "zh", "z", "i", "y", "k", "l", "m", "n", "o", "p", "r",
+                      "s", "t", "u", "f", "kh", "ts", "ch", "sh", "sch", "", "y", "", "e", "yu", "ya", "o'", "q",
+                      "g'", "h"]))
+
+
+def _translit(s: str) -> str:
+    out = []
+    for ch in s:
+        low = ch.lower()
+        if low in _TRANSLIT:
+            t = _TRANSLIT[low]
+            out.append(t.upper() if ch != low else t)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+# Оформление по названию способа: (цвет1, цвет2, логотип)
+_CARD_BRANDS = [
+    (("uzcard",), ("#0b3d91", "#1e88e5"), "UZCARD"),
+    (("humo", "хумо"), ("#e65100", "#ffb300"), "HUMO"),
+    (("visa",), ("#1a1f71", "#3f51b5"), "VISA"),
+    (("master",), ("#1c1c1c", "#4a4a4a"), "mc"),
+    (("сбер", "sber"), ("#0b7a36", "#21a038"), "СБЕР"),
+    (("тиньк", "tinkoff", "t-bank", "т-банк"), ("#1c1c1c", "#3a3a3a"), "T-BANK"),
+    (("kaspi", "каспи"), ("#b71c1c", "#f4511e"), "KASPI"),
+    (("payme",), ("#00897b", "#26c6da"), "PAYME"),
+    (("click",), ("#01579b", "#29b6f6"), "CLICK"),
+    (("uzum",), ("#4a148c", "#8e24aa"), "UZUM"),
+]
+
+
+def _card_brand(name: str):
+    low = (name or "").lower()
+    for keys, colors, logo in _CARD_BRANDS:
+        if any(k in low for k in keys):
+            return colors, logo
+    return ("#263238", "#546e7a"), ""
+
+
+def _hex(c: str):
+    c = c.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _card_image(m: dict, total=None, order_id=None, cur=None):
+    """PNG «банковская карта» с реквизитами продавца (+ сумма и номер заказа снизу).
+    None — если Pillow не установлен или у способа нет реквизитов."""
+    if Image is None or not str(m.get("details") or "").strip():
+        return None
+    try:
+        W, H, CW, CH, R = 1000, 780, 900, 560, 42
+        x0, y0 = 50, 40
+        img = Image.new("RGB", (W, H), (244, 246, 250))
+        (c1, c2), logo = _card_brand(m.get("name", ""))
+        a, b = _hex(c1), _hex(c2)
+        grad = Image.new("RGB", (CW, CH))
+        gd = ImageDraw.Draw(grad)
+        for i in range(CW + CH):                         # диагональный градиент
+            t = i / (CW + CH)
+            col = tuple(int(a[k] + (b[k] - a[k]) * t) for k in range(3))
+            gd.line([(i, 0), (i - CH, CH)], fill=col, width=2)
+        mask = Image.new("L", (CW, CH), 0)
+        ImageDraw.Draw(mask).rounded_rectangle([0, 0, CW - 1, CH - 1], R, fill=255)
+        shadow = Image.new("L", (CW, CH), 0)
+        ImageDraw.Draw(shadow).rounded_rectangle([0, 0, CW - 1, CH - 1], R, fill=70)
+        img.paste((190, 196, 210), (x0 + 6, y0 + 10), shadow)
+        img.paste(grad, (x0, y0), mask)
+        d = ImageDraw.Draw(img)
+        white, soft = (255, 255, 255), (230, 236, 245)
+
+        def txt(xy, s, size, bold=False, fill=white, anchor="la"):
+            f, cyr = _card_font(size, bold)
+            s = str(s)
+            if not cyr:
+                s = _translit(s)
+            d.text(xy, s, font=f, fill=fill, anchor=anchor)
+
+        # декоративные полупрозрачные круги
+        over = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        od = ImageDraw.Draw(over)
+        od.ellipse([x0 + CW - 330, y0 - 160, x0 + CW + 170, y0 + 340], fill=(255, 255, 255, 22))
+        od.ellipse([x0 - 140, y0 + CH - 220, x0 + 260, y0 + CH + 180], fill=(255, 255, 255, 14))
+        cut = Image.new("L", (W, H), 0)
+        ImageDraw.Draw(cut).rounded_rectangle([x0, y0, x0 + CW - 1, y0 + CH - 1], R, fill=255)
+        over.putalpha(Image.composite(over.getchannel("A"), Image.new("L", (W, H), 0), cut))
+        img.paste(over, (0, 0), over)
+        d = ImageDraw.Draw(img)
+
+        # название банка / способа
+        txt((x0 + 60, y0 + 55), str(m.get("name", ""))[:22], 46, True)
+        # чип
+        cx, cy = x0 + 60, y0 + 170
+        d.rounded_rectangle([cx, cy, cx + 110, cy + 82], 14, fill=(232, 196, 104), outline=(196, 156, 64), width=2)
+        for yy in (cy + 27, cy + 55):
+            d.line([(cx, yy), (cx + 110, yy)], fill=(196, 156, 64), width=2)
+        d.line([(cx + 55, cy), (cx + 55, cy + 82)], fill=(196, 156, 64), width=2)
+        # бесконтакт
+        for k, r in enumerate((18, 32, 46)):
+            d.arc([cx + 150 - r, cy + 41 - r, cx + 150 + r, cy + 41 + r], -50, 50, fill=soft, width=5)
+        # номер
+        lines = [ln.strip() for ln in str(m.get("details") or "").splitlines() if ln.strip()]
+        num = _fmt_account(lines[0])
+        size = 66 if len(num) <= 19 else (54 if len(num) <= 24 else 40)
+        txt((x0 + 60, y0 + 305), num[:32], size, True)
+        if len(lines) > 1:
+            txt((x0 + 62, y0 + 385), " · ".join(lines[1:])[:48], 28, fill=soft)
+        # получатель
+        if m.get("holder"):
+            txt((x0 + 60, y0 + 440), "ПОЛУЧАТЕЛЬ", 22, fill=soft)
+            txt((x0 + 60, y0 + 470), str(m["holder"]).upper()[:28], 38, True)
+        # логотип справа снизу
+        lx, ly = x0 + CW - 60, y0 + CH - 60
+        if logo == "mc":
+            d.ellipse([lx - 150, ly - 70, lx - 60, ly + 20], fill=(235, 0, 27))
+            over2 = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            ImageDraw.Draw(over2).ellipse([lx - 95, ly - 70, lx - 5, ly + 20], fill=(247, 158, 27, 225))
+            img.paste(over2, (0, 0), over2)
+            d = ImageDraw.Draw(img)
+        elif logo:
+            txt((lx, ly), logo, 44, True, anchor="rb")
+        # нижняя плашка: сколько и комментарий
+        if total is not None:
+            fy = y0 + CH + 40
+            d.rounded_rectangle([x0, fy, x0 + CW, fy + 130], 28, fill=(255, 255, 255), outline=(220, 224, 232))
+            txt((x0 + 40, fy + 22), "К оплате", 24, fill=(110, 118, 132))
+            txt((x0 + 40, fy + 55), _money(total, cur), 50, True, fill=(20, 24, 32))
+            if order_id is not None:
+                txt((x0 + CW - 40, fy + 22), "Комментарий к платежу", 24, fill=(110, 118, 132), anchor="ra")
+                txt((x0 + CW - 40, fy + 58), f"Заказ №{order_id}", 42, True, fill=(20, 24, 32), anchor="ra")
+        else:
+            img = img.crop((0, 0, W, y0 + CH + 40))
+        out = io.BytesIO()
+        img.save(out, "PNG", optimize=True)
+        return out.getvalue()
+    except Exception as e:  # noqa: BLE001
+        log.warning("card image: %s", e)
+        return None
+
+
+def _order_card_image(o):
+    """Картинка карты для заказа (если способ — перевод по реквизитам и включена опция)."""
+    m = o.get("method") or {}
+    if not _shop().get("card_img", True) or m.get("cod") or m.get("type") == "link":
+        return None
+    return _card_image(m, _o_total(o), o.get("id"), _o_cur(o))
+
+
 async def on_error(update, context):
     err = context.error
     if isinstance(err, (NetworkError, TimedOut)):
@@ -10284,7 +10913,7 @@ async def _post_init(app: Application):
             BotCommand("gmanager", "назначить менеджера группы"),
             BotCommand("ungmanager", "снять менеджера группы"),
             BotCommand("gmanagers", "менеджеры группы"),
-            BotCommand("random", "рандом и розыгрыш: приз | победителей | время"),
+            BotCommand("random", "рандом и розыгрыш: приз, победителей, время"),
             BotCommand("gwend", "подвести итоги розыгрыша"),
             BotCommand("reroll", "перевыбрать победителей"),
             BotCommand("shopchat", "присылать заказы магазина в этот чат"),
@@ -10438,7 +11067,7 @@ def main():
         jq.run_repeating(flush_config_job, interval=90, first=30)
         jq.run_repeating(janitor_job, interval=3600, first=600)
         jq.run_repeating(weekly_digest_job, interval=3600, first=900)
-    log.info("Channel Guard v7.3 запускается…")
+    log.info("Channel Guard v7.5 запускается…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
